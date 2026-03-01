@@ -35,7 +35,16 @@ import chokidar from "chokidar";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = 3457;
 const HTTPS_PORT = 3458;
-const TS_HOSTNAME = "happys-mac-mini-2.tail4eed8e.ts.net";
+// Auto-detect Tailscale hostname from cert, or use env var, or placeholder
+const TS_HOSTNAME = process.env.TS_HOSTNAME || (() => {
+  try {
+    const certPath = join(__dirname, "tailscale-cert.pem");
+    if (!existsSync(certPath)) return "";
+    const out = execSync(`openssl x509 -in "${certPath}" -noout -subject`, { encoding: "utf-8", timeout: 3000 });
+    const match = out.match(/CN\s*=\s*([^\s,]+)/);
+    return match ? match[1] : "";
+  } catch { return ""; }
+})();
 const TMUX_SESSION = "claude-voice";
 const HOME = homedir();
 const SETTINGS_FILE = join(__dirname, "settings.json");
@@ -1932,12 +1941,16 @@ if (existsSync(certPath) && existsSync(keyPath)) {
   const wssSecure = new WebSocketServer({ server: httpsServer });
   wssSecure.on("connection", handleWsConnection);
   httpsServer.listen(HTTPS_PORT, "0.0.0.0", () => {
-    console.log(`  HTTPS: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
-    console.log(`  Open on iPhone: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
+    if (TS_HOSTNAME) {
+      console.log(`  HTTPS: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
+      console.log(`  Open on iPhone: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
+    } else {
+      console.log(`  HTTPS: https://localhost:${HTTPS_PORT}`);
+    }
   });
 } else {
   console.log("  No Tailscale certs found — HTTPS disabled");
-  console.log("  Run: tailscale cert --cert-file tailscale-cert.pem --key-file tailscale-key.pem " + TS_HOSTNAME);
+  console.log("  To enable: tailscale cert --cert-file tailscale-cert.pem --key-file tailscale-key.pem <your-hostname>");
 }
 
 // Graceful shutdown
