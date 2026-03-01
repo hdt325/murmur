@@ -1,5 +1,5 @@
 /**
- * Automated UI tests for voice-panel bug fixes.
+ * Automated UI tests for Murmur bug fixes.
  * Drives a real Chromium browser against http://localhost:3457
  *
  * Run:  npx playwright test test-bugs.ts

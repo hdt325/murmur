@@ -190,9 +190,9 @@ function stopTts() {
 
 function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
   // Write both files to tmp
-  const preFile = "/tmp/voice-panel-prebuf.wav";
-  const mainFile = "/tmp/voice-panel-main.webm";
-  const outFile = "/tmp/voice-panel-combined.webm";
+  const preFile = "/tmp/murmur-prebuf.wav";
+  const mainFile = "/tmp/murmur-main.webm";
+  const outFile = "/tmp/murmur-combined.webm";
   writeFileSync(preFile, preBuffer);
   writeFileSync(mainFile, mainAudio);
 
@@ -221,8 +221,8 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     }
   }
 
-  const tmpFile = "/tmp/voice-panel-audio.webm";
-  const normalizedFile = "/tmp/voice-panel-audio-norm.wav";
+  const tmpFile = "/tmp/murmur-audio.webm";
+  const normalizedFile = "/tmp/murmur-audio-norm.wav";
   writeFileSync(tmpFile, audioData);
 
   // Normalize audio volume with ffmpeg before transcription
@@ -326,7 +326,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
   const ttsText = speakable;
 
-  const ttsFile = `/tmp/voice-panel-tts-${Date.now()}.mp3`;
+  const ttsFile = `/tmp/murmur-tts-${Date.now()}.mp3`;
   const payload = JSON.stringify({
     model: "kokoro",
     input: ttsText,
@@ -1841,7 +1841,7 @@ app.get("/info", (_req, res) => {
   };
   try {
     const ps = execSync(
-      "ps aux | grep -E '[c]laude' | grep -v 'voice-panel' | head -1",
+      "ps aux | grep -E '[c]laude' | grep -v 'murmur' | head -1",
       { encoding: "utf-8" }
     ).trim();
     if (ps) {
@@ -1875,7 +1875,7 @@ initSignalFiles();
 
 // Clean up orphaned TTS temp files from previous/crashed sessions
 try {
-  const tmpFiles = readdirSync("/tmp").filter(f => f.startsWith("voice-panel-tts-") && f.endsWith(".mp3"));
+  const tmpFiles = readdirSync("/tmp").filter(f => f.startsWith("murmur-tts-") && f.endsWith(".mp3"));
   if (tmpFiles.length > 0) {
     for (const f of tmpFiles) {
       try { unlinkSync(join("/tmp", f)); } catch {}

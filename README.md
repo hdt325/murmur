@@ -94,7 +94,7 @@ npx tsx server.ts
 
 # Then open http://localhost:3457 in a browser
 # Or launch the native panel separately:
-open VoicePanel.app
+open Murmur.app
 ```
 
 ## Usage
@@ -202,7 +202,7 @@ Binary WebSocket frames from clients are treated as audio input (mic data).
 
 ## Native Panel
 
-The Swift app (`panel.swift` → `VoicePanel.app`) provides:
+The Swift app (`panel.swift` → `Murmur.app`) provides:
 
 - **Floating window** — always-on-top, borderless, resizable, 320x500 default
 - **Global hotkey** — Right Cmd (keyCode 54) toggles recording from any app
@@ -220,7 +220,7 @@ murmur/
 ├── launch.sh            # One-command launcher (deps, compile, start, open)
 ├── settings.json        # Voice + speed config (auto-created, gitignored)
 ├── make-icon.py         # Generates AppIcon.icns from PIL (optional)
-├── VoicePanel.app/      # Compiled macOS app bundle (gitignored)
+├── Murmur.app/      # Compiled macOS app bundle (gitignored)
 ├── package.json         # Node dependencies (express, ws, chokidar)
 ├── tsconfig.json        # TypeScript config
 ├── CLAUDE.md            # VoiceMode parameter constraints for Claude Code
@@ -269,7 +269,7 @@ tmux new-session -d -s claude-voice
 
 **No audio / mic not working**
 - Check System Settings → Privacy & Security → Microphone
-- Ensure the browser or VoicePanel.app has mic permission
+- Ensure the browser or Murmur.app has mic permission
 
 **Swift compilation errors**
 ```bash

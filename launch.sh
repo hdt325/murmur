@@ -11,7 +11,7 @@ if [ ! -d "node_modules" ]; then
   npm install --silent
 fi
 
-APP_BIN="VoicePanel.app/Contents/MacOS/VoicePanel"
+APP_BIN="Murmur.app/Contents/MacOS/Murmur"
 
 # Compile native panel if needed
 if [ ! -f "$APP_BIN" ] || [ "panel.swift" -nt "$APP_BIN" ]; then
@@ -20,20 +20,20 @@ if [ ! -f "$APP_BIN" ] || [ "panel.swift" -nt "$APP_BIN" ]; then
 fi
 
 # Generate icon if missing
-if [ ! -f "VoicePanel.app/Contents/Resources/AppIcon.icns" ]; then
+if [ ! -f "Murmur.app/Contents/Resources/AppIcon.icns" ]; then
   echo "Generating app icon..."
   python3 make-icon.py 2>/dev/null || echo "Icon generation skipped (install Pillow: pip3 install Pillow)"
 fi
 
 # Kill any existing instances
-pkill -f "VoicePanel.app/Contents/MacOS/VoicePanel" 2>/dev/null || true
-pkill -f "tsx.*voice-panel.*server.ts" 2>/dev/null || true
+pkill -f "Murmur.app/Contents/MacOS/Murmur" 2>/dev/null || true
+pkill -f "tsx.*murmur.*server.ts" 2>/dev/null || true
 sleep 0.3
 
 # Clean up on exit
 cleanup() {
   kill $SERVER_PID 2>/dev/null || true
-  pkill -f "VoicePanel.app/Contents/MacOS/VoicePanel" 2>/dev/null || true
+  pkill -f "Murmur.app/Contents/MacOS/Murmur" 2>/dev/null || true
   exit 0
 }
 trap cleanup SIGINT SIGTERM
@@ -52,7 +52,7 @@ for i in $(seq 1 30); do
 done
 
 # Launch native panel
-open "$DIR/VoicePanel.app"
+open "$DIR/Murmur.app"
 echo "Murmur launched"
 echo "Press Ctrl+C to stop"
 

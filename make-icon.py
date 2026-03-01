@@ -57,7 +57,7 @@ for angle in range(0, 181, 2):
     draw.ellipse([ax-2, ay-2, ax+2, ay+2], fill=(93, 173, 226, 120))
 
 # Save as iconset
-iconset_dir = "VoicePanel.app/Contents/Resources/AppIcon.iconset"
+iconset_dir = "Murmur.app/Contents/Resources/AppIcon.iconset"
 os.makedirs(iconset_dir, exist_ok=True)
 
 sizes = [16, 32, 64, 128, 256, 512, 1024]
@@ -70,9 +70,9 @@ for s in sizes:
 
 # Convert to icns
 subprocess.run(["iconutil", "-c", "icns", iconset_dir, "-o",
-                "VoicePanel.app/Contents/Resources/AppIcon.icns"], check=True)
+                "Murmur.app/Contents/Resources/AppIcon.icns"], check=True)
 
 # Clean up iconset
 shutil.rmtree(iconset_dir)
 
-print("Icon created: VoicePanel.app/Contents/Resources/AppIcon.icns")
+print("Icon created: Murmur.app/Contents/Resources/AppIcon.icns")
