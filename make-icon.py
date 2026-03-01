@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Voice Panel v2 app icon — dark waveform mic design."""
+"""Generate Murmur app icon — dark waveform mic design."""
 from PIL import Image, ImageDraw
 import math, os, subprocess, shutil
 

@@ -207,7 +207,7 @@ function assert(condition: boolean, name: string, detail?: string) {
 }
 
 console.log("═══════════════════════════════════════════════════════");
-console.log("  Voice Panel Detection Unit Tests");
+console.log("  Murmur Detection Unit Tests");
 console.log("═══════════════════════════════════════════════════════");
 console.log("");
 

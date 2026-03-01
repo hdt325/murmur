@@ -1,5 +1,5 @@
 #!/bin/bash
-# Voice Panel v3 — Start server + native floating panel
+# Murmur — Start server + native floating panel
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -53,7 +53,7 @@ done
 
 # Launch native panel
 open "$DIR/VoicePanel.app"
-echo "Voice Panel v3 launched"
+echo "Murmur launched"
 echo "Press Ctrl+C to stop"
 
 # Wait for server process

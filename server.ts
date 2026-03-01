@@ -1,5 +1,5 @@
 /**
- * Voice Panel v3 — VoiceMode Edition
+ * Murmur — voice interface for Claude Code
  *
  * Express + WebSocket bridge between the panel UI and Claude Code (in tmux).
  * VoiceMode MCP handles all audio (TTS + STT). This server:
@@ -186,6 +186,28 @@ function stopTts() {
   } catch {}
 }
 
+// --- Audio Pre-Buffer Combination ---
+
+function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
+  // Write both files to tmp
+  const preFile = "/tmp/voice-panel-prebuf.wav";
+  const mainFile = "/tmp/voice-panel-main.webm";
+  const outFile = "/tmp/voice-panel-combined.webm";
+  writeFileSync(preFile, preBuffer);
+  writeFileSync(mainFile, mainAudio);
+
+  // Use ffmpeg to concatenate: convert both to same format, then combine
+  execSync(
+    `ffmpeg -y -i "${preFile}" -i "${mainFile}" ` +
+      `-filter_complex "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a0];` +
+      `[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a1];` +
+      `[a0][a1]concat=n=2:v=0:a=1[out]" ` +
+      `-map "[out]" -c:a libopus "${outFile}"`,
+    { stdio: "ignore", timeout: 10000 }
+  );
+  return Buffer.from(readFileSync(outFile));
+}
+
 // --- Direct Voice Input: Transcribe + Type into tmux ---
 
 async function transcribeAudio(audioData: Buffer): Promise<string> {
@@ -200,12 +222,27 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
   }
 
   const tmpFile = "/tmp/voice-panel-audio.webm";
+  const normalizedFile = "/tmp/voice-panel-audio-norm.wav";
   writeFileSync(tmpFile, audioData);
+
+  // Normalize audio volume with ffmpeg before transcription
+  // loudnorm filter boosts quiet speech to a consistent level
+  try {
+    execSync(
+      `ffmpeg -y -i "${tmpFile}" -af "loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=80,lowpass=f=8000" -ar 16000 -ac 1 "${normalizedFile}"`,
+      { stdio: "ignore", timeout: 10000 }
+    );
+    console.log("[stt] Audio normalized for transcription");
+  } catch (err) {
+    console.warn("[stt] ffmpeg normalization failed, using raw audio:", (err as Error).message);
+    // Fall back to raw file
+    try { writeFileSync(normalizedFile, audioData); } catch {}
+  }
 
   try {
     const result = execSync(
       `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
-        `-F "file=@${tmpFile}" -F "model=whisper-1"`,
+        `-F "file=@${normalizedFile}" -F "model=whisper-1"`,
       { encoding: "utf-8", timeout: 10000 }
     );
     const json = JSON.parse(result);
@@ -223,8 +260,23 @@ let ttsGeneration = 0;
 let ttsClientTimeout: ReturnType<typeof setTimeout> | null = null;
 let ttsInProgress = false;
 let ttsActiveGen = 0; // Generation of the audio currently playing on client
+let ttsQueue: string[] = []; // Queue of texts waiting to be spoken
+let ttsRetryCount = 0;
+const TTS_MAX_RETRIES = 3;
 
-async function speakText(text: string): Promise<void> {
+async function speakText(text: string, interrupt = false): Promise<void> {
+  // If TTS is in progress and not interrupting, queue the text
+  if (ttsInProgress && !interrupt) {
+    console.log(`[tts] Queuing text (${text.length} chars) — ${ttsQueue.length + 1} in queue`);
+    ttsQueue.push(text);
+    return;
+  }
+
+  // If interrupting, clear the queue too
+  if (interrupt) {
+    ttsQueue = [];
+  }
+
   // Cancel any current TTS (generation counter ensures old callbacks are discarded)
   const myGen = ++ttsGeneration;
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
@@ -239,14 +291,31 @@ async function speakText(text: string): Promise<void> {
   // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
   const speakable = text
     .replace(/```[\s\S]*?```/g, "... code block omitted ...")
-    .replace(/`[^`]+`/g, "code snippet")
-    .replace(/https?:\/\/\S+/g, "")                    // URLs
+    .replace(/`[^`]+`/g, (m) => m.slice(1, -1))         // inline code → just the word
+    .replace(/https?:\/\/\S+/g, "")                      // URLs
     .replace(/\b\S+\.(com|org|net|io|dev|ai|co)\b/gi, "") // domains
-    .replace(/(\/[\w.~-]+){3,}/g, "that path")          // file paths (3+ segments)
-    .replace(/[a-f0-9]{8,}/gi, "")                       // hex hashes/IDs
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")             // markdown links → just text
-    .replace(/[#*_]{2,}/g, "")                           // markdown formatting
-    .replace(/\s{2,}/g, " ")                             // collapse whitespace
+    .replace(/(\/[\w.~-]+){3,}/g, "that path")            // file paths (3+ segments)
+    .replace(/[a-f0-9]{8,}/gi, "")                         // hex hashes/IDs
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")               // markdown links → just text
+    .replace(/[#*_]{2,}/g, "")                             // markdown formatting
+    // Process paragraphs (double newline = real break, single newline = tmux wrap)
+    .split(/\n\n+/)
+    .map(paragraph => {
+      // Within a paragraph, join tmux-wrapped lines with spaces
+      const lines = paragraph.split("\n").map(l => l.trim()).filter(Boolean);
+      const joined = lines
+        .map(l => l.replace(/^[-*•]\s+/, "").replace(/^\d+[.)]\s+/, "")) // strip bullets
+        .map(l => l.replace(/\*\*([^*]+)\*\*/g, "$1")) // bold → plain
+        .join(" ");
+      // Add period at end of paragraph if missing punctuation
+      if (joined && !/[.!?:;,—]$/.test(joined)) {
+        return joined + ".";
+      }
+      return joined;
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s{2,}/g, " ")                              // collapse whitespace
     .trim();
 
   if (!speakable) {
@@ -295,11 +364,22 @@ async function speakText(text: string): Promise<void> {
     }
 
     if (code !== 0) {
-      console.error(`[tts] curl failed with code ${code}`);
       ttsInProgress = false;
-      broadcast({ type: "voice_status", state: "idle" });
+      if (ttsRetryCount < TTS_MAX_RETRIES) {
+        ttsRetryCount++;
+        const delay = ttsRetryCount * 1000; // 1s, 2s, 3s backoff
+        console.error(`[tts] curl failed with code ${code} — retry ${ttsRetryCount}/${TTS_MAX_RETRIES} in ${delay}ms`);
+        setTimeout(() => {
+          if (myGen === ttsGeneration) speakText(ttsText);
+        }, delay);
+      } else {
+        console.error(`[tts] curl failed with code ${code} — giving up after ${TTS_MAX_RETRIES} retries`);
+        ttsRetryCount = 0;
+        broadcast({ type: "voice_status", state: "idle" });
+      }
       return;
     }
+    ttsRetryCount = 0; // Reset on success
 
     if (!existsSync(ttsFile) || statSync(ttsFile).size < 100) {
       console.error("[tts] Produced empty/missing file");
@@ -338,6 +418,7 @@ async function speakText(text: string): Promise<void> {
 
 function stopClientPlayback() {
   ttsGeneration++;
+  ttsQueue = []; // Clear pending queue
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   broadcast({ type: "tts_stop" });
   ttsInProgress = false;
@@ -351,6 +432,15 @@ function handleTtsDone() {
   }
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   ttsInProgress = false;
+
+  // Play next queued text if available
+  if (ttsQueue.length > 0) {
+    const next = ttsQueue.shift()!;
+    console.log(`[tts] Playing next in queue (${next.length} chars, ${ttsQueue.length} remaining)`);
+    speakText(next);
+    return;
+  }
+
   console.log("[tts] TTS done — broadcasting idle");
   broadcast({ type: "voice_status", state: "idle" });
 }
@@ -372,25 +462,17 @@ type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "DONE";
 let streamState: StreamState = "IDLE";
 let streamWatcher: ReturnType<typeof setInterval> | null = null;
 let streamTimeout: ReturnType<typeof setTimeout> | null = null;
+let contentCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let promptCheckInterval: ReturnType<typeof setInterval> | null = null; // Independent prompt-ready checker
 let streamFileOffset = 0;
-let responseBuffer = "";
+let lastStreamActivity = 0;
 let lastBroadcastText = "";
-let incompleteLineBuffer = "";
 let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
 const STREAM_FILE = `/tmp/claude-voice-stream-${process.pid}.raw`;
 const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
+const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
-
-// Strip ANSI escape codes from raw pipe-pane output
-function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")   // CSI (colors, cursor)
-    .replace(/\x1B\][^\x07]*\x07/g, "")        // OSC (title)
-    .replace(/\x1B[()][AB012]/g, "")            // Charset
-    .replace(/\x1B[>=<]/g, "")                  // Mode
-    .replace(/\r/g, "");                         // CR
-}
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -399,6 +481,18 @@ function captureVisiblePane(): string {
   try {
     return execSync(
       `tmux capture-pane -t ${TMUX_SESSION} -p`,
+      { encoding: "utf-8", timeout: 2000 }
+    );
+  } catch {
+    return "";
+  }
+}
+
+// Capture visible pane with ANSI escape codes — for terminal panel rendering
+function captureTerminalPane(): string {
+  try {
+    return execSync(
+      `tmux capture-pane -t ${TMUX_SESSION} -e -p`,
       { encoding: "utf-8", timeout: 2000 }
     );
   } catch {
@@ -743,10 +837,20 @@ function normalizeSpinners(text: string): string {
   return text.replace(/[✻✳✢✽✶·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "•");
 }
 
-// Broadcast accumulated stream buffer to app for display.
-function broadcastAccumulatedOutput() {
-  if (!responseBuffer) return;
-  const reflowed = reflowText(responseBuffer);
+// Track incremental TTS state
+let lastIncrementalSpeakable = "";
+let incrementalTtsTimer: ReturnType<typeof setTimeout> | null = null;
+const INCREMENTAL_TTS_DELAY_MS = 500; // Wait 500ms of stable text before speaking incrementally
+
+// Broadcast current response content to app for display (via capture-pane snapshot).
+// Also triggers incremental TTS when new speakable text accumulates during long responses.
+function broadcastCurrentOutput() {
+  const pane = captureTmuxPane();
+  if (!pane) return;
+
+  const raw = extractRawOutput(preInputSnapshot, pane, lastUserInput);
+  if (!raw) return;
+  const reflowed = reflowText(raw);
   if (!reflowed) return;
 
   // Only broadcast if content actually changed
@@ -761,102 +865,93 @@ function broadcastAccumulatedOutput() {
     ts: Date.now(),
     partial: true,
   });
+
+  // Incremental TTS: check if speakable text has grown
+  const speakable = extractSpeakableText(preInputSnapshot, pane, lastUserInput);
+  if (speakable && speakable.length > lastIncrementalSpeakable.length + 20) {
+    // New speakable content — schedule TTS if not already scheduled
+    // Don't reset the timer on new content — let it fire and speak what's available
+    if (!incrementalTtsTimer) {
+      incrementalTtsTimer = setTimeout(() => {
+        incrementalTtsTimer = null;
+        // Re-extract to get latest stable text
+        const freshPane = captureTmuxPane();
+        if (!freshPane) return;
+        const freshSpeakable = extractSpeakableText(preInputSnapshot, freshPane, lastUserInput);
+        if (!freshSpeakable) return;
+
+        const unspoken = freshSpeakable.slice(lastIncrementalSpeakable.length).trim();
+        if (unspoken.length > 20) {
+          console.log(`[stream] Incremental TTS (${unspoken.length} chars): "${unspoken.slice(0, 100)}..."`);
+          lastIncrementalSpeakable = freshSpeakable;
+          lastSpokenText = freshSpeakable; // Keep handleStreamDone in sync
+          // Queue instead of interrupting — speakText handles queuing automatically
+          speakText(unspoken);
+        }
+      }, INCREMENTAL_TTS_DELAY_MS);
+    }
+  }
 }
 
-// Process each chunk of ANSI-stripped pipe output
-function processStreamChunk(newData: string) {
-  // Prepend any incomplete line from last chunk
-  const data = incompleteLineBuffer + newData;
-  incompleteLineBuffer = "";
+// Called when new pipe-pane bytes arrive — schedules a capture-pane content check.
+// The pipe data is used purely as an activity signal; actual content detection
+// uses captureTmuxPane() for clean, reliable output.
+function onStreamActivity() {
+  lastStreamActivity = Date.now();
+  sawActivity = true;
 
-  const lines = data.split("\n");
+  // Cancel any pending done-check — new output means not done yet
+  cancelDoneCheck();
 
-  // If data doesn't end with newline, last element is incomplete
-  if (!data.endsWith("\n")) {
-    incompleteLineBuffer = lines.pop() || "";
+  // Schedule a content check (throttled to every CONTENT_CHECK_MS)
+  if (!contentCheckTimer) {
+    contentCheckTimer = setTimeout(() => {
+      contentCheckTimer = null;
+      checkPaneState();
+    }, CONTENT_CHECK_MS);
+  }
+}
+
+// Check the tmux pane for state transitions and content updates.
+function checkPaneState() {
+  if (streamState === "IDLE" || streamState === "DONE") return;
+
+  const pane = captureTmuxPane();
+  if (!pane) return;
+
+  const elapsed = Date.now() - pollStartTime;
+  const spinner = hasSpinnerChars(pane);
+  const response = hasResponseMarkers(pane);
+  const prompt = hasPromptReady(pane);
+
+  // State transitions
+  if (streamState === "WAITING") {
+    if (spinner) {
+      streamState = "THINKING";
+      console.log(`[stream] → THINKING (${(elapsed/1000).toFixed(1)}s)`);
+      broadcast({ type: "voice_status", state: "thinking" });
+    }
+    if (response) {
+      streamState = "RESPONDING";
+      console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
+      broadcast({ type: "voice_status", state: "responding" });
+    }
+  } else if (streamState === "THINKING") {
+    if (response) {
+      streamState = "RESPONDING";
+      console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
+      broadcast({ type: "voice_status", state: "responding" });
+    }
   }
 
-  const startTime = pollStartTime;
-  const elapsed = Date.now() - startTime;
+  // Broadcast content when we have response markers
+  if (streamState === "RESPONDING" || response) {
+    broadcastCurrentOutput();
+  }
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    // Skip context/compact status lines
-    if (/context left until/i.test(line)) continue;
-    if (/auto-compact/i.test(line)) continue;
-
-    // Skip tmux chrome
-    if (/^[─━═]{3,}/.test(line)) continue;
-    if (/bypass\s+permissions/i.test(line)) continue;
-    if (/^⏵/.test(line)) continue;
-    if (/^[▐▝▘]/.test(line)) continue;
-    if (/Claude Code v/.test(line)) continue;
-    if (/Opus \d|Claude Max/.test(line)) continue;
-    if (/ctrl\+[a-z]/i.test(line) && line.length < 60) continue;
-    if (/shift\+tab/i.test(line)) continue;
-
-    // Spinner detected → THINKING
-    if (isSpinnerLine(line)) {
-      if (streamState === "WAITING" || streamState === "THINKING") {
-        if (streamState !== "THINKING") {
-          streamState = "THINKING";
-          console.log(`[stream] → THINKING (${(elapsed/1000).toFixed(1)}s)`);
-          broadcast({ type: "voice_status", state: "thinking" });
-        }
-        cancelDoneCheck();
-      }
-      continue;
-    }
-
-    // Bare prompt ❯ — possible done signal
-    if (/^❯\s*$/.test(line)) {
-      if (streamState === "RESPONDING") {
-        scheduleDoneCheck();
-      } else if ((streamState === "THINKING" || streamState === "WAITING") && elapsed > 1500) {
-        scheduleDoneCheck();
-      }
-      continue;
-    }
-
-    // Skip prompt lines with suggested text
-    if (/^❯/.test(line)) continue;
-
-    // ⏺ marker or content after it → RESPONDING
-    if (/^⏺/.test(line) || (streamState === "RESPONDING" && line.length > 0)) {
-      cancelDoneCheck();
-      if (streamState !== "RESPONDING") {
-        streamState = "RESPONDING";
-        console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
-        broadcast({ type: "voice_status", state: "responding" });
-      }
-
-      // Strip ⏺ marker and accumulate
-      const content = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "").trim();
-      if (content) {
-        // Dedupe: skip if this line is already at the tail of responseBuffer
-        const bufferTail = responseBuffer.split("\n").slice(-1)[0]?.trim();
-        if (content !== bufferTail) {
-          responseBuffer += (responseBuffer ? "\n" : "") + content;
-          broadcastAccumulatedOutput();
-        }
-      }
-      continue;
-    }
-
-    // Any other content while in WAITING/THINKING could be response start
-    if (streamState === "WAITING" || streamState === "THINKING") {
-      // ⎿ lines are tool output
-      if (/^⎿/.test(line)) {
-        cancelDoneCheck();
-        if (streamState !== "THINKING") {
-          streamState = "THINKING";
-          broadcast({ type: "voice_status", state: "thinking" });
-        }
-        continue;
-      }
-    }
+  // Schedule done check when prompt appears without spinner and we've seen activity
+  if (prompt && !spinner && sawActivity) {
+    scheduleDoneCheck();
   }
 }
 
@@ -888,12 +983,13 @@ function startTmuxStreaming(userInput: string) {
 
   lastUserInput = userInput;
   pollStartTime = Date.now();
+  lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
   lastSpokenText = "";
-  responseBuffer = "";
+  lastIncrementalSpeakable = "";
+  if (incrementalTtsTimer) { clearTimeout(incrementalTtsTimer); incrementalTtsTimer = null; }
   streamFileOffset = 0;
-  incompleteLineBuffer = "";
   stopClientPlayback(); // Stop any current TTS before new input
 
   // Take snapshot BEFORE sendToTmux is called — captures the clean prompt state
@@ -910,30 +1006,42 @@ function startTmuxStreaming(userInput: string) {
   streamState = "WAITING";
   broadcast({ type: "voice_status", state: "thinking" });
 
-  // 50ms file watcher — reads new bytes from stream file
+  // 50ms file watcher — detects new pipe output as activity signal
   streamWatcher = setInterval(() => {
     try {
       const stat = statSync(STREAM_FILE);
-      if (stat.size <= streamFileOffset) return;
-
-      const fd = openSync(STREAM_FILE, "r");
-      const buf = Buffer.alloc(stat.size - streamFileOffset);
-      readSync(fd, buf, 0, buf.length, streamFileOffset);
-      closeSync(fd);
-      streamFileOffset = stat.size;
-
-      const raw = buf.toString("utf-8");
-      const cleaned = stripAnsi(raw);
-      if (cleaned.trim()) {
-        processStreamChunk(cleaned);
+      if (stat.size > streamFileOffset) {
+        streamFileOffset = stat.size;
+        onStreamActivity();
+      } else {
+        // No new data — if quiet long enough after activity, schedule done check
+        const quietMs = Date.now() - lastStreamActivity;
+        if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
+          scheduleDoneCheck();
+        }
       }
     } catch {}
   }, 50);
 
+  // Independent checker — runs every 1s to:
+  // 1. Catch completion when pipe activity keeps canceling the done-check timer
+  // 2. Trigger incremental TTS for text that appeared between tool calls
+  promptCheckInterval = setInterval(() => {
+    if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
+    if (!sawActivity) return;
+    const pane = captureTmuxPane();
+    if (hasPromptReady(pane) && !hasSpinnerChars(pane)) {
+      console.log("[stream] Prompt-ready detected by independent checker");
+      handleStreamDone();
+    } else if (streamState === "RESPONDING") {
+      // Not done yet — but broadcast content and trigger incremental TTS
+      broadcastCurrentOutput();
+    }
+  }, 1000);
+
   // Overall timeout
   streamTimeout = setTimeout(() => {
     console.log(`[stream] Timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
-    // Try final extraction before giving up
     const pane = captureTmuxPane();
     const finalText = extractRawOutput(preInputSnapshot, pane, lastUserInput);
     if (finalText) {
@@ -952,7 +1060,7 @@ function handleStreamDone() {
   const elapsed = Date.now() - pollStartTime;
   stopTmuxStreaming();
 
-  console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s (buffer: ${responseBuffer.length} chars)`);
+  console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s`);
 
   // Take final snapshot for extraction
   const pane = captureTmuxPane();
@@ -962,8 +1070,8 @@ function handleStreamDone() {
   if (rawOutput) rawOutput = reflowText(rawOutput);
   const speakable = extractSpeakableText(preInputSnapshot, pane, lastUserInput);
 
-  // For transcript display: prefer speakable prose, then stream buffer, then raw
-  const displayText = speakable ? reflowText(speakable) : (responseBuffer ? reflowText(responseBuffer) : rawOutput);
+  // For transcript display: prefer speakable prose over raw tool output
+  const displayText = speakable ? reflowText(speakable) : rawOutput;
   if (displayText) {
     broadcast({
       type: "transcription",
@@ -974,16 +1082,16 @@ function handleStreamDone() {
     console.log(`[stream] Display (${displayText.length} chars): "${displayText.slice(0, 100)}"`);
   }
 
-  // TTS: speak the filtered/speakable portion
+  // TTS: speak only the portion not already spoken by incremental TTS
   if (speakable) {
     const unspoken = speakable.length > lastSpokenText.length
       ? speakable.slice(lastSpokenText.length).trim()
-      : speakable.trim();
+      : ""; // Already fully spoken by incremental TTS
 
     if (unspoken) {
       console.log(`[stream] Speaking (${unspoken.length} chars): "${unspoken.slice(0, 100)}..."`);
       lastSpokenText = speakable; // Save for replay
-      stopClientPlayback();
+      // Queue the final text — don't interrupt if incremental TTS is still playing
       speakText(unspoken);
     } else {
       console.log("[stream] Speakable found but nothing new to speak — broadcasting idle");
@@ -1014,7 +1122,13 @@ function stopTmuxStreaming() {
     clearTimeout(streamTimeout);
     streamTimeout = null;
   }
+  if (contentCheckTimer) {
+    clearTimeout(contentCheckTimer);
+    contentCheckTimer = null;
+  }
   cancelDoneCheck();
+  if (incrementalTtsTimer) { clearTimeout(incrementalTtsTimer); incrementalTtsTimer = null; }
+  if (promptCheckInterval) { clearInterval(promptCheckInterval); promptCheckInterval = null; }
   streamState = "IDLE";
 
   // Clean up stream file
@@ -1377,6 +1491,12 @@ function handleWsConnection(ws: WebSocket) {
   // Send current state
   ws.send(JSON.stringify({ type: "status", ...vmState }));
 
+  // Send current voice status so client doesn't get stuck on stale state
+  const currentVoiceState = streamState === "IDLE" || streamState === "DONE"
+    ? (ttsInProgress ? "speaking" : "idle")
+    : streamState.toLowerCase();
+  ws.send(JSON.stringify({ type: "voice_status", state: currentVoiceState }));
+
   // Send tmux session info
   ws.send(
     JSON.stringify({
@@ -1444,21 +1564,63 @@ function handleWsConnection(ws: WebSocket) {
 
   // Track whether next binary message is a wake-word check
   let pendingWakeCheck = false;
+  // Pre-buffer: WAV audio captured before recording started (speech onset)
+  let pendingPreBuffer: Buffer | null = null;
 
   ws.on("message", async (raw, isBinary) => {
     // Binary message = audio data to transcribe
     if (isBinary) {
       const audioData = raw as Buffer;
+
+      // If we're expecting a pre-buffer WAV, store it and wait for the main audio
+      if (pendingPreBuffer === null && pendingWakeCheck === false && (ws as any)._expectPreBuffer) {
+        pendingPreBuffer = audioData;
+        (ws as any)._expectPreBuffer = false;
+        console.log(`Received pre-buffer: ${audioData.length} bytes — waiting for main audio`);
+        return;
+      }
+
       const isWakeCheck = pendingWakeCheck;
       pendingWakeCheck = false;
 
-      console.log(`Received audio: ${audioData.length} bytes (wake_check=${isWakeCheck})`);
+      // Combine pre-buffer with main audio if available
+      let finalAudio = audioData;
+      if (pendingPreBuffer) {
+        const preBuffer = pendingPreBuffer;
+        pendingPreBuffer = null;
+        try {
+          finalAudio = combineAudioBuffers(preBuffer, audioData);
+          console.log(`Combined pre-buffer (${preBuffer.length}b) + main audio (${audioData.length}b) = ${finalAudio.length}b`);
+        } catch (err) {
+          console.error("Failed to combine pre-buffer:", (err as Error).message);
+          // Fall back to just the main audio
+          finalAudio = audioData;
+        }
+      }
+
+      console.log(`Received audio: ${finalAudio.length} bytes (wake_check=${isWakeCheck})`);
       broadcast({ type: "voice_status", state: "transcribing" });
 
-      const text = await transcribeAudio(audioData);
+      const text = await transcribeAudio(finalAudio);
 
       if (!text || text.length <= 1) {
         console.log("Blank transcription");
+        broadcast({ type: "voice_status", state: isWakeCheck ? "wake_no_match" : "blank" });
+        return;
+      }
+
+      // Filter Whisper hallucinations — common artifacts from blank/noisy audio
+      const lower = text.toLowerCase().trim();
+      const WHISPER_NOISE = [
+        /^\[.*\]$/,                          // [BLANK_AUDIO], [silence], [music], etc.
+        /^\(.*\)$/,                          // (silence), (background noise), etc.
+        /^(thank you\.?|thanks\.?|you\.?)$/i,  // Common Whisper hallucination
+        /^(bye\.?|okay\.?|yeah\.?)$/i,       // Single-word noise (too short to be real)
+        /^(hmm\.?|uh\.?|um\.?|ah\.?)$/i,    // Filler sounds
+        /^\.+$/,                             // Just dots
+      ];
+      if (WHISPER_NOISE.some(re => re.test(lower))) {
+        console.log(`Filtered Whisper noise: "${text}"`);
         broadcast({ type: "voice_status", state: isWakeCheck ? "wake_no_match" : "blank" });
         return;
       }
@@ -1490,6 +1652,13 @@ function handleWsConnection(ws: WebSocket) {
     }
 
     const msg = raw.toString();
+
+    // Pre-buffer marker — next binary is WAV pre-buffer, followed by main WebM audio
+    if (msg === "voice:prebuffer") {
+      (ws as any)._expectPreBuffer = true;
+      console.log("Pre-buffer signal received — next binary is WAV pre-buffer");
+      return;
+    }
 
     // Wake check marker — next binary message will be checked for wake word
     if (msg === "voice:wake_check") {
@@ -1731,12 +1900,12 @@ setInterval(async () => {
   }
 }, 60000);
 
-// Broadcast raw tmux pane content for the terminal panel (every 500ms)
+// Broadcast tmux pane content with ANSI colors for the terminal panel (every 500ms)
 let lastTerminalText = "";
 setInterval(() => {
   if (clients.size === 0) return;
   try {
-    const text = captureTmuxPane();
+    const text = captureTerminalPane();
     if (text && text !== lastTerminalText) {
       lastTerminalText = text;
       broadcast({ type: "terminal", text });
@@ -1745,7 +1914,7 @@ setInterval(() => {
 }, 500);
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Voice Panel v3 (VoiceMode): http://localhost:${PORT}`);
+  console.log(`Murmur: http://localhost:${PORT}`);
   console.log(`tmux session: ${TMUX_SESSION}`);
   console.log(`  Attach: tmux attach -t ${TMUX_SESSION}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);

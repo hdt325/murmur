@@ -1,5 +1,5 @@
 {
-  "name": "voice-panel-v3",
+  "name": "murmur",
   "private": true,
   "type": "module",
   "dependencies": {

@@ -6,7 +6,7 @@ set -e
 SERVER="http://localhost:3457"
 TMUX_SESSION="claude-voice"
 
-echo "=== Voice Panel Cycle Test ==="
+echo "=== Murmur Voice Cycle Test ==="
 echo ""
 
 # 1. Check server is up
