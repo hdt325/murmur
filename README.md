@@ -224,29 +224,30 @@ murmur/
 ├── package.json         # Node dependencies (express, ws, chokidar)
 ├── tsconfig.json        # TypeScript config
 ├── CLAUDE.md            # VoiceMode parameter constraints for Claude Code
-├── test-e2e.ts          # Full Playwright browser test suite (UI + voice flow)
-├── test-detection.ts    # Unit tests for tmux state detection (spinner, prompt)
-├── test-bugs.ts         # Regression tests for 11 specific bug fixes
-├── test-poll.sh         # Bash integration test for poll detection
-├── test-voice-cycle.sh  # Bash integration test for full voice cycle
-└── test-audio/          # Sample WAV files for E2E testing
+└── tests/
+    ├── test-e2e.ts      # Full Playwright browser test suite (UI + voice flow)
+    ├── test-detection.ts# Unit tests for tmux state detection (spinner, prompt)
+    ├── test-bugs.ts     # Regression tests for 11 specific bug fixes
+    ├── test-poll.sh     # Bash integration test for poll detection
+    ├── test-voice-cycle.sh # Bash integration test for full voice cycle
+    └── test-audio/      # Sample WAV files for E2E testing
 ```
 
 ## Testing
 
 ```bash
 # Full E2E browser tests (launches Chromium via Playwright)
-npx tsx test-e2e.ts
+npx tsx tests/test-e2e.ts
 
 # tmux state detection unit tests
-npx tsx test-detection.ts
+npx tsx tests/test-detection.ts
 
 # Bug regression tests
-npx tsx test-bugs.ts
+npx tsx tests/test-bugs.ts
 
 # Bash integration tests
-bash test-poll.sh
-bash test-voice-cycle.sh
+bash tests/test-poll.sh
+bash tests/test-voice-cycle.sh
 ```
 
 ## Troubleshooting

@@ -1,7 +1,8 @@
 node_modules/
 *.pem
 settings.json
-test-audio/
+tests/test-audio/
 Murmur.app/
 /tmp/
 *.output
+.DS_Store
