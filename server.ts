@@ -1,0 +1,1786 @@
+/**
+ * Voice Panel v3 — VoiceMode Edition
+ *
+ * Express + WebSocket bridge between the panel UI and Claude Code (in tmux).
+ * VoiceMode MCP handles all audio (TTS + STT). This server:
+ * - Manages the tmux session running Claude Code
+ * - Watches VoiceMode event log for real-time status (recording, TTS, STT)
+ * - Watches VoiceMode exchanges log for conversation transcriptions
+ * - Writes control signal files (speed, voice, mute, mic device)
+ * - Sends /conversation to tmux on panel button click
+ */
+
+import express from "express";
+import { WebSocketServer, WebSocket } from "ws";
+import { createServer } from "http";
+import { createServer as createHttpsServer } from "https";
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  existsSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+  readdirSync,
+  unlinkSync,
+} from "fs";
+import { execSync, execFileSync, execFile, spawn } from "child_process";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
+import { homedir } from "os";
+import chokidar from "chokidar";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = 3457;
+const HTTPS_PORT = 3458;
+const TS_HOSTNAME = "happys-mac-mini-2.tail4eed8e.ts.net";
+const TMUX_SESSION = "claude-voice";
+const HOME = homedir();
+const SETTINGS_FILE = join(__dirname, "settings.json");
+
+const WHISPER_URL = "http://127.0.0.1:2022";
+const KOKORO_URL = "http://127.0.0.1:8880";
+
+// Valid Kokoro TTS voice names
+const VALID_VOICES = new Set([
+  "af_sky", "af_heart", "af_nova", "am_adam", "am_echo",
+  "bf_emma", "bf_alice", "bm_george", "bm_daniel",
+  "ff_siwis", "ef_dora", "jf_alpha", "zf_xiaoxiao",
+]);
+
+// --- Service Health Checks ---
+
+async function checkService(name: string, url: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    // Any response (even 404) means the service is running
+    console.log(`  ✓ ${name} is running (${url})`);
+    return true;
+  } catch {
+    console.warn(`  ✗ ${name} is NOT reachable (${url})`);
+    return false;
+  }
+}
+
+async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean }> {
+  console.log("Checking services...");
+  const [whisper, kokoro] = await Promise.all([
+    checkService("Whisper STT", WHISPER_URL),
+    checkService("Kokoro TTS", KOKORO_URL),
+  ]);
+  if (!whisper) console.warn("  → Transcription will fail until Whisper is started");
+  if (!kokoro) console.warn("  → TTS will fail until Kokoro is started");
+  return { whisper, kokoro };
+}
+
+let serviceStatus = { whisper: false, kokoro: false };
+
+// VoiceMode log paths
+const VM_LOGS = join(HOME, ".voicemode", "logs");
+const VM_EVENTS_DIR = join(VM_LOGS, "events");
+const VM_EXCHANGES_DIR = join(VM_LOGS, "conversations");
+
+const app = express();
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+// --- tmux Session Management ---
+
+function isTmuxSessionAlive(): boolean {
+  try {
+    execSync(`tmux has-session -t ${TMUX_SESSION} 2>/dev/null`, {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createTmuxSession() {
+  if (isTmuxSessionAlive()) {
+    console.log(`tmux session "${TMUX_SESSION}" already exists`);
+    return;
+  }
+
+  try {
+    execSync(
+      `tmux new-session -d -s ${TMUX_SESSION} -x 120 -y 30`,
+      { stdio: "ignore", timeout: 5000 }
+    );
+
+    execSync(
+      `tmux send-keys -t ${TMUX_SESSION} 'claude --dangerously-skip-permissions' Enter`,
+      { stdio: "ignore", timeout: 5000 }
+    );
+
+    console.log(`tmux session "${TMUX_SESSION}" created with claude`);
+    console.log(`  Attach with: tmux attach -t ${TMUX_SESSION}`);
+  } catch (err) {
+    console.error("Failed to create tmux session:", (err as Error).message);
+  }
+}
+
+function sendToTmux(text: string) {
+  try {
+    // Use execFileSync with array args to avoid shell injection entirely
+    execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "-l", text], { stdio: "ignore", timeout: 5000 });
+    execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "C-m"], { stdio: "ignore", timeout: 5000 });
+  } catch (err) {
+    console.error("tmux send-keys failed:", (err as Error).message);
+  }
+}
+
+// --- Persistent Settings ---
+
+interface PanelSettings {
+  voice?: string;
+  speed?: number;
+}
+
+function loadSettings(): PanelSettings {
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      return JSON.parse(readFileSync(SETTINGS_FILE, "utf-8"));
+    }
+  } catch (err) {
+    console.error("Settings file corrupted, backing up and resetting:", (err as Error).message);
+    try {
+      renameSync(SETTINGS_FILE, SETTINGS_FILE + ".backup");
+    } catch {}
+  }
+  return {};
+}
+
+function saveSettings(updates: Partial<PanelSettings>) {
+  const current = loadSettings();
+  const merged = { ...current, ...updates };
+  // Atomic write: write to temp file then rename to prevent corruption on crash
+  const tmpFile = SETTINGS_FILE + ".tmp";
+  writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
+  renameSync(tmpFile, SETTINGS_FILE);
+}
+
+// On startup, write persisted settings to signal files so VoiceMode picks them up
+function initSignalFiles() {
+  const settings = loadSettings();
+  if (settings.voice) {
+    writeFileSync("/tmp/claude-tts-voice", settings.voice);
+    console.log(`  Restored voice: ${settings.voice}`);
+  }
+  if (settings.speed) {
+    writeFileSync("/tmp/claude-tts-speed", settings.speed.toString());
+    console.log(`  Restored speed: ${settings.speed}`);
+  }
+}
+
+// --- TTS Control ---
+
+function stopTts() {
+  stopClientPlayback();
+  try {
+    execSync("pkill -x afplay 2>/dev/null; pkill -x say 2>/dev/null", { stdio: "ignore", timeout: 3000 });
+  } catch {}
+}
+
+// --- Direct Voice Input: Transcribe + Type into tmux ---
+
+async function transcribeAudio(audioData: Buffer): Promise<string> {
+  if (!serviceStatus.whisper) {
+    // Re-check in case it came up since last check
+    serviceStatus.whisper = await checkService("Whisper STT", WHISPER_URL);
+    if (!serviceStatus.whisper) {
+      console.error("Whisper is not running — cannot transcribe");
+      broadcast({ type: "voice_status", state: "error", message: "Whisper STT not running" });
+      return "";
+    }
+  }
+
+  const tmpFile = "/tmp/voice-panel-audio.webm";
+  writeFileSync(tmpFile, audioData);
+
+  try {
+    const result = execSync(
+      `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
+        `-F "file=@${tmpFile}" -F "model=whisper-1"`,
+      { encoding: "utf-8", timeout: 10000 }
+    );
+    const json = JSON.parse(result);
+    return json.text?.trim() || "";
+  } catch (err) {
+    console.error("Whisper transcription failed:", (err as Error).message);
+    serviceStatus.whisper = false; // Mark as down so next call re-checks
+    return "";
+  }
+}
+
+// --- TTS Playback (streamed to clients via WebSocket) ---
+
+let ttsGeneration = 0;
+let ttsClientTimeout: ReturnType<typeof setTimeout> | null = null;
+let ttsInProgress = false;
+let ttsActiveGen = 0; // Generation of the audio currently playing on client
+
+async function speakText(text: string): Promise<void> {
+  // Cancel any current TTS (generation counter ensures old callbacks are discarded)
+  const myGen = ++ttsGeneration;
+  if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
+  if (ttsInProgress) {
+    broadcast({ type: "tts_stop" });
+  }
+  ttsInProgress = true;
+  const settings = loadSettings();
+  const voice = settings.voice || "af_sky";
+  const speed = settings.speed || 1;
+
+  // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
+  const speakable = text
+    .replace(/```[\s\S]*?```/g, "... code block omitted ...")
+    .replace(/`[^`]+`/g, "code snippet")
+    .replace(/https?:\/\/\S+/g, "")                    // URLs
+    .replace(/\b\S+\.(com|org|net|io|dev|ai|co)\b/gi, "") // domains
+    .replace(/(\/[\w.~-]+){3,}/g, "that path")          // file paths (3+ segments)
+    .replace(/[a-f0-9]{8,}/gi, "")                       // hex hashes/IDs
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")             // markdown links → just text
+    .replace(/[#*_]{2,}/g, "")                           // markdown formatting
+    .replace(/\s{2,}/g, " ")                             // collapse whitespace
+    .trim();
+
+  if (!speakable) {
+    ttsInProgress = false;
+    broadcast({ type: "voice_status", state: "idle" });
+    return;
+  }
+
+  const ttsText = speakable;
+
+  const ttsFile = `/tmp/voice-panel-tts-${Date.now()}.mp3`;
+  const payload = JSON.stringify({
+    model: "kokoro",
+    input: ttsText,
+    voice,
+    speed,
+  });
+
+  if (!serviceStatus.kokoro) {
+    // Re-check in case it came up since last check
+    serviceStatus.kokoro = await checkService("Kokoro TTS", KOKORO_URL);
+    if (!serviceStatus.kokoro) {
+      console.error("Kokoro is not running — cannot speak");
+      ttsInProgress = false;
+      broadcast({ type: "voice_status", state: "error", message: "Kokoro TTS not running" });
+      return;
+    }
+  }
+
+  console.log(`[tts] Requesting Kokoro TTS (${ttsText.length} chars, voice=${voice})...`);
+
+  const curl = spawn("curl", [
+    "-s", "-X", "POST",
+    `${KOKORO_URL}/v1/audio/speech`,
+    "-H", "Content-Type: application/json",
+    "-d", payload,
+    "--output", ttsFile,
+    "--max-time", "30",
+  ], { stdio: "ignore" });
+
+  curl.on("exit", (code) => {
+    // Superseded by a newer speakText call — discard
+    if (myGen !== ttsGeneration) {
+      try { unlinkSync(ttsFile); } catch {}
+      return;
+    }
+
+    if (code !== 0) {
+      console.error(`[tts] curl failed with code ${code}`);
+      ttsInProgress = false;
+      broadcast({ type: "voice_status", state: "idle" });
+      return;
+    }
+
+    if (!existsSync(ttsFile) || statSync(ttsFile).size < 100) {
+      console.error("[tts] Produced empty/missing file");
+      ttsInProgress = false;
+      broadcast({ type: "voice_status", state: "idle" });
+      return;
+    }
+
+    // Stream audio to clients (plays on their device, not server)
+    const audioData = readFileSync(ttsFile);
+    try { unlinkSync(ttsFile); } catch {}
+
+    console.log(`[tts] Streaming ${audioData.length} bytes to ${clients.size} clients`);
+    ttsActiveGen = myGen;
+    broadcastBinary(audioData);
+    broadcast({ type: "voice_status", state: "speaking" });
+
+    // Client sends "tts_done" when playback finishes; timeout as fallback
+    // Estimate duration: ~16KB/s for 24kHz mono MP3 at normal speed
+    const estimatedDurationMs = Math.max(5000, (audioData.length / 16000) * 1000 + 3000);
+    console.log(`[tts] Estimated playback: ${(estimatedDurationMs/1000).toFixed(1)}s`);
+    ttsClientTimeout = setTimeout(() => {
+      if (myGen !== ttsGeneration) return;
+      console.log("[tts] Client playback timeout — assuming done");
+      handleTtsDone();
+    }, estimatedDurationMs);
+  });
+
+  curl.on("error", (err) => {
+    if (myGen !== ttsGeneration) return;
+    console.error("[tts] curl spawn error:", err.message);
+    ttsInProgress = false;
+    broadcast({ type: "voice_status", state: "idle" });
+  });
+}
+
+function stopClientPlayback() {
+  ttsGeneration++;
+  if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
+  broadcast({ type: "tts_stop" });
+  ttsInProgress = false;
+}
+
+function handleTtsDone() {
+  // Ignore stale tts_done if a newer TTS is already in progress
+  if (ttsActiveGen !== ttsGeneration) {
+    console.log(`[tts] Ignoring stale tts_done (active=${ttsActiveGen} current=${ttsGeneration})`);
+    return;
+  }
+  if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
+  ttsInProgress = false;
+  console.log("[tts] TTS done — broadcasting idle");
+  broadcast({ type: "voice_status", state: "idle" });
+}
+
+function broadcastBinary(data: Buffer) {
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(data); } catch { clients.delete(ws); }
+    }
+  }
+}
+
+// --- Tmux Streaming State Machine ---
+// Uses `tmux pipe-pane` to stream output in real-time instead of polling snapshots.
+// Detects Claude's response, extracts text, speaks it via TTS.
+
+type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "DONE";
+
+let streamState: StreamState = "IDLE";
+let streamWatcher: ReturnType<typeof setInterval> | null = null;
+let streamTimeout: ReturnType<typeof setTimeout> | null = null;
+let streamFileOffset = 0;
+let responseBuffer = "";
+let lastBroadcastText = "";
+let incompleteLineBuffer = "";
+let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
+const STREAM_FILE = `/tmp/claude-voice-stream-${process.pid}.raw`;
+const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
+const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
+let preInputSnapshot: string = "";
+
+// Strip ANSI escape codes from raw pipe-pane output
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")   // CSI (colors, cursor)
+    .replace(/\x1B\][^\x07]*\x07/g, "")        // OSC (title)
+    .replace(/\x1B[()][AB012]/g, "")            // Charset
+    .replace(/\x1B[>=<]/g, "")                  // Mode
+    .replace(/\r/g, "");                         // CR
+}
+
+// Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
+
+// Capture visible pane only (what you'd see on screen) — for display
+function captureVisiblePane(): string {
+  try {
+    return execSync(
+      `tmux capture-pane -t ${TMUX_SESSION} -p`,
+      { encoding: "utf-8", timeout: 2000 }
+    );
+  } catch {
+    return "";
+  }
+}
+
+// Capture with scrollback (200 lines) — for polling/extraction logic
+function captureTmuxPane(): string {
+  try {
+    return execSync(
+      `tmux capture-pane -t ${TMUX_SESSION} -p -S -2000`,
+      { encoding: "utf-8", timeout: 2000 }
+    );
+  } catch {
+    return "";
+  }
+}
+
+// Pattern-based spinner detection: Claude Code spinners look like "✶ Roosting…" or "· Shimmying… (3s · ↓ 85 tokens)"
+// Pattern: <symbol> <SingleWord>… [optional timing info]
+// The regex is specific enough (requires single word before …) to avoid false positives.
+// Allow up to 120 chars to accommodate timing info like "(13m 26s · ↓ 10.6k tokens · thought for 15s)"
+const SPINNER_REGEX = /^[^\w\d\s]\s+\w+…/;
+
+function isSpinnerLine(trimmed: string): boolean {
+  return trimmed.length < 120 && SPINNER_REGEX.test(trimmed);
+}
+
+function hasSpinnerChars(pane: string): boolean {
+  // Claude Code TUI layout: content area → separator (─────) → ❯ → separator → status bar
+  // The spinner appears in the CONTENT AREA above the separator, not after ❯.
+  // ❯ is always visible (it's the TUI input field), so we check for spinners
+  // between the user's input line and the bottom TUI chrome.
+  const lines = pane.split("\n");
+
+  // Find bottom TUI chrome: separator line above the always-present ❯
+  let bottomPromptIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^❯\s*$/.test(lines[i].trim())) { bottomPromptIdx = i; break; }
+  }
+
+  // Find the separator just above ❯ (within 3 lines)
+  let contentEnd = bottomPromptIdx >= 0 ? bottomPromptIdx : lines.length;
+  if (bottomPromptIdx > 0) {
+    for (let i = bottomPromptIdx - 1; i >= Math.max(0, bottomPromptIdx - 3); i--) {
+      if (/^[─━═]{3,}/.test(lines[i].trim())) { contentEnd = i; break; }
+    }
+  }
+
+  // Find user input line to limit search scope
+  const inputIdx = findUserInputLine(lines, lastUserInput);
+  const startIdx = inputIdx >= 0 ? inputIdx + 1 : Math.max(0, contentEnd - 30);
+
+  // Check content area for spinner lines
+  for (let i = startIdx; i < contentEnd; i++) {
+    if (isSpinnerLine(lines[i].trim())) return true;
+  }
+  return false;
+}
+
+function hasResponseMarkers(pane: string): boolean {
+  // Only check for NEW response markers not present in pre-input snapshot
+  const preMarkerCount = (preInputSnapshot.match(/⏺/g) || []).length;
+  const curMarkerCount = (pane.match(/⏺/g) || []).length;
+  return curMarkerCount > preMarkerCount;
+}
+
+function findUserInputLine(lines: string[], userInput: string): number {
+  // Match the start of the input (first line, first 35 chars) to handle tmux line wrapping
+  // Use only the first line since voice transcriptions can be multi-line
+  const firstLine = userInput.trim().split("\n")[0].trim();
+  const inputStart = firstLine.slice(0, 35);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("❯ ") && trimmed.slice(2).trim().startsWith(inputStart)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function hasPromptReady(pane: string): boolean {
+  // Claude Code TUI always shows ❯ at the bottom (it's the input field).
+  // "Prompt ready" means: ❯ is visible AND no spinner in the content area.
+  // The spinner disappears only when Claude's turn is fully complete.
+  const lines = pane.split("\n");
+
+  // Find the bottom TUI ❯ prompt
+  let bottomPromptIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^❯\s*$/.test(lines[i].trim())) { bottomPromptIdx = i; break; }
+  }
+  if (bottomPromptIdx < 0) return false;
+
+  // Find separator above ❯
+  let contentEnd = bottomPromptIdx;
+  for (let i = bottomPromptIdx - 1; i >= Math.max(0, bottomPromptIdx - 3); i--) {
+    if (/^[─━═]{3,}/.test(lines[i].trim())) { contentEnd = i; break; }
+  }
+
+  // Find user input line (may have scrolled off for long responses)
+  const inputIdx = findUserInputLine(lines, lastUserInput);
+  // If input scrolled off, check last 30 lines before separator for spinners
+  const checkStart = inputIdx >= 0 ? inputIdx + 1 : Math.max(0, contentEnd - 30);
+
+  // Check that NO spinner exists in content area
+  for (let i = checkStart; i < contentEnd; i++) {
+    if (isSpinnerLine(lines[i].trim())) return false;
+  }
+
+  return true; // ❯ exists and no spinner → Claude is done
+}
+
+// Get lines after user's input from the tmux pane
+function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput: string): string[] {
+  const postLines = postSnapshot.split("\n");
+  const inputLineIdx = findUserInputLine(postLines, userInput);
+
+  let newLines: string[];
+  if (inputLineIdx >= 0) {
+    newLines = postLines.slice(inputLineIdx);
+  } else {
+    const preLines = preSnapshot.split("\n");
+    let diffStart = 0;
+    for (let i = 0; i < Math.min(preLines.length, postLines.length); i++) {
+      if (preLines[i] !== postLines[i]) { diffStart = i; break; }
+      diffStart = i + 1;
+    }
+    newLines = postLines.slice(diffStart);
+  }
+
+  // Skip user's input lines (which may wrap across many tmux lines)
+  const inputLower = userInput.trim().toLowerCase();
+  let startIdx = 0;
+  for (let i = 0; i < newLines.length; i++) {
+    const t = newLines[i].trim();
+    if (!t) continue;
+    if (t.startsWith("❯")) { startIdx = i + 1; continue; }
+    if (t.length >= 5 && inputLower.includes(t.toLowerCase())) { startIdx = i + 1; continue; }
+    break;
+  }
+  return newLines.slice(startIdx);
+}
+
+// Raw CLI output for app display — only strip tmux chrome, keep everything Claude outputs
+function extractRawOutput(preSnapshot: string, postSnapshot: string, userInput: string): string {
+  const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
+  const cleaned: string[] = [];
+  let foundContent = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!foundContent && !trimmed) continue;
+
+    // Only skip pure tmux/terminal chrome
+    if (/^[─━═]{3,}/.test(trimmed)) continue;
+    if (/^❯/.test(trimmed)) continue; // Skip all prompt lines
+    if (/bypass\s+permissions/i.test(trimmed)) continue;
+    if (/^⏵/.test(trimmed)) continue;
+    if (isSpinnerLine(trimmed)) continue;
+    // Skip context/compact status lines
+    if (/context left until/i.test(trimmed)) continue;
+    if (/auto-compact/i.test(trimmed)) continue;
+
+    // Strip ⏺ response markers from display text
+    let clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
+    const cleanTrimmed = clean.trim();
+
+    // Skip bare ⏺ lines (streaming indicator with no content)
+    if (!cleanTrimmed) {
+      if (foundContent) cleaned.push("");
+      continue;
+    }
+
+    foundContent = true;
+    cleaned.push(clean);
+  }
+
+  while (cleaned.length > 0 && !cleaned[cleaned.length - 1].trim()) cleaned.pop();
+  return cleaned.join("\n").trim();
+}
+
+// Filtered text for TTS — strip chrome, tool calls, code, and non-prose content
+function extractSpeakableText(preSnapshot: string, postSnapshot: string, userInput: string): string {
+  const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
+  const cleaned: string[] = [];
+  let foundContent = false;
+  let inToolBlock = false; // Track when inside a tool call block
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!foundContent && !trimmed) continue;
+
+    // Skip tmux chrome
+    if (/^[─━═]{3,}/.test(trimmed)) continue;
+    if (/^❯/.test(trimmed)) continue; // Skip all prompt lines (bare or with suggested text)
+    if (/bypass\s+permissions/i.test(trimmed)) continue;
+    if (/^⏵/.test(trimmed)) continue;
+    // Skip context/compact status lines
+    if (/context left until/i.test(trimmed)) continue;
+    if (/auto-compact/i.test(trimmed)) continue;
+
+    // Skip spinners and timing summaries
+    if (isSpinnerLine(trimmed)) continue;
+    if (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) continue;
+
+    // Skip ctrl hints
+    if (/^(ctrl|⌃|esc to|press)/i.test(trimmed)) continue;
+    if (/\bctrl\+[a-z]\b/i.test(trimmed)) continue;
+
+    // Skip tool summaries
+    if (/^Read \d+ files?/i.test(trimmed)) continue;
+    if (/^Searched for \d+/i.test(trimmed)) continue;
+    if (/^Wrote \d+/i.test(trimmed)) continue;
+    if (/^Edited \d+/i.test(trimmed)) continue;
+    if (/^Ran /i.test(trimmed) && trimmed.length < 60) continue;
+    if (/Interrupted/.test(trimmed)) continue;
+    if (/Running…/.test(trimmed)) continue;
+
+    // Skip todo items
+    if (/^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed)) continue;
+
+    // Skip expand hints
+    if (/ctrl\+o/i.test(trimmed)) continue;
+    if (/^\+\d+ lines/.test(trimmed)) continue;
+    if (/^… \+\d+/.test(trimmed)) continue;
+
+    // Tool block tracking: ⏺ ToolName( starts a block, ⏺ prose ends it
+    if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
+      inToolBlock = true;
+      continue;
+    }
+    // ⎿ lines are tool output — stay in tool block
+    if (/^⎿/.test(trimmed)) {
+      inToolBlock = true;
+      continue;
+    }
+    // Bare tool calls
+    if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/.test(trimmed)) {
+      inToolBlock = true;
+      continue;
+    }
+
+    // ⏺ followed by prose (not a tool name) = new prose paragraph, exit tool block
+    if (/^⏺\s+/.test(trimmed) && !/^⏺\s+\w+[\s(]?$/.test(trimmed)) {
+      inToolBlock = false;
+    }
+    // A line that doesn't start with spaces/indent after a tool block = exiting tool block
+    if (inToolBlock) {
+      // Indented lines or lines starting with special chars are still tool output
+      if (/^\s{2,}/.test(line) || /^[^a-zA-Z⏺]/.test(trimmed)) continue;
+      // Non-indented prose line = tool block ended
+      inToolBlock = false;
+    }
+
+    // Lines that are clearly file paths or command output
+    if (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100) continue;
+
+    // Strip ⏺ markers from prose
+    let clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
+
+    if (clean.trim()) {
+      foundContent = true;
+      cleaned.push(clean);
+    } else if (foundContent) {
+      cleaned.push("");
+    }
+  }
+
+  while (cleaned.length > 0 && !cleaned[cleaned.length - 1].trim()) cleaned.pop();
+  return cleaned.join("\n").trim();
+}
+
+let lastUserInput = "";
+let pollStartTime = 0;
+let sawActivity = false;
+let lastSpokenText = "";  // Track what we've already spoken to avoid repeats
+
+// Strip tmux/Claude Code chrome from visible pane lines
+function stripChrome(lines: string[]): string[] {
+  const cleaned: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) { if (cleaned.length > 0) cleaned.push(""); continue; }
+    if (/^[▐▝▘]/.test(t)) continue;
+    if (/Claude Code v/.test(t)) continue;
+    if (/Opus \d|Claude Max/.test(t)) continue;
+    if (/~\//.test(t) && t.length < 60 && !t.includes(" ")) continue;
+    if (/^[─━═]{3,}/.test(t)) continue;
+    if (/bypass\s+permissions/i.test(t)) continue;
+    if (/^⏵/.test(t)) continue;
+    if (/^❯\s*$/.test(t)) continue;
+    if (/ctrl\+[a-z]/i.test(t) && t.length < 60) continue;
+    if (/shift\+tab/i.test(t)) continue;
+    cleaned.push(line);
+  }
+  while (cleaned.length > 0 && !cleaned[0].trim()) cleaned.shift();
+  while (cleaned.length > 0 && !cleaned[cleaned.length - 1].trim()) cleaned.pop();
+  return cleaned;
+}
+
+// Reflow tmux-wrapped lines into natural paragraphs.
+// Tmux hard-wraps at terminal width (120 cols), which looks broken in the UI.
+// Join consecutive non-empty lines into paragraphs, preserving intentional breaks.
+function reflowText(text: string): string {
+  const lines = text.split("\n");
+  const paragraphs: string[] = [];
+  let current = "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Empty line = paragraph break
+    if (!trimmed) {
+      if (current) { paragraphs.push(current); current = ""; }
+      continue;
+    }
+
+    // Lines starting with structural markers get their own line
+    if (/^[-*•]\s/.test(trimmed) || /^\d+[.)]\s/.test(trimmed) ||
+        /^⏺/.test(trimmed) || /^⎿/.test(trimmed) || /^>/.test(trimmed)) {
+      if (current) { paragraphs.push(current); current = ""; }
+      current = trimmed;
+      continue;
+    }
+
+    // Otherwise join with previous line (reflow tmux wrap)
+    if (current) {
+      current += " " + trimmed;
+    } else {
+      current = trimmed;
+    }
+  }
+  if (current) paragraphs.push(current);
+
+  return paragraphs.join("\n\n");
+}
+
+// Normalize spinner chars so overlap detection isn't broken by changing spinner glyphs
+function normalizeSpinners(text: string): string {
+  return text.replace(/[✻✳✢✽✶·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "•");
+}
+
+// Broadcast accumulated stream buffer to app for display.
+function broadcastAccumulatedOutput() {
+  if (!responseBuffer) return;
+  const reflowed = reflowText(responseBuffer);
+  if (!reflowed) return;
+
+  // Only broadcast if content actually changed
+  const normalized = normalizeSpinners(reflowed);
+  if (normalized === lastBroadcastText) return;
+  lastBroadcastText = normalized;
+
+  broadcast({
+    type: "transcription",
+    role: "assistant",
+    text: reflowed,
+    ts: Date.now(),
+    partial: true,
+  });
+}
+
+// Process each chunk of ANSI-stripped pipe output
+function processStreamChunk(newData: string) {
+  // Prepend any incomplete line from last chunk
+  const data = incompleteLineBuffer + newData;
+  incompleteLineBuffer = "";
+
+  const lines = data.split("\n");
+
+  // If data doesn't end with newline, last element is incomplete
+  if (!data.endsWith("\n")) {
+    incompleteLineBuffer = lines.pop() || "";
+  }
+
+  const startTime = pollStartTime;
+  const elapsed = Date.now() - startTime;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Skip context/compact status lines
+    if (/context left until/i.test(line)) continue;
+    if (/auto-compact/i.test(line)) continue;
+
+    // Skip tmux chrome
+    if (/^[─━═]{3,}/.test(line)) continue;
+    if (/bypass\s+permissions/i.test(line)) continue;
+    if (/^⏵/.test(line)) continue;
+    if (/^[▐▝▘]/.test(line)) continue;
+    if (/Claude Code v/.test(line)) continue;
+    if (/Opus \d|Claude Max/.test(line)) continue;
+    if (/ctrl\+[a-z]/i.test(line) && line.length < 60) continue;
+    if (/shift\+tab/i.test(line)) continue;
+
+    // Spinner detected → THINKING
+    if (isSpinnerLine(line)) {
+      if (streamState === "WAITING" || streamState === "THINKING") {
+        if (streamState !== "THINKING") {
+          streamState = "THINKING";
+          console.log(`[stream] → THINKING (${(elapsed/1000).toFixed(1)}s)`);
+          broadcast({ type: "voice_status", state: "thinking" });
+        }
+        cancelDoneCheck();
+      }
+      continue;
+    }
+
+    // Bare prompt ❯ — possible done signal
+    if (/^❯\s*$/.test(line)) {
+      if (streamState === "RESPONDING") {
+        scheduleDoneCheck();
+      } else if ((streamState === "THINKING" || streamState === "WAITING") && elapsed > 1500) {
+        scheduleDoneCheck();
+      }
+      continue;
+    }
+
+    // Skip prompt lines with suggested text
+    if (/^❯/.test(line)) continue;
+
+    // ⏺ marker or content after it → RESPONDING
+    if (/^⏺/.test(line) || (streamState === "RESPONDING" && line.length > 0)) {
+      cancelDoneCheck();
+      if (streamState !== "RESPONDING") {
+        streamState = "RESPONDING";
+        console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
+        broadcast({ type: "voice_status", state: "responding" });
+      }
+
+      // Strip ⏺ marker and accumulate
+      const content = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "").trim();
+      if (content) {
+        // Dedupe: skip if this line is already at the tail of responseBuffer
+        const bufferTail = responseBuffer.split("\n").slice(-1)[0]?.trim();
+        if (content !== bufferTail) {
+          responseBuffer += (responseBuffer ? "\n" : "") + content;
+          broadcastAccumulatedOutput();
+        }
+      }
+      continue;
+    }
+
+    // Any other content while in WAITING/THINKING could be response start
+    if (streamState === "WAITING" || streamState === "THINKING") {
+      // ⎿ lines are tool output
+      if (/^⎿/.test(line)) {
+        cancelDoneCheck();
+        if (streamState !== "THINKING") {
+          streamState = "THINKING";
+          broadcast({ type: "voice_status", state: "thinking" });
+        }
+        continue;
+      }
+    }
+  }
+}
+
+function cancelDoneCheck() {
+  if (doneCheckTimer) {
+    clearTimeout(doneCheckTimer);
+    doneCheckTimer = null;
+  }
+}
+
+function scheduleDoneCheck() {
+  cancelDoneCheck();
+  doneCheckTimer = setTimeout(() => {
+    // Confirm with a single capture-pane snapshot
+    const pane = captureTmuxPane();
+    if (hasPromptReady(pane)) {
+      handleStreamDone();
+    } else {
+      // Not actually done, retry
+      scheduleDoneCheck();
+    }
+  }, DONE_QUIET_MS);
+}
+
+function startTmuxStreaming(userInput: string) {
+  if (streamState !== "IDLE") {
+    stopTmuxStreaming();
+  }
+
+  lastUserInput = userInput;
+  pollStartTime = Date.now();
+  sawActivity = false;
+  lastBroadcastText = "";
+  lastSpokenText = "";
+  responseBuffer = "";
+  streamFileOffset = 0;
+  incompleteLineBuffer = "";
+  stopClientPlayback(); // Stop any current TTS before new input
+
+  // Take snapshot BEFORE sendToTmux is called — captures the clean prompt state
+  preInputSnapshot = captureTmuxPane();
+  console.log(`[stream] Pre-snapshot: ${(preInputSnapshot.match(/^❯/gm) || []).length} prompts`);
+
+  // Truncate stream file and set up pipe-pane
+  try { writeFileSync(STREAM_FILE, ""); } catch {}
+  try { execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, { stdio: "ignore", timeout: 2000 }); } catch {} // close existing
+  try { execSync(`tmux pipe-pane -O -t ${TMUX_SESSION} 'cat >> ${STREAM_FILE}'`, { stdio: "ignore", timeout: 2000 }); } catch (e) {
+    console.error("[stream] Failed to start pipe-pane:", e);
+  }
+
+  streamState = "WAITING";
+  broadcast({ type: "voice_status", state: "thinking" });
+
+  // 50ms file watcher — reads new bytes from stream file
+  streamWatcher = setInterval(() => {
+    try {
+      const stat = statSync(STREAM_FILE);
+      if (stat.size <= streamFileOffset) return;
+
+      const fd = openSync(STREAM_FILE, "r");
+      const buf = Buffer.alloc(stat.size - streamFileOffset);
+      readSync(fd, buf, 0, buf.length, streamFileOffset);
+      closeSync(fd);
+      streamFileOffset = stat.size;
+
+      const raw = buf.toString("utf-8");
+      const cleaned = stripAnsi(raw);
+      if (cleaned.trim()) {
+        processStreamChunk(cleaned);
+      }
+    } catch {}
+  }, 50);
+
+  // Overall timeout
+  streamTimeout = setTimeout(() => {
+    console.log(`[stream] Timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
+    // Try final extraction before giving up
+    const pane = captureTmuxPane();
+    const finalText = extractRawOutput(preInputSnapshot, pane, lastUserInput);
+    if (finalText) {
+      handleStreamDone();
+    } else {
+      stopTmuxStreaming();
+      broadcast({ type: "voice_status", state: "idle" });
+    }
+  }, STREAM_TIMEOUT_MS);
+
+  console.log(`[stream] Started pipe-pane → ${STREAM_FILE}`);
+}
+
+function handleStreamDone() {
+  streamState = "DONE";
+  const elapsed = Date.now() - pollStartTime;
+  stopTmuxStreaming();
+
+  console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s (buffer: ${responseBuffer.length} chars)`);
+
+  // Take final snapshot for extraction
+  const pane = captureTmuxPane();
+
+  // Extract both raw and speakable text from final snapshot
+  let rawOutput = extractRawOutput(preInputSnapshot, pane, lastUserInput);
+  if (rawOutput) rawOutput = reflowText(rawOutput);
+  const speakable = extractSpeakableText(preInputSnapshot, pane, lastUserInput);
+
+  // For transcript display: prefer speakable prose, then stream buffer, then raw
+  const displayText = speakable ? reflowText(speakable) : (responseBuffer ? reflowText(responseBuffer) : rawOutput);
+  if (displayText) {
+    broadcast({
+      type: "transcription",
+      role: "assistant",
+      text: displayText,
+      ts: Date.now(),
+    });
+    console.log(`[stream] Display (${displayText.length} chars): "${displayText.slice(0, 100)}"`);
+  }
+
+  // TTS: speak the filtered/speakable portion
+  if (speakable) {
+    const unspoken = speakable.length > lastSpokenText.length
+      ? speakable.slice(lastSpokenText.length).trim()
+      : speakable.trim();
+
+    if (unspoken) {
+      console.log(`[stream] Speaking (${unspoken.length} chars): "${unspoken.slice(0, 100)}..."`);
+      lastSpokenText = speakable; // Save for replay
+      stopClientPlayback();
+      speakText(unspoken);
+    } else {
+      console.log("[stream] Speakable found but nothing new to speak — broadcasting idle");
+      broadcast({ type: "voice_status", state: "idle" });
+    }
+  } else if (!rawOutput) {
+    console.log("[stream] No output extracted — pane tail:");
+    const tail = pane.split("\n").slice(-15).map(l => `  |${l}`).join("\n");
+    console.log(tail);
+    broadcast({ type: "voice_status", state: "idle" });
+  } else {
+    // Raw output exists but nothing speakable (e.g. just tool calls)
+    console.log(`[stream] Raw output but nothing speakable — broadcasting idle`);
+    console.log(`[stream] Raw output: "${rawOutput.slice(0, 200)}"`);
+    broadcast({ type: "voice_status", state: "idle" });
+  }
+}
+
+function stopTmuxStreaming() {
+  // Close pipe-pane
+  try { execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, { stdio: "ignore", timeout: 2000 }); } catch {}
+
+  if (streamWatcher) {
+    clearInterval(streamWatcher);
+    streamWatcher = null;
+  }
+  if (streamTimeout) {
+    clearTimeout(streamTimeout);
+    streamTimeout = null;
+  }
+  cancelDoneCheck();
+  streamState = "IDLE";
+
+  // Clean up stream file
+  try { unlinkSync(STREAM_FILE); } catch {}
+}
+
+// --- VoiceMode Event Log Watching ---
+// Watches ~/.voicemode/logs/events/*.jsonl for real-time status
+
+let eventsLogSize = 0;
+let currentEventsFile = "";
+
+function findTodayEventsFile(): string {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return join(VM_EVENTS_DIR, `voicemode_events_${today}.jsonl`);
+}
+
+function initEventsLog() {
+  currentEventsFile = findTodayEventsFile();
+  try {
+    if (existsSync(currentEventsFile)) {
+      eventsLogSize = statSync(currentEventsFile).size;
+    }
+  } catch {}
+}
+
+function readNewEvents() {
+  // Check if day rolled over
+  const todayFile = findTodayEventsFile();
+  if (todayFile !== currentEventsFile) {
+    currentEventsFile = todayFile;
+    eventsLogSize = 0;
+  }
+
+  if (!existsSync(currentEventsFile)) return;
+
+  try {
+    const newSize = statSync(currentEventsFile).size;
+    if (newSize <= eventsLogSize) {
+      eventsLogSize = newSize;
+      return;
+    }
+    const buf = Buffer.alloc(newSize - eventsLogSize);
+    let fd: number | null = null;
+    try {
+      fd = openSync(currentEventsFile, "r");
+      readSync(fd, buf, 0, buf.length, eventsLogSize);
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
+    eventsLogSize = newSize;
+
+    const lines = buf.toString().trim().split("\n");
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line);
+        handleVoiceModeEvent(event);
+      } catch {}
+    }
+  } catch {
+    eventsLogSize = 0;
+  }
+}
+
+// --- VoiceMode Exchanges Log Watching ---
+// Watches ~/.voicemode/logs/conversations/*.jsonl for transcriptions
+
+let exchangesLogSize = 0;
+let currentExchangesFile = "";
+
+function findTodayExchangesFile(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return join(VM_EXCHANGES_DIR, `exchanges_${today}.jsonl`);
+}
+
+function initExchangesLog() {
+  currentExchangesFile = findTodayExchangesFile();
+  try {
+    if (existsSync(currentExchangesFile)) {
+      exchangesLogSize = statSync(currentExchangesFile).size;
+    }
+  } catch {}
+}
+
+function readNewExchanges() {
+  const todayFile = findTodayExchangesFile();
+  if (todayFile !== currentExchangesFile) {
+    currentExchangesFile = todayFile;
+    exchangesLogSize = 0;
+  }
+
+  if (!existsSync(currentExchangesFile)) return;
+
+  try {
+    const newSize = statSync(currentExchangesFile).size;
+    if (newSize <= exchangesLogSize) {
+      exchangesLogSize = newSize;
+      return;
+    }
+    const buf = Buffer.alloc(newSize - exchangesLogSize);
+    let fd: number | null = null;
+    try {
+      fd = openSync(currentExchangesFile, "r");
+      readSync(fd, buf, 0, buf.length, exchangesLogSize);
+    } finally {
+      if (fd !== null) closeSync(fd);
+    }
+    exchangesLogSize = newSize;
+
+    const lines = buf.toString().trim().split("\n");
+    for (const line of lines) {
+      try {
+        const exchange = JSON.parse(line);
+        handleVoiceModeExchange(exchange);
+      } catch {}
+    }
+  } catch {
+    exchangesLogSize = 0;
+  }
+}
+
+// --- VoiceMode Event Handler ---
+
+// Phase tracks the detailed conversation state:
+// "idle" | "standby" | "speaking" | "listening" | "recording" | "transcribing" | "thinking" | "responding"
+let vmState = {
+  ttsPlaying: false,
+  micActive: false,
+  conversationActive: false,
+  phase: "idle" as string,
+};
+
+// Track whether the current converse() cycle had TTS (to detect standby mode)
+let currentCycleHadTts = false;
+
+// Timer to reset to idle after TOOL_REQUEST_END if no new events come
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleIdleReset(delayMs = 15000) {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if ((vmState.phase === "thinking" || vmState.phase === "standby") && !vmState.ttsPlaying && !vmState.micActive) {
+      // If the last cycle had no TTS, it was standby — go to standby, not idle
+      // The conversation skill will keep looping, so stay in standby
+      if (!currentCycleHadTts && vmState.conversationActive) {
+        vmState.phase = "standby";
+      } else {
+        vmState.phase = "idle";
+        vmState.conversationActive = false;
+      }
+      broadcast({ type: "status", ...vmState });
+    }
+  }, delayMs);
+}
+
+function cancelIdleReset() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function handleVoiceModeEvent(event: { event_type: string; data?: Record<string, unknown> }) {
+  const prev = { ...vmState, phase: vmState.phase };
+
+  switch (event.event_type) {
+    case "TTS_START":
+      cancelIdleReset();
+      currentCycleHadTts = true;
+      vmState.conversationActive = true;
+      vmState.phase = "responding";
+      // Emit assistant message
+      if (event.data?.message) {
+        broadcast({
+          type: "transcription",
+          role: "assistant",
+          text: event.data.message as string,
+          ts: Date.now(),
+        });
+      }
+      break;
+    case "TTS_PLAYBACK_START":
+      cancelIdleReset();
+      vmState.ttsPlaying = true;
+      vmState.conversationActive = true;
+      vmState.phase = "speaking";
+      break;
+    case "TTS_PLAYBACK_END":
+      vmState.ttsPlaying = false;
+      vmState.phase = "listening";
+      break;
+    case "RECORDING_START":
+      cancelIdleReset();
+      vmState.micActive = true;
+      vmState.conversationActive = true;
+      // If no TTS happened this cycle, we're in standby (passive listen)
+      vmState.phase = currentCycleHadTts ? "recording" : "standby";
+      break;
+    case "RECORDING_END":
+      vmState.micActive = false;
+      vmState.phase = "transcribing";
+      break;
+    case "STT_START":
+      vmState.micActive = false;
+      vmState.phase = "transcribing";
+      break;
+    case "STT_COMPLETE":
+      vmState.micActive = false;
+      vmState.phase = "thinking";
+      // Emit user transcription
+      if (event.data?.text) {
+        broadcast({
+          type: "transcription",
+          role: "user",
+          text: event.data.text as string,
+          ts: Date.now(),
+        });
+      }
+      break;
+    case "SESSION_END":
+    case "TOOL_REQUEST_END":
+      vmState.ttsPlaying = false;
+      vmState.micActive = false;
+      vmState.phase = "thinking";
+      // If no new events arrive within 15s, assume conversation ended
+      scheduleIdleReset(15000);
+      break;
+    case "SESSION_START":
+    case "TOOL_REQUEST_START":
+      cancelIdleReset();
+      currentCycleHadTts = false; // Reset TTS tracker for new cycle
+      vmState.conversationActive = true;
+      if (vmState.phase === "thinking" || vmState.phase === "idle" || vmState.phase === "standby") {
+        // Don't assume "responding" — could be standby (skip_tts) listen
+        // If TTS_START follows, it'll set "responding"; if RECORDING_START follows, it's standby
+        vmState.phase = "responding";
+      }
+      break;
+    case "CONCH_ACQUIRE":
+      cancelIdleReset();
+      if (vmState.phase === "thinking" || vmState.phase === "idle") {
+        vmState.phase = "responding";
+      }
+      break;
+    case "CONCH_RELEASE":
+      break;
+    default:
+      return;
+  }
+
+  // Broadcast if anything changed
+  if (
+    vmState.ttsPlaying !== prev.ttsPlaying ||
+    vmState.micActive !== prev.micActive ||
+    vmState.conversationActive !== prev.conversationActive ||
+    vmState.phase !== prev.phase
+  ) {
+    broadcast({ type: "status", ...vmState });
+  }
+}
+
+function handleVoiceModeExchange(exchange: {
+  type: string;
+  text: string;
+  timestamp: string;
+}) {
+  const role = exchange.type === "stt" ? "user" : "assistant";
+  const ts = new Date(exchange.timestamp).getTime();
+  broadcast({ type: "transcription", role, text: exchange.text, ts });
+}
+
+// --- File Watching ---
+
+// Watch VoiceMode log directories
+const watchPaths: string[] = [];
+if (existsSync(VM_EVENTS_DIR)) watchPaths.push(VM_EVENTS_DIR);
+if (existsSync(VM_EXCHANGES_DIR)) watchPaths.push(VM_EXCHANGES_DIR);
+
+if (!existsSync(VM_EVENTS_DIR)) {
+  console.warn(`⚠ VoiceMode events dir not found: ${VM_EVENTS_DIR}`);
+  console.warn("  VoiceMode may not be installed or has not run yet.");
+}
+if (!existsSync(VM_EXCHANGES_DIR)) {
+  console.warn(`⚠ VoiceMode exchanges dir not found: ${VM_EXCHANGES_DIR}`);
+}
+if (watchPaths.length === 0) {
+  console.warn("⚠ No VoiceMode log dirs found — real-time status updates will be unavailable.");
+  console.warn("  Install VoiceMode and run it once to create the log directories.");
+}
+
+const watcher = chokidar.watch(watchPaths, {
+  persistent: true,
+  ignoreInitial: true,
+  awaitWriteFinish: false,
+  usePolling: false,
+});
+
+watcher.on("change", (filePath: string) => {
+  const name = filePath.split("/").pop()!;
+  if (name.startsWith("voicemode_events_")) {
+    readNewEvents();
+  } else if (name.startsWith("exchanges_")) {
+    readNewExchanges();
+  }
+});
+
+// Also watch for new files (day rollover)
+watcher.on("add", (filePath: string) => {
+  const name = filePath.split("/").pop()!;
+  if (name.startsWith("voicemode_events_")) {
+    currentEventsFile = filePath;
+    eventsLogSize = 0;
+    readNewEvents();
+  } else if (name.startsWith("exchanges_")) {
+    currentExchangesFile = filePath;
+    exchangesLogSize = 0;
+    readNewExchanges();
+  }
+});
+
+// Initialize log positions (skip existing content)
+initEventsLog();
+initExchangesLog();
+
+
+// --- WebSocket Handling ---
+
+const clients = new Set<WebSocket>();
+
+function broadcast(msg: Record<string, unknown>) {
+  const data = JSON.stringify(msg);
+  let sent = 0;
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(data);
+        sent++;
+      } catch {
+        clients.delete(ws);
+      }
+    } else {
+      clients.delete(ws);
+    }
+  }
+  if (msg.type === "transcription" || (msg.type === "voice_status" && msg.state !== "idle")) {
+    console.log(`[broadcast] ${msg.type}${msg.type === "transcription" ? ` (${(msg as any).role})` : ` (${(msg as any).state})`} → ${sent}/${clients.size} clients`);
+  }
+}
+
+setInterval(() => {
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+    else clients.delete(ws);
+  }
+}, 10000);
+
+function handleWsConnection(ws: WebSocket) {
+  clients.add(ws);
+
+  // Send current state
+  ws.send(JSON.stringify({ type: "status", ...vmState }));
+
+  // Send tmux session info
+  ws.send(
+    JSON.stringify({
+      type: "tmux",
+      session: TMUX_SESSION,
+      alive: isTmuxSessionAlive(),
+    })
+  );
+
+  // Send service status
+  ws.send(JSON.stringify({ type: "services", ...serviceStatus }));
+
+  // Send current panel settings (prefer persistent file, fall back to signal files)
+  {
+    const persisted = loadSettings();
+    const settings: Record<string, string> = {};
+    if (persisted.speed) settings.speed = persisted.speed.toString();
+    else { try { const v = readFileSync("/tmp/claude-tts-speed", "utf-8").trim(); if (v) settings.speed = v; } catch {} }
+    if (persisted.voice) settings.voice = persisted.voice;
+    else { try { const v = readFileSync("/tmp/claude-tts-voice", "utf-8").trim(); if (v) settings.voice = v; } catch {} }
+    try { const v = readFileSync("/tmp/claude-mic-mute", "utf-8").trim(); settings.muted = v === "1" ? "1" : "0"; } catch {}
+    ws.send(JSON.stringify({ type: "settings", ...settings }));
+  }
+
+  // Send recent transcriptions from today's event log
+  // (exchanges log may lag, events log has STT_COMPLETE and TTS_START with text)
+  try {
+    const evFile = findTodayEventsFile();
+    if (existsSync(evFile)) {
+      const content = readFileSync(evFile, "utf-8").trim();
+      if (content) {
+        const lines = content.split("\n");
+        const transcripts: { role: string; text: string; ts: number }[] = [];
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line);
+            if (event.event_type === "STT_COMPLETE" && event.data?.text) {
+              transcripts.push({
+                role: "user",
+                text: event.data.text,
+                ts: new Date(event.timestamp).getTime(),
+              });
+            } else if (event.event_type === "TTS_START" && event.data?.message) {
+              transcripts.push({
+                role: "assistant",
+                text: event.data.message,
+                ts: new Date(event.timestamp).getTime(),
+              });
+            }
+          } catch {}
+        }
+        // Send last 20
+        for (const t of transcripts.slice(-20)) {
+          ws.send(
+            JSON.stringify({
+              type: "transcription",
+              historic: true,
+              ...t,
+            })
+          );
+        }
+      }
+    }
+  } catch {}
+
+  // Track whether next binary message is a wake-word check
+  let pendingWakeCheck = false;
+
+  ws.on("message", async (raw, isBinary) => {
+    // Binary message = audio data to transcribe
+    if (isBinary) {
+      const audioData = raw as Buffer;
+      const isWakeCheck = pendingWakeCheck;
+      pendingWakeCheck = false;
+
+      console.log(`Received audio: ${audioData.length} bytes (wake_check=${isWakeCheck})`);
+      broadcast({ type: "voice_status", state: "transcribing" });
+
+      const text = await transcribeAudio(audioData);
+
+      if (!text || text.length <= 1) {
+        console.log("Blank transcription");
+        broadcast({ type: "voice_status", state: isWakeCheck ? "wake_no_match" : "blank" });
+        return;
+      }
+
+      console.log(`Transcription: "${text}"`);
+
+      if (isWakeCheck) {
+        // Check for wake word
+        const lower = text.toLowerCase();
+        // Use word boundaries to avoid false positives (e.g. "claudication", "cloudy")
+        if (/\bclaude\b/.test(lower) || /\bclyde\b/.test(lower) || /\bhey cloud\b/.test(lower)) {
+          console.log("Wake word detected!");
+          broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
+          // Snapshot BEFORE sending, then send, then start polling
+          startTmuxStreaming(text);
+          sendToTmux(text);
+        } else {
+          console.log(`No wake word in: "${text}"`);
+          broadcast({ type: "voice_status", state: "wake_no_match" });
+        }
+      } else {
+        // Direct send — no wake word check
+        broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
+        // Snapshot BEFORE sending, then send, then polling starts after delay
+        startTmuxStreaming(text);
+        sendToTmux(text);
+      }
+      return;
+    }
+
+    const msg = raw.toString();
+
+    // Wake check marker — next binary message will be checked for wake word
+    if (msg === "voice:wake_check") {
+      pendingWakeCheck = true;
+      return;
+    }
+
+    // Start conversation — interrupt any current operation, then send /conversation
+    if (msg === "conversation:start") {
+      if (!isTmuxSessionAlive()) {
+        createTmuxSession();
+        setTimeout(() => {
+          sendToTmux("/conversation");
+          vmState.conversationActive = true;
+          broadcast({ type: "status", ...vmState });
+          broadcast({ type: "conversation", state: "starting" });
+        }, 3000);
+        return;
+      }
+      // Interrupt any current operation, clear input line, then send
+      try {
+        execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 });
+      } catch {}
+      setTimeout(() => {
+        try {
+          // Clear any text in the input line
+          execSync(`tmux send-keys -t ${TMUX_SESSION} C-u`, { stdio: "ignore", timeout: 5000 });
+        } catch {}
+        setTimeout(() => {
+          sendToTmux("/conversation");
+          vmState.conversationActive = true;
+          broadcast({ type: "status", ...vmState });
+          broadcast({ type: "conversation", state: "starting" });
+        }, 300);
+      }, 500);
+      return;
+    }
+
+    // Stop conversation — send Escape to tmux to interrupt
+    if (msg === "conversation:stop") {
+      cancelIdleReset();
+      try {
+        execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 });
+      } catch {}
+      stopTts();
+      stopTmuxStreaming();
+      // Also try to kill any active recording
+      try { execSync("pkill -f 'rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      vmState = { ttsPlaying: false, micActive: false, conversationActive: false, phase: "idle" };
+      broadcast({ type: "status", ...vmState });
+      broadcast({ type: "voice_status", state: "idle" });
+      broadcast({ type: "conversation", state: "stopped" });
+      return;
+    }
+
+    // Stop — interrupt Claude + kill TTS + stop polling
+    if (msg === "stop") {
+      // Send Escape to tmux to interrupt current tool call (converse)
+      try { execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 }); } catch {}
+      stopTts();
+      stopTmuxStreaming();
+      // Also kill VoiceMode's sounddevice playback and any recording
+      try { execSync("pkill -f 'sounddevice\\|rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      vmState.ttsPlaying = false;
+      vmState.micActive = false;
+      broadcast({ type: "status", ...vmState });
+      broadcast({ type: "voice_status", state: "idle" });
+      broadcast({ type: "signal", name: "voice-stop" });
+      return;
+    }
+
+    // TTS playback complete (from client)
+    if (msg === "tts_done") {
+      console.log(`[tts] Received tts_done from client (activeGen=${ttsActiveGen} gen=${ttsGeneration})`);
+      handleTtsDone();
+      return;
+    }
+
+    // Speed
+    if (msg.startsWith("speed:")) {
+      const speed = parseFloat(msg.slice(6));
+      if (!isNaN(speed) && speed >= 0.5 && speed <= 3.0) {
+        writeFileSync("/tmp/claude-tts-speed", speed.toString());
+        saveSettings({ speed });
+      }
+      return;
+    }
+
+    // Voice
+    if (msg.startsWith("voice:")) {
+      const voice = msg.slice(6).trim();
+      if (voice && VALID_VOICES.has(voice)) {
+        writeFileSync("/tmp/claude-tts-voice", voice);
+        saveSettings({ voice });
+      } else if (voice) {
+        console.warn(`[voice] Rejected invalid voice name: "${voice}"`);
+      }
+      return;
+    }
+
+    // Mic device
+    if (msg.startsWith("mic:")) {
+      const deviceId = msg.slice(4).trim();
+      writeFileSync("/tmp/claude-mic-device", deviceId);
+      return;
+    }
+
+    // Mute
+    if (msg.startsWith("mute:")) {
+      const muted = msg.slice(5) === "1";
+      writeFileSync("/tmp/claude-mic-mute", muted ? "1" : "0");
+      return;
+    }
+
+    // Client-side log relay
+    if (msg.startsWith("log:")) {
+      console.log(`[client] ${msg.slice(4)}`);
+      return;
+    }
+
+    // Replay last spoken text
+    if (msg === "replay") {
+      if (lastSpokenText) {
+        console.log(`[replay] Re-speaking (${lastSpokenText.length} chars): "${lastSpokenText.slice(0, 80)}..."`);
+        stopClientPlayback();
+        speakText(lastSpokenText);
+      } else {
+        console.log("[replay] No previous text to replay");
+      }
+      return;
+    }
+
+    // Text input from terminal panel
+    if (msg.startsWith("text:")) {
+      const text = msg.slice(5);
+      if (text) {
+        console.log(`[terminal] Text input: "${text}"`);
+        broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
+        startTmuxStreaming(text);
+        sendToTmux(text);
+      }
+      return;
+    }
+  });
+
+  ws.on("close", () => clients.delete(ws));
+}
+
+wss.on("connection", handleWsConnection);
+
+// --- HTTP Endpoints ---
+
+app.get("/", (_req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.sendFile(join(__dirname, "index.html"));
+});
+
+app.get("/version", (_req, res) => {
+  res.json({ version: 15 });
+});
+
+app.get("/debug", (_req, res) => {
+  res.json({
+    wsClients: clients.size,
+    streamState,
+    ttsPlaying: ttsInProgress,
+    vmState,
+  });
+});
+
+app.get("/info", (_req, res) => {
+  const cli = {
+    pid: null as number | null,
+    cwd: null as string | null,
+    version: null as string | null,
+    tmuxSession: TMUX_SESSION,
+    tmuxAlive: isTmuxSessionAlive(),
+  };
+  try {
+    const ps = execSync(
+      "ps aux | grep -E '[c]laude' | grep -v 'voice-panel' | head -1",
+      { encoding: "utf-8" }
+    ).trim();
+    if (ps) {
+      const parts = ps.split(/\s+/);
+      const pid = parseInt(parts[1]);
+      if (pid) {
+        cli.pid = pid;
+        try {
+          cli.cwd =
+            execSync(
+              `lsof -p ${pid} 2>/dev/null | grep cwd | awk '{print $NF}'`,
+              { encoding: "utf-8" }
+            ).trim() || null;
+        } catch {}
+        try {
+          cli.version =
+            execSync("claude --version 2>/dev/null | head -1", {
+              encoding: "utf-8",
+            }).trim() || null;
+        } catch {}
+      }
+    }
+  } catch {}
+  res.json(cli);
+});
+
+// --- Start ---
+
+createTmuxSession();
+initSignalFiles();
+
+// Clean up orphaned TTS temp files from previous/crashed sessions
+try {
+  const tmpFiles = readdirSync("/tmp").filter(f => f.startsWith("voice-panel-tts-") && f.endsWith(".mp3"));
+  if (tmpFiles.length > 0) {
+    for (const f of tmpFiles) {
+      try { unlinkSync(join("/tmp", f)); } catch {}
+    }
+    console.log(`Cleaned up ${tmpFiles.length} orphaned TTS temp file(s)`);
+  }
+} catch {}
+
+// Check services on startup
+checkAllServices().then(status => {
+  serviceStatus = status;
+  broadcast({ type: "services", ...status });
+});
+
+// Re-check services periodically (every 60s)
+setInterval(async () => {
+  const prev = { ...serviceStatus };
+  serviceStatus.whisper = await checkService("Whisper STT", WHISPER_URL);
+  serviceStatus.kokoro = await checkService("Kokoro TTS", KOKORO_URL);
+  if (prev.whisper !== serviceStatus.whisper || prev.kokoro !== serviceStatus.kokoro) {
+    broadcast({ type: "services", ...serviceStatus });
+  }
+}, 60000);
+
+// Broadcast raw tmux pane content for the terminal panel (every 500ms)
+let lastTerminalText = "";
+setInterval(() => {
+  if (clients.size === 0) return;
+  try {
+    const text = captureTmuxPane();
+    if (text && text !== lastTerminalText) {
+      lastTerminalText = text;
+      broadcast({ type: "terminal", text });
+    }
+  } catch {}
+}, 500);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Voice Panel v3 (VoiceMode): http://localhost:${PORT}`);
+  console.log(`tmux session: ${TMUX_SESSION}`);
+  console.log(`  Attach: tmux attach -t ${TMUX_SESSION}`);
+  console.log(`  Watching: ${VM_EVENTS_DIR}`);
+  console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
+});
+
+// HTTPS server for remote access (Tailscale) — needed for mic permission on non-localhost
+const certPath = join(__dirname, "tailscale-cert.pem");
+const keyPath = join(__dirname, "tailscale-key.pem");
+if (existsSync(certPath) && existsSync(keyPath)) {
+  const httpsServer = createHttpsServer(
+    { cert: readFileSync(certPath), key: readFileSync(keyPath) },
+    app
+  );
+  const wssSecure = new WebSocketServer({ server: httpsServer });
+  wssSecure.on("connection", handleWsConnection);
+  httpsServer.listen(HTTPS_PORT, "0.0.0.0", () => {
+    console.log(`  HTTPS: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
+    console.log(`  Open on iPhone: https://${TS_HOSTNAME}:${HTTPS_PORT}`);
+  });
+} else {
+  console.log("  No Tailscale certs found — HTTPS disabled");
+  console.log("  Run: tailscale cert --cert-file tailscale-cert.pem --key-file tailscale-key.pem " + TS_HOSTNAME);
+}
+
+// Graceful shutdown
+function cleanup() {
+  console.log("Shutting down...");
+  stopTts();
+  stopTmuxStreaming();
+  watcher.close();
+  wss.close();
+  server.close();
+  process.exit(0);
+}
+
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
