@@ -792,49 +792,30 @@
   <section class="howto" id="howto">
     <div class="container">
       <h2>Getting Started</h2>
-      <p class="subtitle">Up and running in 5 minutes. Murmur connects to your existing Claude Code CLI session.</p>
+      <p class="subtitle">Download, open, talk. That's it.</p>
 
       <div class="steps">
         <div class="step">
           <div class="step-num">1</div>
           <div class="step-body">
-            <h3>Install Prerequisites</h3>
-            <p>You need <strong>Node.js 18+</strong>, <strong>Claude Code CLI</strong> (<code>npm i -g @anthropic-ai/claude-code</code>), and <strong>VoiceMode</strong> for local STT/TTS (<code>uv tool install voicemode</code>). On macOS, also install <code>tmux</code> via Homebrew.</p>
+            <h3>Download and Open</h3>
+            <p><a href="#download" style="color:var(--accent)">Download the app</a> for macOS or Windows. Open it -- Murmur checks for prerequisites, starts a Claude Code session, and connects automatically. A guided tour walks you through all controls on first launch.</p>
           </div>
         </div>
 
         <div class="step">
           <div class="step-num">2</div>
           <div class="step-body">
-            <h3>Start Voice Services</h3>
-            <p>Launch Whisper (speech-to-text) and Kokoro (text-to-speech) locally:<br>
-              <code>voicemode service whisper start</code><br>
-              <code>voicemode service kokoro start</code><br>
-              These run in the background and Murmur auto-detects them on startup.</p>
+            <h3>Talk or Type</h3>
+            <p>Tap the talk button or press <span class="kbd">Right Cmd</span> to start recording. Speak your request, release to send. Claude's response appears as conversation bubbles and is read aloud. Or just type in the text input.</p>
           </div>
         </div>
 
         <div class="step">
           <div class="step-num">3</div>
           <div class="step-body">
-            <h3>Launch Murmur</h3>
-            <p>Download the desktop app or run from source. Murmur opens as a floating panel, starts a Claude Code session in a terminal, and connects automatically. A guided tour walks you through all controls on first launch.</p>
-          </div>
-        </div>
-
-        <div class="step">
-          <div class="step-num">4</div>
-          <div class="step-body">
-            <h3>Talk or Type</h3>
-            <p>Tap the talk button or press <span class="kbd">Right Cmd</span> to start recording. Speak your request, release to send. Claude's response appears as conversation bubbles and is read aloud. Type in the text input for keyboard-based interaction.</p>
-          </div>
-        </div>
-
-        <div class="step">
-          <div class="step-num">5</div>
-          <div class="step-body">
             <h3>Choose Your Mode</h3>
-            <p>Tap the mode button to cycle between Talk, Type, Read, and Text. Each mode adjusts mic and speaker behavior. Use the terminal panel to see Claude's full output and navigate with arrow keys.</p>
+            <p>Tap the mode button to cycle between Talk, Type, Read, and Text. Each mode adjusts mic and speaker behavior. Expand the terminal panel to see Claude's full output and navigate with arrow keys.</p>
           </div>
         </div>
       </div>
