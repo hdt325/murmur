@@ -19,7 +19,8 @@
     "publish": {
       "provider": "github",
       "owner": "hdt325",
-      "repo": "murmur"
+      "repo": "murmur",
+      "releaseType": "release"
     },
     "mac": {
       "target": [
