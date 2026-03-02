@@ -352,6 +352,8 @@ let ttsEntryIdQueue: (number | null)[] = []; // Entry IDs corresponding to queue
 let ttsRetryCount = 0;
 const TTS_MAX_RETRIES = 3;
 
+let _forceKokoroFallback = false;
+
 async function speakText(text: string, interrupt = false): Promise<void> {
   // If TTS is in progress and not interrupting, queue the text
   if (ttsInProgress && !interrupt) {
@@ -381,7 +383,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   }
   ttsInProgress = true;
   const settings = loadSettings();
-  const voice = settings.voice || "_local:default";
+  // If local TTS timed out, force Kokoro fallback for this call
+  const voice = _forceKokoroFallback ? "af_heart" : (settings.voice || "_local:default");
+  _forceKokoroFallback = false;
   const speed = settings.speed || 1;
 
   // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
@@ -423,29 +427,45 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   const ttsText = speakable;
 
   // Local TTS: send text to client for Web Speech API playback (no Kokoro needed)
+  // But only if at least one connected client actually has that voice
   if (voice.startsWith("_local")) {
-    plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
-    slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
-    console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to client`);
-    ttsActiveGen = myGen;
-    broadcast({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
-    broadcast({ type: "voice_status", state: "speaking" });
-    // Client will send tts_done when speechSynthesis finishes
-    // Safety timeout in case client never responds
-    ttsClientTimeout = setTimeout(() => {
-      if (myGen === ttsGeneration) {
-        console.warn("[tts] Local TTS client timeout — forcing done");
-        handleTtsDone();
-      }
-    }, 60000);
-    return;
+    const localName = voice.slice(7); // e.g. "Daniel" from "_local:Daniel"
+    const anyClientHasVoice = localName === "default" || Array.from(clients).some(
+      (c: any) => c._localVoices?.has(localName)
+    );
+    if (anyClientHasVoice) {
+      plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
+      slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
+      console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to client`);
+      ttsActiveGen = myGen;
+      broadcast({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
+      broadcast({ type: "voice_status", state: "speaking" });
+      // Safety timeout — 10s for local TTS, with auto-fallback to Kokoro
+      ttsClientTimeout = setTimeout(() => {
+        if (myGen === ttsGeneration) {
+          console.warn("[tts] Local TTS timeout — falling back to Kokoro");
+          ttsInProgress = false;
+          // Temporarily override voice to force Kokoro, then retry
+          _forceKokoroFallback = true;
+          speakText(ttsText);
+        }
+      }, 10000);
+      return;
+    } else {
+      // No client has the selected local voice — fall back to Kokoro
+      console.log(`[tts] Local voice "${localName}" not available on any client — using Kokoro`);
+      // Fall through to Kokoro path below
+    }
   }
+
+  // If we fell through from _local (voice not available), use Kokoro default
+  const kokoroVoice = voice.startsWith("_local") ? "af_heart" : voice;
 
   const ttsFile = join(TEMP_DIR, `murmur-tts-${Date.now()}.mp3`);
   const payload = JSON.stringify({
     model: "kokoro",
     input: ttsText,
-    voice,
+    voice: kokoroVoice,
     speed,
   });
 
@@ -461,9 +481,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   }
 
   plog("tts_request", `"${ttsText.slice(0, 100)}${ttsText.length > 100 ? "..." : ""}" (${ttsText.length} chars)`);
-  slog("tts", "request", { chars: ttsText.length, text: ttsText.slice(0, 80), voice });
+  slog("tts", "request", { chars: ttsText.length, text: ttsText.slice(0, 80), voice: kokoroVoice });
   const ttsStartTime = Date.now();
-  console.log(`[tts] Requesting Kokoro TTS (${ttsText.length} chars, voice=${voice})...`);
+  console.log(`[tts] Requesting Kokoro TTS (${ttsText.length} chars, voice=${kokoroVoice})...`);
 
   const curl = spawn("curl", [
     "-s", "-X", "POST",
@@ -2295,6 +2315,14 @@ function handleWsConnection(ws: WebSocket) {
         writeFileSync(join(SIGNAL_DIR, "claude-tts-speed"), speed.toString());
         saveSettings({ speed });
       }
+      return;
+    }
+
+    // Client reports available local voices for TTS fallback decisions
+    if (msg.startsWith("local_voices:")) {
+      const voiceNames = msg.slice(13).split(",").filter(Boolean);
+      (ws as any)._localVoices = new Set(voiceNames);
+      console.log(`[ws] Client reported ${voiceNames.length} local voices`);
       return;
     }
 

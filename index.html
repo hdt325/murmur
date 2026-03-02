@@ -1778,6 +1778,20 @@
     ws.onopen = () => {
       setHeaderState("ready", "Ready");
       clearTimeout(reconnectTimer);
+      // Report available local voices so server knows what this client supports
+      if (window.speechSynthesis) {
+        const sendVoices = () => {
+          const voices = speechSynthesis.getVoices()
+            .filter(v => v.lang.startsWith("en"))
+            .map(v => v.name);
+          if (voices.length > 0 && ws.readyState === WebSocket.OPEN) {
+            ws.send("local_voices:" + voices.join(","));
+          }
+        };
+        sendVoices();
+        // Voices may load async — retry on voiceschanged
+        speechSynthesis.addEventListener("voiceschanged", sendVoices, { once: true });
+      }
       // Check if page is stale and needs reload
       fetch("/version").then(r => r.json()).then(d => {
         if (d.version && d.version > PAGE_VERSION) {
@@ -2952,6 +2966,7 @@
       if (localVoiceName) {
         const match = speechSynthesis.getVoices().find(v => v.name === localVoiceName);
         if (match) utter.voice = match;
+        else rlog("[local-tts] Voice not found: " + localVoiceName + " — using default");
       }
       utter.rate = 1.1;
       utter.pitch = 1.0;
@@ -2961,7 +2976,27 @@
       // Highlight the entry being spoken
       if (entryId != null) highlightEntry(entryId);
 
+      // Safety: if onstart doesn't fire within 3s, assume speechSynthesis failed silently
+      let started = false;
+      const safetyTimer = setTimeout(() => {
+        if (!started) {
+          rlog("[local-tts] No onstart after 3s — assuming silent failure, sending tts_done");
+          ttsPlaying = false;
+          localTtsUtterance = null;
+          window.speechSynthesis.cancel();
+          if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+          if (pendingIdle) applyIdleState();
+        }
+      }, 3000);
+
+      utter.onstart = () => {
+        started = true;
+        clearTimeout(safetyTimer);
+      };
+
       utter.onend = () => {
+        started = true;
+        clearTimeout(safetyTimer);
         rlog("[local-tts] onend fired");
         ttsPlaying = false;
         localTtsUtterance = null;
@@ -2972,6 +3007,8 @@
         if (pendingIdle) applyIdleState();
       };
       utter.onerror = (ev) => {
+        started = true;
+        clearTimeout(safetyTimer);
         rlog("[local-tts] onerror: " + ev.error);
         ttsPlaying = false;
         localTtsUtterance = null;
