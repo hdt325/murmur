@@ -80,24 +80,23 @@
   }
 
   .header .app-title {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    font-size: 13px;
+    display: none;
+  }
+  .toolbar-brand {
+    font-size: 10px;
     font-weight: 500;
     letter-spacing: 1px;
     color: rgba(180, 100, 100, 0.3);
     text-transform: uppercase;
-    pointer-events: none;
-    -webkit-app-region: drag;
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
+    pointer-events: none;
   }
-  .header .app-icon {
-    width: 16px;
-    height: 16px;
-    opacity: 0.5;
+  .toolbar-brand-icon {
+    width: 12px;
+    height: 12px;
+    opacity: 0.4;
   }
 
   .header .status-text {
@@ -302,15 +301,16 @@
   body.clean-mode .entry-nonspeakable { display: none; }
 
   .msg-wrap {
-    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
     align-self: flex-start;
-    max-width: 88%;
+    max-width: 92%;
   }
-  .msg-wrap .msg { max-width: 100%; }
+  .msg-wrap .msg { flex: 1; min-width: 0; }
   .msg-replay {
-    position: absolute;
-    top: 2px;
-    right: -28px;
+    flex-shrink: 0;
+    margin-top: 2px;
     background: none;
     border: 1px solid #333338;
     border-radius: 4px;
@@ -318,8 +318,9 @@
     font-size: 10px;
     padding: 1px 5px;
     cursor: pointer;
-    opacity: 0.5;
+    opacity: 0.3;
   }
+  .msg-wrap:hover .msg-replay { opacity: 0.7; }
   .msg-replay:hover { opacity: 1; color: #e8636b; border-color: #e8636b88; }
 
   .msg .meta {
@@ -479,7 +480,6 @@
     flex-shrink: 0;
   }
   .talk-bar button.recording .murmur-icon { opacity: 1; color: #e74c3c; }
-  .talk-bar button.ready-to-listen .murmur-icon { opacity: 0.8; color: #2ecc71; }
   .talk-bar button.speaking .murmur-icon { opacity: 0.8; color: #c9b07c; }
 
   .talk-bar button.recording {
@@ -519,12 +519,6 @@
     cursor: pointer;
   }
 
-  .talk-bar button.ready-to-listen {
-    border-color: #2ecc71;
-    background: #2ecc7122;
-    color: #2ecc71;
-    animation: pulse-border-green 1s ease-in-out infinite;
-  }
 
   @keyframes pulse-border-green {
     0%, 100% { border-color: #2ecc71; }
@@ -919,7 +913,7 @@
 
 <!-- Section 1: Header -->
 <div class="header">
-  <span class="app-title"><img src="/icon-256.png" class="app-icon" alt="">MURMUR</span>
+  <span class="app-title"></span>
   <div class="status-dot green" id="statusDot"></div>
   <span class="status-text" id="statusText">Ready</span>
   <div class="svc-indicators">
@@ -939,6 +933,8 @@
 <div class="transcript" id="transcript">
   <div class="conv-toolbar" id="convToolbar">
     <button id="cleanBtn" class="active" data-tip="Toggle verbose streaming output">Clean</button>
+    <span class="conv-toolbar-spacer"></span>
+    <span class="toolbar-brand"><img src="/icon-256.png" class="toolbar-brand-icon" alt="">MURMUR</span>
     <span class="conv-toolbar-spacer"></span>
     <button id="chatZoomOut" data-tip="Decrease font size">−</button>
     <button id="chatZoomIn" data-tip="Increase font size">+</button>
@@ -1025,7 +1021,7 @@
 </div>
 
 <script>
-  const PAGE_VERSION = 62; // Bump this when making changes that require reload
+  const PAGE_VERSION = 64; // Bump this when making changes that require reload
 
   // --- Debug Panel ---
   const _wsLog = [];
@@ -1723,6 +1719,11 @@
   // =============================================
   function connect() {
     if (!location.host) { console.warn("[ws] No host, skipping connect"); return; }
+    clearTimeout(reconnectTimer);
+    // Clean up old WS to prevent duplicate connections
+    if (ws) {
+      try { ws.onclose = null; ws.onerror = null; ws.onmessage = null; ws.close(); } catch {}
+    }
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${wsProto}//${location.host}`);
     window._ws = ws;
@@ -1905,6 +1906,10 @@
 
       if (msg.type === "tts_stop") {
         stopTtsPlayback();
+      }
+
+      if (msg.type === "restarting") {
+        setHeaderState("thinking", "Restarting...");
       }
 
       if (msg.type === "interactive_prompt") {
@@ -2310,7 +2315,7 @@
       else if (state === "responding") setHeaderState("responding", "Claude is responding...");
       return;
     }
-    if (talkBtn.classList.contains("transcribing") && state !== "thinking" && state !== "sent") {
+    if (talkBtn.classList.contains("transcribing") && !["thinking", "blank", "idle", "wake_no_match", "error"].includes(state)) {
       rlog(`[voice_status] ${state} IGNORED — transcribing in progress`);
       return;
     }
@@ -2340,16 +2345,17 @@
         return;
       }
       applyIdleState();
-    } else if (state === "sent") {
-      setTalkState("thinking");
     } else if (state === "blank") {
       talkBtn.textContent = "No speech detected";
       talkBtn.className = "";
       setTimeout(() => setTalkState("idle"), 1500);
     } else if (state === "wake_no_match") {
       setTalkState("idle");
-    } else if (state === "wake_matched") {
-      setTalkState("thinking");
+    } else if (state === "error") {
+      setHeaderState("error", "Voice error");
+      talkBtn.textContent = "Error";
+      talkBtn.className = "";
+      setTimeout(() => setTalkState("idle"), 3000);
     }
   }
   let conversationHotTimer = null;
@@ -2529,8 +2535,10 @@
     return new Blob([buffer], { type: "audio/wav" });
   }
 
+  let _recordingStarting = false;
   async function startRecording(isAutoListen) {
-    if (isRecording) return;
+    if (isRecording || _recordingStarting) return;
+    _recordingStarting = true;
     console.log(`[rec] Starting recording (autoListen=${isAutoListen})`);
 
     // Grab pre-buffer snapshot before recording starts
@@ -2572,12 +2580,14 @@
 
       mediaRecorder.start(100);
       isRecording = true;
+      _recordingStarting = false;
       recordingStartTime = Date.now();
 
       setTalkState("recording");
       startSilenceDetection();
 
     } catch (err) {
+      _recordingStarting = false;
       console.error("Mic access failed:", err);
       talkBtn.textContent = "Mic access denied";
       talkBtn.className = "";

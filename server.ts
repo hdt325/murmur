@@ -294,8 +294,9 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     }
   }
 
-  const tmpFile = join(TEMP_DIR, "murmur-audio.webm");
-  const normalizedFile = join(TEMP_DIR, "murmur-audio-norm.wav");
+  const uid = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  const tmpFile = join(TEMP_DIR, `murmur-audio-${uid}.webm`);
+  const normalizedFile = join(TEMP_DIR, `murmur-audio-${uid}-norm.wav`);
   writeFileSync(tmpFile, audioData);
 
   // Normalize audio volume with ffmpeg before transcription
@@ -332,6 +333,9 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     slog("stt", "error", { error: (err as Error).message });
     serviceStatus.whisper = false; // Mark as down so next call re-checks
     return "";
+  } finally {
+    try { unlinkSync(tmpFile); } catch {}
+    try { unlinkSync(normalizedFile); } catch {}
   }
 }
 
@@ -342,6 +346,7 @@ let ttsClientTimeout: ReturnType<typeof setTimeout> | null = null;
 let ttsInProgress = false;
 let ttsActiveGen = 0; // Generation of the audio currently playing on client
 let ttsQueue: string[] = []; // Queue of texts waiting to be spoken
+let ttsEntryIdQueue: (number | null)[] = []; // Entry IDs corresponding to queued texts
 let ttsRetryCount = 0;
 const TTS_MAX_RETRIES = 3;
 
@@ -351,12 +356,19 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     if (ttsQueue.length >= 50) { console.warn("[tts] Queue full, dropping"); return; }
     console.log(`[tts] Queuing text (${text.length} chars) — ${ttsQueue.length + 1} in queue`);
     ttsQueue.push(text);
+    ttsEntryIdQueue.push(currentTtsEntryId);
     return;
   }
 
   // If interrupting, clear the queue too
   if (interrupt) {
     ttsQueue = [];
+    ttsEntryIdQueue = [];
+  }
+
+  // Broadcast highlight for the entry we're about to speak
+  if (currentTtsEntryId != null) {
+    broadcast({ type: "tts_highlight", entryId: currentTtsEntryId });
   }
 
   // Cancel any current TTS (generation counter ensures old callbacks are discarded)
@@ -405,9 +417,6 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     broadcast({ type: "voice_status", state: "idle" });
     return;
   }
-
-  // Broadcast the spoken text so clean-mode clients can show it
-  broadcast({ type: "spoken_text", text: speakable, ts: Date.now() });
 
   const ttsText = speakable;
 
@@ -509,6 +518,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 function stopClientPlayback() {
   ttsGeneration++;
   ttsQueue = []; // Clear pending queue
+  ttsEntryIdQueue = [];
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   broadcast({ type: "tts_stop" });
   ttsInProgress = false;
@@ -527,7 +537,9 @@ function handleTtsDone() {
   // Play next queued text if available
   if (ttsQueue.length > 0) {
     const next = ttsQueue.shift()!;
-    console.log(`[tts] Playing next in queue (${next.length} chars, ${ttsQueue.length} remaining)`);
+    const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+    currentTtsEntryId = nextEntryId;
+    console.log(`[tts] Playing next in queue (${next.length} chars, entryId=${nextEntryId}, ${ttsQueue.length} remaining)`);
     speakText(next);
     return;
   }
@@ -1072,7 +1084,6 @@ function broadcastCurrentOutput() {
       console.log(`[stream] Entry TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
       plog("entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
       currentTtsEntryId = entry.id;
-      broadcast({ type: "tts_highlight", entryId: entry.id });
       speakText(entry.text);
     }
   }
@@ -1083,7 +1094,6 @@ function broadcastCurrentOutput() {
     if (entryTtsTimer) clearTimeout(entryTtsTimer);
     entryTtsTimer = setTimeout(() => {
       entryTtsTimer = null;
-      // Re-check — if still last and unchanged, speak it
       const freshAssistant = conversationEntries.filter(e => e.role === "assistant");
       const freshLast = freshAssistant[freshAssistant.length - 1];
       if (freshLast && freshLast.id === lastEntry.id && !freshLast.spoken) {
@@ -1091,7 +1101,6 @@ function broadcastCurrentOutput() {
         console.log(`[stream] Entry TTS delayed (id=${freshLast.id}, ${freshLast.text.length} chars)`);
         plog("entry_tts_delayed", `id=${freshLast.id} "${freshLast.text.slice(0, 80)}" (${freshLast.text.length} chars)`);
         currentTtsEntryId = freshLast.id;
-        broadcast({ type: "tts_highlight", entryId: freshLast.id });
         speakText(freshLast.text);
       }
     }, ENTRY_TTS_DELAY_MS);
@@ -1318,7 +1327,6 @@ function handleStreamDone() {
       console.log(`[stream] Final TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
       plog("final_entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
       currentTtsEntryId = entry.id;
-      broadcast({ type: "tts_highlight", entryId: entry.id });
       speakText(entry.text);
       spokeAnything = true;
     }
@@ -2324,7 +2332,7 @@ app.get("/favicon-16.png", (_req, res) => {
 });
 
 app.get("/version", (_req, res) => {
-  res.json({ version: 63 });
+  res.json({ version: 64 });
 });
 
 app.get("/debug", (_req, res) => {
