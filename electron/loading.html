@@ -103,6 +103,24 @@
     max-width: 160px;
     text-align: right;
   }
+  .checklist-item .install-btn {
+    margin-left: auto;
+    background: #f04b5a;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+    white-space: nowrap;
+  }
+  .checklist-item .install-btn:hover { background: #d63d4b; }
+  .checklist-item .install-btn:disabled {
+    background: #555;
+    cursor: default;
+  }
 
   /* Log area */
   .log-area {
@@ -181,6 +199,10 @@
       <span class="icon">&#9679;</span>
       <span class="label">Dependencies</span>
     </div>
+    <div class="checklist-item pending" data-check="voicemode">
+      <span class="icon">&#9679;</span>
+      <span class="label">VoiceMode</span>
+    </div>
     <div class="checklist-item pending" data-check="server">
       <span class="icon">&#9679;</span>
       <span class="label">Server</span>
@@ -225,6 +247,13 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  // Which checks can be auto-installed
+  const INSTALLABLE = {
+    claude: "Claude CLI",
+    tmux: "tmux",
+    voicemode: "VoiceMode",
+  };
+
   function updateCheck(name, status, hint) {
     const item = document.querySelector(`[data-check="${name}"]`);
     if (!item) return;
@@ -233,14 +262,36 @@
     if (status === "ok") icon.innerHTML = "&#10003;";
     else if (status === "fail") icon.innerHTML = "&#10007;";
     else if (status === "warn") icon.innerHTML = "!";
-    if (hint) {
-      let hintEl = item.querySelector(".hint");
-      if (!hintEl) {
-        hintEl = document.createElement("span");
-        hintEl.className = "hint";
-        item.appendChild(hintEl);
-      }
+
+    // Remove old hint/button
+    const oldHint = item.querySelector(".hint");
+    if (oldHint) oldHint.remove();
+    const oldBtn = item.querySelector(".install-btn");
+    if (oldBtn) oldBtn.remove();
+
+    if ((status === "warn" || status === "fail") && INSTALLABLE[name] && window.murmurElectron) {
+      const btn = document.createElement("button");
+      btn.className = "install-btn";
+      btn.textContent = "Install";
+      btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = "Installing...";
+        const result = await window.murmurElectron.installPrereq(name);
+        if (result.ok) {
+          btn.textContent = "Done";
+          setTimeout(() => btn.remove(), 1500);
+        } else {
+          btn.textContent = "Failed";
+          btn.disabled = false;
+          setTimeout(() => { btn.textContent = "Retry"; }, 2000);
+        }
+      };
+      item.appendChild(btn);
+    } else if (hint) {
+      const hintEl = document.createElement("span");
+      hintEl.className = "hint";
       hintEl.textContent = hint;
+      item.appendChild(hintEl);
     }
   }
 

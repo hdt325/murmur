@@ -123,6 +123,14 @@ async function checkPrerequisites() {
     sendStatus("", "info", { check: "tmux", checkStatus: "ok" });
   }
 
+  // VoiceMode (provides Whisper STT + Kokoro TTS)
+  try {
+    execSync("which voicemode", { timeout: 3000 });
+    sendStatus("VoiceMode available", "info", { check: "voicemode", checkStatus: "ok" });
+  } catch {
+    sendStatus("VoiceMode not found", "warn", { check: "voicemode", checkStatus: "warn", checkHint: "uv tool install voicemode" });
+  }
+
   return hasBlocker;
 }
 
@@ -539,6 +547,41 @@ function setupAutoUpdater() {
 // Handle retry from loading page
 ipcMain.on("retry-startup", () => {
   startup();
+});
+
+// One-click prerequisite installs
+ipcMain.handle("install-prereq", async (_event, name) => {
+  const commands = {
+    claude: "npm i -g @anthropic-ai/claude-code",
+    tmux: "brew install tmux",
+    voicemode: "uv tool install voicemode || pip install voicemode",
+  };
+
+  const cmd = commands[name];
+  if (!cmd) return { ok: false, error: "Unknown prerequisite" };
+
+  sendStatus(`Installing ${name}...`, "info", { check: name, checkStatus: "pending" });
+
+  try {
+    const output = execSync(cmd, {
+      encoding: "utf8",
+      timeout: 180000,
+      env: {
+        ...process.env,
+        PATH: process.platform === "darwin"
+          ? `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH}`
+          : process.env.PATH,
+      },
+    });
+    console.log(`[install] ${name} installed:`, output.slice(0, 200));
+    sendStatus(`${name} installed`, "success", { check: name, checkStatus: "ok" });
+    return { ok: true };
+  } catch (err) {
+    const msg = err.stderr || err.message || "Unknown error";
+    console.error(`[install] ${name} failed:`, msg.slice(0, 500));
+    sendStatus(`Failed to install ${name}: ${msg.slice(0, 100)}`, "error", { check: name, checkStatus: "fail" });
+    return { ok: false, error: msg.slice(0, 200) };
+  }
 });
 
 // Handle close from panel UI

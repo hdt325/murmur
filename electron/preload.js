@@ -11,4 +11,6 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   onStartupStatus: (callback) => ipcRenderer.on("startup-status", (_e, data) => callback(data)),
   retry: () => ipcRenderer.send("retry-startup"),
   close: () => ipcRenderer.send("close-panel"),
+  // One-click prerequisite installs
+  installPrereq: (name) => ipcRenderer.invoke("install-prereq", name),
 });
