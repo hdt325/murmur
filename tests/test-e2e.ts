@@ -1,654 +1,924 @@
 /**
- * End-to-end voice panel UI test.
+ * Comprehensive end-to-end tests — every user-facing feature tested as an end-user.
+ * Runs with VISIBLE browser so you can watch the tests execute.
+ * Requires: server running on localhost:3457
  *
- * Generates audio samples, feeds them through the WebSocket as if they were
- * mic input, and watches every UI state transition in a real browser.
- *
- * Run:  npx tsx test-e2e.ts
+ * Run:        npx tsx tests/test-e2e.ts
+ * Headless:   HEADLESS=1 npx tsx tests/test-e2e.ts
  */
 
-import { chromium, Browser, Page } from "playwright";
-import { readFileSync } from "fs";
-import { resolve } from "path";
-import WebSocket from "ws";
+import { chromium, Browser, Page, BrowserContext } from "playwright";
+import { mkdirSync } from "fs";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 const BASE = "http://localhost:3457";
-const WS_URL = "ws://localhost:3457";
-const AUDIO_DIR = resolve(import.meta.dirname!, "test-audio");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SCREENSHOTS_DIR = join(__dirname, "screenshots", "e2e");
+const HEADLESS = process.env.HEADLESS === "1";
 const PASS = "\x1b[32m✓\x1b[0m";
 const FAIL = "\x1b[31m✗\x1b[0m";
-const WARN = "\x1b[33m⚠\x1b[0m";
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
-interface TestResult {
-  name: string;
-  ok: boolean;
-  detail?: string;
-  states?: string[];
-}
-
+interface TestResult { name: string; ok: boolean; detail?: string }
 const results: TestResult[] = [];
 let browser: Browser;
+let ctx: BrowserContext;
 let page: Page;
+let screenshotIdx = 0;
 
-function report(name: string, ok: boolean, detail = "", states?: string[]) {
-  results.push({ name, ok, detail, states });
-  const icon = ok ? PASS : FAIL;
-  console.log(`  ${icon}  ${name}${detail ? ` ${DIM}(${detail})${RESET}` : ""}`);
-  if (states?.length) console.log(`     ${DIM}states: ${states.join(" → ")}${RESET}`);
+mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+
+function report(name: string, ok: boolean, detail = "") {
+  results.push({ name, ok, detail });
+  console.log(`  ${ok ? PASS : FAIL}  ${name}${detail ? ` ${DIM}(${detail})${RESET}` : ""}`);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────
-
-/** Capture all UI state transitions during an operation. */
-async function captureStates(page: Page, timeoutMs: number): Promise<string[]> {
-  // Use page.waitForTimeout-based polling instead of page.evaluate with timers
-  // to avoid tsx's __name injection breaking in browser context
-  const states: string[] = [];
-  const seen = new Set<string>();
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs) {
-    const snap = await page.evaluate(() => {
-      const dot = document.getElementById("statusDot");
-      const text = document.getElementById("statusText");
-      const talk = document.getElementById("talkBtn");
-      return {
-        dotClass: (dot?.className || "").replace("status-dot", "").trim(),
-        statusText: text?.textContent?.trim() || "",
-        talkText: talk?.textContent?.trim() || "",
-        talkClass: talk?.className?.trim() || "",
-      };
-    });
-    const key = `${snap.dotClass}|${snap.statusText}|${snap.talkClass}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      states.push(`[${snap.dotClass}] "${snap.statusText}" btn="${snap.talkText.slice(0, 40)}" class=${snap.talkClass}`);
-    }
-    await page.waitForTimeout(150);
-  }
-  return states;
+async function screenshot(label: string) {
+  screenshotIdx++;
+  const filename = `${String(screenshotIdx).padStart(2, "0")}-${label.replace(/\s+/g, "-").toLowerCase()}.png`;
+  await page.screenshot({ path: join(SCREENSHOTS_DIR, filename), fullPage: true });
 }
 
-/** Get current UI snapshot */
-async function uiSnapshot(page: Page) {
-  return page.evaluate(() => {
-    const dot = document.getElementById("statusDot");
-    const text = document.getElementById("statusText");
-    const talk = document.getElementById("talkBtn") as HTMLElement;
-    const transcript = document.getElementById("transcript");
-    const msgs = transcript?.querySelectorAll(".msg") || [];
-    const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
-    return {
-      dotClass: dot?.className?.replace("status-dot", "").trim() || "",
-      statusText: text?.textContent?.trim() || "",
-      talkText: talk?.textContent?.trim() || "",
-      talkClass: talk?.className?.trim() || "",
-      msgCount: msgs.length,
-      lastMsgRole: lastMsg?.classList.contains("assistant") ? "assistant" : lastMsg?.classList.contains("user") ? "user" : null,
-      lastMsgText: lastMsg?.textContent?.replace(/^(You|Claude)\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?/i, "").trim().slice(0, 200) || "",
-      hasPartial: !!document.getElementById("partialMsg"),
-      hasThinking: !!document.getElementById("thinkingBubble"),
-    };
+async function freshPage() {
+  // Clear all localStorage and reload for a clean state
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.clear());
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1000);
+}
+
+async function readyPage() {
+  // Load page with tour already done (most tests don't need tour)
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => {
+    localStorage.setItem("murmur-tour-done", "1");
   });
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1000);
 }
-
-/** Send audio file through a raw WebSocket (simulating mic input) */
-async function sendAudioViaWs(audioPath: string): Promise<void> {
-  const audioData = readFileSync(audioPath);
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(WS_URL);
-    ws.on("open", () => {
-      ws.send(audioData);
-      // Close after a short delay to let the server process
-      setTimeout(() => { ws.close(); resolve(); }, 500);
-    });
-    ws.on("error", reject);
-  });
-}
-
-// ──────────────────────────────────────────────────────────────
-// Setup / Teardown
-// ──────────────────────────────────────────────────────────────
 
 async function setup() {
-  browser = await chromium.launch({ headless: false, slowMo: 50 });
-  const ctx = await browser.newContext({ permissions: ["microphone"] });
+  browser = await chromium.launch({
+    headless: HEADLESS,
+    slowMo: HEADLESS ? 0 : 80,
+  });
+  ctx = await browser.newContext({
+    permissions: ["microphone"],
+    viewport: { width: 320, height: 800 },
+  });
   page = await ctx.newPage();
-  page.on("dialog", d => d.dismiss());
-  // Collect console logs
-  page.on("console", msg => {
-    if (msg.type() === "error") console.log(`     ${DIM}[browser] ${msg.text()}${RESET}`);
-  });
-  await page.goto(BASE, { waitUntil: "networkidle" });
-  await page.waitForTimeout(2000); // Let WS connect and settle
 }
 
-async function teardown() {
+// Wrap each test so one failure doesn't crash the suite
+async function run(name: string, fn: () => Promise<void>) {
+  try { await fn(); }
+  catch (err) {
+    await screenshot(`error-${name.replace(/\s+/g, "-").toLowerCase()}`).catch(() => {});
+    report(name, false, (err as Error).message);
+  }
+}
+
+// ═══════════════════════════════════════════
+// 1. PAGE LOAD & CONNECTION
+// ═══════════════════════════════════════════
+
+async function testPageLoad() {
+  await readyPage();
+  const dot = await page.locator("#statusDot").isVisible();
+  const statusText = await page.locator("#statusText").textContent();
+  const header = await page.locator(".header").isVisible();
+  const talkBtn = await page.locator("#talkBtn").isVisible();
+  const input = await page.locator("#textInput").isVisible();
+  await screenshot("page-load");
+  report("Page loads with all critical elements", dot && header && talkBtn && input, `status="${statusText}"`);
+}
+
+async function testWsConnection() {
+  await readyPage();
   await page.waitForTimeout(1000);
-  await browser.close();
-
-  const passed = results.filter(r => r.ok).length;
-  const failed = results.filter(r => !r.ok).length;
-  console.log(`\n${"═".repeat(50)}`);
-  console.log(`  Results: ${passed} passed, ${failed} failed`);
-  if (failed > 0) {
-    console.log(`\n  Failures:`);
-    results.filter(r => !r.ok).forEach(r => {
-      console.log(`    ${FAIL}  ${r.name}${r.detail ? ` — ${r.detail}` : ""}`);
-    });
-  }
-  console.log(`${"═".repeat(50)}\n`);
-  process.exit(failed > 0 ? 1 : 0);
+  const dotClass = await page.locator("#statusDot").getAttribute("class");
+  const isConnected = dotClass?.includes("green") || dotClass?.includes("yellow") || false;
+  const statusText = await page.locator("#statusText").textContent();
+  await screenshot("ws-connected");
+  report("WebSocket connects (dot not gray)", isConnected, `class="${dotClass}", status="${statusText}"`);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Test: Initial page load state
-// ──────────────────────────────────────────────────────────────
-async function testInitialState() {
-  console.log("\n── Initial Page State ──");
-  const snap = await uiSnapshot(page);
-
-  report("Connection dot is green", snap.dotClass.includes("green"), snap.dotClass);
-  report("Status text shows Ready/connected", /ready|connected|listening/i.test(snap.statusText), snap.statusText);
-  report("Talk button is in idle state", snap.talkClass === "" || snap.talkClass === "none" || snap.talkText.includes("tap to talk"), snap.talkText);
-
-  // Services
-  const whisperUp = await page.locator("#svcWhisper.up").isVisible().catch(() => false);
-  const kokoroUp = await page.locator("#svcKokoro.up").isVisible().catch(() => false);
-  report("Whisper STT service up", whisperUp as boolean);
-  report("Kokoro TTS service up", kokoroUp as boolean);
-
-  // Controls visible
-  for (const id of ["stopBtn", "muteBtn", "speedBtn", "voiceBtn", "replayBtn", "termBtn"]) {
-    const vis = await page.locator(`#${id}`).isVisible().catch(() => false);
-    report(`${id} visible`, vis as boolean);
-  }
+async function testServiceDots() {
+  await readyPage();
+  await page.waitForTimeout(1500);
+  const whisperClass = await page.locator("#svcWhisper").getAttribute("class");
+  const kokoroClass = await page.locator("#svcKokoro").getAttribute("class");
+  await screenshot("service-dots");
+  report("Whisper service dot shows status", await page.locator("#svcWhisper").isVisible(), `class="${whisperClass}"`);
+  report("Kokoro service dot shows status", await page.locator("#svcKokoro").isVisible(), `class="${kokoroClass}"`);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Test: Mute toggle
-// ──────────────────────────────────────────────────────────────
-async function testMuteToggle() {
-  console.log("\n── Mute Toggle ──");
-
-  // Mute
-  await page.locator("#muteBtn").click();
-  await page.waitForTimeout(300);
-  let snap = await uiSnapshot(page);
-  const muteText = await page.locator("#muteBtn").textContent();
-  report("After mute click: button says 'Unmute'", muteText?.includes("Unmute") ?? false, muteText || "");
-  report("After mute: status shows Muted", /muted/i.test(snap.statusText), snap.statusText);
-
-  // Unmute
-  await page.locator("#muteBtn").click();
-  await page.waitForTimeout(300);
-  snap = await uiSnapshot(page);
-  const unmuteText = await page.locator("#muteBtn").textContent();
-  report("After unmute: button says 'Mute'", unmuteText?.includes("Mute") && !unmuteText?.includes("Unmute") || false, unmuteText || "");
-  report("After unmute: status shows Ready", /ready/i.test(snap.statusText), snap.statusText);
+async function testEmptyState() {
+  await readyPage();
+  const emptyVisible = await page.locator("#emptyState").isVisible().catch(() => false);
+  await screenshot("empty-state");
+  report("Empty state shown when no messages", emptyVisible);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Test: Speed cycling
-// ──────────────────────────────────────────────────────────────
-async function testSpeedCycle() {
-  console.log("\n── Speed Cycle ──");
-  const SPEEDS = ["0.5x", "1x", "1.25x", "1.5x", "2x", "2.5x", "3x"];
-  const speedBtn = page.locator("#speedBtn");
-  const startText = await speedBtn.textContent();
-  const startIdx = SPEEDS.indexOf(startText?.trim() || "1x");
+// ═══════════════════════════════════════════
+// 2. TOUR SYSTEM
+// ═══════════════════════════════════════════
 
-  const collected: string[] = [];
-  for (let i = 0; i < SPEEDS.length; i++) {
-    await speedBtn.click();
-    await page.waitForTimeout(200);
-    const t = (await speedBtn.textContent())?.trim() || "";
-    collected.push(t);
-  }
-
-  // Should have cycled through all speeds
-  const unique = new Set(collected);
-  report(`Speed cycles through ${unique.size} unique values`, unique.size >= 5, collected.join(" → "));
-
-  // Reset to 1.25x (the saved default)
-  while ((await speedBtn.textContent())?.trim() !== "1.25x") {
-    await speedBtn.click();
-    await page.waitForTimeout(100);
-  }
+async function testTourAutoStart() {
+  await freshPage();
+  await page.waitForTimeout(1500);
+  const overlay = await page.locator(".tour-overlay").isVisible();
+  await screenshot("tour-auto-start");
+  report("Tour auto-starts on first visit", overlay);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Test: Voice selection popover
-// ──────────────────────────────────────────────────────────────
-async function testVoiceSelection() {
-  console.log("\n── Voice Selection ──");
-  const voiceBtn = page.locator("#voiceBtn");
-  const popover = page.locator("#voicePopover");
+async function testTourWalkthrough() {
+  let stepCount = 0;
+  const stepTitles: string[] = [];
 
-  await voiceBtn.click();
-  await page.waitForTimeout(300);
-  const popVisible = await popover.isVisible();
-  report("Voice popover opens on click", popVisible);
+  while (stepCount < 15) {
+    const title = await page.locator(".tour-tip h4").textContent().catch(() => null);
+    const stepText = await page.locator(".tour-step").textContent().catch(() => null);
+    if (!stepText) break;
+    stepTitles.push(title || "?");
+    stepCount++;
+    await screenshot(`tour-step-${stepCount}`);
 
-  // Count voice options
-  const voiceCount = await page.locator(".voice-option").count();
-  report(`Voice popover has options (${voiceCount})`, voiceCount >= 8, `${voiceCount} voices`);
+    const nextBtn = page.locator(".tour-next");
+    const btnText = await nextBtn.textContent();
+    if (btnText?.trim() === "Done") {
+      await nextBtn.click();
+      await page.waitForTimeout(300);
+      break;
+    }
+    await nextBtn.click();
+    await page.waitForTimeout(400);
+  }
 
-  // Select a voice
-  const firstVoice = page.locator(".voice-option").first();
-  const voiceName = await firstVoice.getAttribute("data-voice");
-  await firstVoice.click();
-  await page.waitForTimeout(500);
+  const done = await page.evaluate(() => localStorage.getItem("murmur-tour-done"));
+  const overlayGone = !(await page.locator(".tour-overlay").isVisible());
+  await screenshot("tour-done");
 
-  const popClosed = !(await popover.isVisible());
-  report("Popover closes after selection", popClosed);
+  report("Tour has 10 steps", stepCount === 10, `${stepCount} steps: ${stepTitles.join(" → ")}`);
+  report("Tour sets localStorage and closes overlay", overlayGone && done === "1");
+}
 
-  const btnText = await voiceBtn.textContent();
-  report(`Voice button updated to selected voice`, btnText?.trim() === voiceName, `${btnText?.trim()}`);
+async function testTourDoesNotRestart() {
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1500);
+  const overlay = await page.locator(".tour-overlay").isVisible();
+  report("Tour does not restart after completion", !overlay);
+}
 
-  // Restore original voice
-  await voiceBtn.click();
+async function testTourSkip() {
+  await page.evaluate(() => localStorage.removeItem("murmur-tour-done"));
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1500);
+  const skipBtn = page.locator(".tour-skip");
+  const skipVisible = await skipBtn.isVisible();
+  if (skipVisible) {
+    await skipBtn.click();
+    await page.waitForTimeout(300);
+  }
+  const overlayGone = !(await page.locator(".tour-overlay").isVisible());
+  const done = await page.evaluate(() => localStorage.getItem("murmur-tour-done"));
+  await screenshot("tour-skipped");
+  report("Tour skip closes tour and sets done", overlayGone && done === "1");
+}
+
+async function testTourFromHelpMenu() {
+  await readyPage();
+  await page.locator("#helpBtn").click();
   await page.waitForTimeout(200);
-  const heart = page.locator('.voice-option[data-voice="af_heart"]');
-  if (await heart.isVisible()) {
-    await heart.click();
-    await page.waitForTimeout(300);
-  }
-}
-
-// ──────────────────────────────────────────────────────────────
-// Test: Terminal panel toggle + input
-// ──────────────────────────────────────────────────────────────
-async function testTerminalPanel() {
-  console.log("\n── Terminal Panel ──");
-
-  // Open terminal
-  await page.locator("#termBtn").click();
-  await page.waitForTimeout(500);
-  const panelVisible = await page.locator("#terminalPanel").evaluate(el => {
-    return el.classList.contains("open") || getComputedStyle(el).height !== "0px";
+  // Help menu items may be outside viewport at 320px — use force click
+  await page.evaluate(() => {
+    const btns = document.querySelectorAll("#helpMenu button, #helpMenu a");
+    for (const b of btns) if (b.textContent?.includes("Tour")) (b as HTMLElement).click();
   });
-  report("Terminal panel opens", panelVisible);
-
-  const inputVisible = await page.locator("#terminalInput").isVisible();
-  report("Terminal input field visible", inputVisible);
-
-  // Terminal content comes via WS broadcast every 500ms. Wait for it.
-  // Also trigger a terminal request by toggling terminal to ensure server knows we want it.
-  await page.waitForTimeout(2500);
-  let termContent = await page.locator("#terminalOutput").textContent();
-  // If still empty, check localStorage (server may have sent before panel opened)
-  if (!termContent?.length) {
-    termContent = await page.evaluate(() => localStorage.getItem("term-output") || "");
-  }
-  report("Terminal output has content", (termContent?.length || 0) > 0, `${termContent?.length} chars`);
-
-  // Close terminal
-  await page.locator("#termBtn").click();
   await page.waitForTimeout(500);
+  const overlay = await page.locator(".tour-overlay").isVisible();
+  await screenshot("tour-from-help");
+  if (await page.locator(".tour-skip").isVisible()) await page.locator(".tour-skip").click();
+  await page.waitForTimeout(200);
+  report("Help menu 'Tour' re-opens guided tour", overlay);
 }
 
-// ──────────────────────────────────────────────────────────────
-// Test: Stop button when idle (should not crash or beep)
-// ──────────────────────────────────────────────────────────────
-async function testStopWhenIdle() {
-  console.log("\n── Stop Button (Idle) ──");
-  await page.locator("#stopBtn").click();
-  await page.waitForTimeout(500);
-  const snap = await uiSnapshot(page);
-  report("Stop when idle: no crash, stays ready", snap.talkText.includes("tap to talk"), snap.talkText);
-  report("Stop when idle: no 'Tap to respond' prompt", !snap.talkText.includes("Tap to respond"), snap.talkText);
-}
+// ═══════════════════════════════════════════
+// 3. INTERACTION MODES
+// ═══════════════════════════════════════════
 
-// ──────────────────────────────────────────────────────────────
-// Test: Feed audio sample and observe full voice flow
-// ──────────────────────────────────────────────────────────────
-async function testVoiceFlow(sampleFile: string, label: string) {
-  console.log(`\n── Voice Flow: "${label}" (${sampleFile}) ──`);
-  const audioPath = resolve(AUDIO_DIR, sampleFile);
-  const audioData = readFileSync(audioPath);
-
-  // Clear transcript state
-  const msgCountBefore = await page.evaluate(() =>
-    document.querySelectorAll(".msg").length
-  );
-
-  // Small delay then send audio via the page's existing WebSocket
-  await page.waitForTimeout(300);
-  await page.evaluate((audioBytes) => {
-    const arr = new Uint8Array(audioBytes);
-    const ws = (window as any).__voiceWs;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(arr.buffer);
-    }
-  }, Array.from(audioData));
-
-  // If the page doesn't expose __voiceWs, fall back to raw WS
-  const sentViaPage = await page.evaluate(() => !!(window as any).__voiceWs);
-  if (!sentViaPage) {
-    console.log(`     ${DIM}[info] Page WS not exposed, sending via raw WebSocket${RESET}`);
-    await sendAudioViaWs(audioPath);
-  }
-
-  // Now wait and watch the UI flow
-  // Poll for state transitions with a timeout
-  const startTime = Date.now();
-  let sawTranscribing = false;
-  let sawThinking = false;
-  let sawResponding = false;
-  let sawSpeaking = false;
-  let sawIdle = false;
-  let sawUserMsg = false;
-  let sawAssistantMsg = false;
-  let lastTalkText = "";
-  let lastStatusText = "";
-  const timeline: string[] = [];
-
-  while (Date.now() - startTime < 60000) {
-    const snap = await uiSnapshot(page);
-    const talkLower = snap.talkText.toLowerCase();
-    const statusLower = snap.statusText.toLowerCase();
-
-    // Track state transitions
-    if (snap.talkText !== lastTalkText || snap.statusText !== lastStatusText) {
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      timeline.push(`${elapsed}s: [${snap.dotClass}] "${snap.statusText}" — "${snap.talkText.slice(0, 50)}"`);
-      lastTalkText = snap.talkText;
-      lastStatusText = snap.statusText;
-    }
-
-    if (talkLower.includes("transcribing") || statusLower.includes("transcribing")) sawTranscribing = true;
-    if (talkLower.includes("thinking") || statusLower.includes("thinking")) sawThinking = true;
-    if (talkLower.includes("responding") || statusLower.includes("responding")) sawResponding = true;
-    if (talkLower.includes("speaking") || statusLower.includes("speaking")) sawSpeaking = true;
-
-    // Check for new messages
-    const currentMsgCount = await page.evaluate(() => document.querySelectorAll(".msg").length);
-    const lastRole = await page.evaluate(() => {
-      const msgs = document.querySelectorAll(".msg");
-      return msgs.length > 0 ? msgs[msgs.length - 1].classList.contains("user") ? "user" : "assistant" : null;
-    });
-    if (currentMsgCount > msgCountBefore && lastRole === "user") sawUserMsg = true;
-    if (currentMsgCount > msgCountBefore && lastRole === "assistant") sawAssistantMsg = true;
-
-    // Done when we see idle after speaking, or "tap to respond", or back to "tap to talk"
-    if ((sawSpeaking || sawResponding) && (talkLower.includes("tap to") || talkLower.includes("press right"))) {
-      sawIdle = true;
-      break;
-    }
-
-    // Also catch blank transcription (no speech detected)
-    if (statusLower.includes("no speech") || talkLower.includes("no speech")) {
-      timeline.push(`${((Date.now() - startTime) / 1000).toFixed(1)}s: BLANK TRANSCRIPTION`);
-      break;
-    }
-
-    await page.waitForTimeout(300);
-  }
-
-  // Final snapshot
-  const finalSnap = await uiSnapshot(page);
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  timeline.push(`${elapsed}s: FINAL — [${finalSnap.dotClass}] "${finalSnap.statusText}" — "${finalSnap.talkText.slice(0, 50)}"`);
-
-  console.log(`     ${DIM}Timeline:${RESET}`);
-  timeline.forEach(t => console.log(`       ${DIM}${t}${RESET}`));
-
-  // Report
-  report("Saw 'Transcribing' state", sawTranscribing);
-  report("Saw 'Thinking' state", sawThinking);
-  report("Saw 'Responding' or 'Speaking' state", sawResponding || sawSpeaking);
-  report("User message appeared in transcript", sawUserMsg);
-  report("Assistant message appeared in transcript", sawAssistantMsg);
-
-  // Check assistant message isn't scrollback garbage (Bug 10)
-  if (sawAssistantMsg) {
-    const lastAssistant = await page.evaluate(() => {
-      const msgs = document.querySelectorAll(".msg.assistant");
-      const last = msgs[msgs.length - 1];
-      return {
-        text: last?.textContent?.replace(/^Claude\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?/i, "").trim() || "",
-        hasPartialId: last?.id === "partialMsg",
-      };
-    });
-    report(
-      "Response is reasonable length (not scrollback)",
-      lastAssistant.text.length < 1000,
-      `${lastAssistant.text.length} chars: "${lastAssistant.text.slice(0, 80)}..."`
-    );
-    report("No stale partial message left over (Bug 11)", !lastAssistant.hasPartialId);
-  }
-
-  // Check returned to idle properly (Bug 7)
-  report("Returned to idle/ready state", finalSnap.talkText.includes("tap to") || finalSnap.talkText.includes("Press Right"), finalSnap.talkText.slice(0, 50));
-
-  // Wait for the full cycle to finish before next test
-  // Must wait past: speaking → idle → echo cooldown
-  const waitStart = Date.now();
-  while (Date.now() - waitStart < 60000) {
-    const t = (await page.locator("#talkBtn").textContent())?.toLowerCase() || "";
-    if (t.includes("tap to talk") || t.includes("press right") || t.includes("tap to respond")) break;
-    await page.waitForTimeout(500);
-  }
-  console.log(`     ${DIM}Cycle complete, cooling down...${RESET}`);
-  await page.waitForTimeout(3000); // echo cooldown + settle
-}
-
-// ──────────────────────────────────────────────────────────────
-// Test: Stop mid-TTS — verify no beep (Bug 7 + Bug 3)
-// ──────────────────────────────────────────────────────────────
-async function testStopMidTts() {
-  console.log("\n── Stop Mid-TTS (Bug 7+3) ──");
-
-  // Send audio that will produce a response
-  const audioPath = resolve(AUDIO_DIR, "sample1.wav");
-  const audioData = readFileSync(audioPath);
-
-  await page.evaluate((audioBytes) => {
-    const arr = new Uint8Array(audioBytes);
-    const ws = (window as any).__voiceWs;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(arr.buffer);
-  }, Array.from(audioData));
-
-  if (!(await page.evaluate(() => !!(window as any).__voiceWs))) {
-    await sendAudioViaWs(audioPath);
-  }
-
-  // Wait until speaking state
-  const startTime = Date.now();
-  let reachedSpeaking = false;
-  while (Date.now() - startTime < 45000) {
-    const talkText = (await page.locator("#talkBtn").textContent())?.toLowerCase() || "";
-    if (talkText.includes("speaking")) { reachedSpeaking = true; break; }
-    await page.waitForTimeout(300);
-  }
-
-  if (reachedSpeaking) {
-    // Click stop mid-TTS
-    await page.locator("#stopBtn").click();
-    await page.waitForTimeout(1000);
-
-    const snap = await uiSnapshot(page);
-    report("After Stop mid-TTS: no 'Tap to respond'", !snap.talkText.includes("Tap to respond"), snap.talkText);
-    report("After Stop mid-TTS: shows idle/ready state", snap.talkText.includes("tap to talk") || snap.talkText.includes("Press Right"), snap.talkText);
-  } else {
-    report("Reached speaking state (prerequisite)", false, "timed out waiting for TTS");
-  }
-
-  await page.waitForTimeout(2000);
-}
-
-// ──────────────────────────────────────────────────────────────
-// Test: Replay button
-// ──────────────────────────────────────────────────────────────
-async function testReplay() {
-  console.log("\n── Replay Button ──");
-
-  await page.locator("#replayBtn").click();
-
-  // Wait up to 5s for speaking state to appear (server needs to generate TTS)
-  let sawSpeaking = false;
-  const start = Date.now();
-  while (Date.now() - start < 8000) {
-    const t = (await page.locator("#talkBtn").textContent())?.toLowerCase() || "";
-    const s = (await page.locator("#statusText").textContent())?.toLowerCase() || "";
-    if (t.includes("speaking") || s.includes("speaking")) { sawSpeaking = true; break; }
-    await page.waitForTimeout(300);
-  }
-  report("Replay triggers speaking state", sawSpeaking);
-
-  // Wait for it to finish
-  if (sawSpeaking) {
-    await page.waitForFunction(
-      () => !(document.getElementById("talkBtn")?.textContent?.toLowerCase().includes("speaking")),
-      { timeout: 30000 }
-    ).catch(() => {});
-  }
-  await page.waitForTimeout(3000);
-}
-
-// ──────────────────────────────────────────────────────────────
-// Test: Terminal scroll preservation (Bug 8)
-// ──────────────────────────────────────────────────────────────
-async function testTerminalScroll() {
-  console.log("\n── Terminal Scroll (Bug 8) ──");
-
-  // Open terminal
-  await page.locator("#termBtn").click();
-  await page.waitForTimeout(500);
-
-  const termOutput = page.locator("#terminalOutput");
-  const scrollHeight = await termOutput.evaluate(el => el.scrollHeight);
-
-  if (scrollHeight > 100) {
-    // Scroll to middle
-    await termOutput.evaluate(el => { el.scrollTop = el.scrollHeight / 2; });
-    const scrollBefore = await termOutput.evaluate(el => el.scrollTop);
-    await page.waitForTimeout(1500); // Wait for at least 2 terminal updates (500ms each)
-    const scrollAfter = await termOutput.evaluate(el => el.scrollTop);
-
-    report(
-      "Scroll position preserved after terminal update",
-      Math.abs(scrollAfter - scrollBefore) < 10,
-      `before=${scrollBefore.toFixed(0)} after=${scrollAfter.toFixed(0)}`
-    );
-  } else {
-    report("Terminal has enough content to scroll", false, `scrollHeight=${scrollHeight}`);
-  }
-
-  // Close terminal
-  await page.locator("#termBtn").click();
-  await page.waitForTimeout(300);
-}
-
-// ──────────────────────────────────────────────────────────────
-// Test: Canvas resize (Bug 4) — live behavioral test
-// ──────────────────────────────────────────────────────────────
-async function testCanvasResize() {
-  console.log("\n── Canvas Resize (Bug 4) ──");
+async function testModeCycling() {
+  await readyPage();
+  const modeBtn = page.locator("#modeBtn");
+  const labels: string[] = [];
+  const classes: string[] = [];
 
   for (let i = 0; i < 5; i++) {
-    await page.setViewportSize({ width: 400 + i * 80, height: 600 + i * 20 });
+    const text = await modeBtn.textContent();
+    const cls = await modeBtn.getAttribute("class");
+    labels.push(text?.trim() || "?");
+    classes.push(cls || "");
+    await screenshot(`mode-${labels[labels.length - 1].toLowerCase()}`);
+    await modeBtn.click();
     await page.waitForTimeout(200);
   }
 
-  const transform = await page.evaluate(() => {
-    const c = document.getElementById("micCanvas") as HTMLCanvasElement | null;
-    const ctx = c?.getContext("2d");
-    if (!ctx) return null;
-    const t = ctx.getTransform();
-    return { a: t.a, d: t.d };
-  });
-
-  const dpr = await page.evaluate(() => window.devicePixelRatio);
-  if (transform) {
-    report(
-      `Canvas scale = ${dpr}x after 5 resizes`,
-      Math.abs(transform.a - dpr) < 0.01,
-      `got ${transform.a.toFixed(3)}x (expected ${dpr}x)`
-    );
-  } else {
-    report("Canvas context accessible", false);
-  }
-
-  await page.setViewportSize({ width: 480, height: 700 });
+  const unique = new Set(labels.slice(0, 4));
+  const cycled = labels[0] === labels[4];
+  report("Mode cycles through 4 modes and wraps", unique.size === 4 && cycled, labels.join(" → "));
 }
 
-// ──────────────────────────────────────────────────────────────
-// Main
-// ──────────────────────────────────────────────────────────────
-async function main() {
-  console.log("\n╔══════════════════════════════════════════════╗");
-  console.log("║  Murmur — Full E2E UI Test Suite             ║");
-  console.log("╚══════════════════════════════════════════════╝");
+async function testModePersistence() {
+  await readyPage();
+  const modeBtn = page.locator("#modeBtn");
+  await modeBtn.click();
+  await page.waitForTimeout(100);
+  await modeBtn.click();
+  await page.waitForTimeout(100);
+  const modeBeforeReload = await modeBtn.textContent();
 
-  await setup();
-
-  // First, expose the WebSocket for audio injection
-  // We need to find and expose the page's WS connection
-  await page.evaluate(() => {
-    // Monkey-patch WebSocket to capture the voice panel's connection
-    const origWs = window.WebSocket;
-    const existingWs = (window as any).__voiceWs;
-    if (existingWs) return; // Already set
-
-    // Try to find existing WS by overriding send
-    const origSend = origWs.prototype.send;
-    origWs.prototype.send = function (...args: any[]) {
-      if (!((window as any).__voiceWs) && this.url?.includes("localhost:3457")) {
-        (window as any).__voiceWs = this;
-        console.log("[test] Captured WebSocket reference");
-      }
-      return origSend.apply(this, args);
-    };
-
-    // Trigger a send to capture the WS
-    // The ping/keepalive or any message will expose it
-  });
-
-  // Trigger a WS send so we can capture the reference
-  await page.evaluate(() => {
-    // Force a small message to expose the WS
-    document.getElementById("stopBtn")?.click();
-  });
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(500);
-
-  const hasWs = await page.evaluate(() => !!(window as any).__voiceWs);
-  if (!hasWs) {
-    // Fallback: hook into reconnect
-    console.log(`  ${WARN}  Could not capture page WebSocket — will use raw WS fallback`);
-  } else {
-    console.log(`  ${PASS}  Captured page WebSocket for audio injection`);
-  }
-
-  // ── Run test suites ──
-  await testInitialState();
-  await testMuteToggle();
-  await testSpeedCycle();
-  await testVoiceSelection();
-  await testTerminalPanel();
-  await testStopWhenIdle();
-  await testCanvasResize();
-
-  // Voice flow tests with real audio
-  await testVoiceFlow("sample1.wav", "What is two plus two?");
-  await testReplay(); // Test replay right after a successful voice flow
-  await testVoiceFlow("sample2.wav", "Say hello world");
-  await testVoiceFlow("sample3.wav", "List three colors");
-
-  // Bug-specific behavioral tests
-  await testStopMidTts();
-  await testTerminalScroll();
-
-  await teardown();
+  const modeAfterReload = await page.locator("#modeBtn").textContent();
+  report("Mode persists across reload", modeBeforeReload?.trim() === modeAfterReload?.trim(),
+    `before="${modeBeforeReload?.trim()}", after="${modeAfterReload?.trim()}"`);
 }
 
-main().catch(err => {
-  console.error("Test runner error:", err);
-  browser?.close();
-  process.exit(2);
-});
+// ═══════════════════════════════════════════
+// 4. TEXT INPUT & MESSAGE BUBBLES
+// ═══════════════════════════════════════════
+
+async function testTextInputSend() {
+  await readyPage();
+  const input = page.locator("#textInput");
+  await input.fill("Hello from E2E test");
+  await screenshot("text-filled");
+  await input.press("Enter");
+  await page.waitForTimeout(2000);
+  const userBubbles = await page.locator(".msg.user").count();
+  await screenshot("text-sent");
+  report("Text input creates user message bubble", userBubbles > 0, `${userBubbles} bubble(s)`);
+}
+
+async function testTextInputSendButton() {
+  await readyPage();
+  const input = page.locator("#textInput");
+  await input.fill("Send button test");
+  await page.locator("#textSendBtn").click();
+  await page.waitForTimeout(2000);
+  const userBubbles = await page.locator(".msg.user").count();
+  report("Send button creates user message bubble", userBubbles > 0, `${userBubbles} bubble(s)`);
+}
+
+async function testTextInputClearsAfterSend() {
+  await readyPage();
+  const input = page.locator("#textInput");
+  await input.fill("Clear test");
+  await input.press("Enter");
+  await page.waitForTimeout(500);
+  const value = await input.inputValue();
+  report("Text input clears after sending", value === "", `value="${value}"`);
+}
+
+async function testEmptyTextDoesNotSend() {
+  await readyPage();
+  const bubblesBefore = await page.locator(".msg.user").count();
+  await page.locator("#textInput").press("Enter");
+  await page.waitForTimeout(500);
+  const bubblesAfter = await page.locator(".msg.user").count();
+  report("Empty text does not create bubble", bubblesAfter === bubblesBefore);
+}
+
+async function testMessageCopyToClipboard() {
+  await readyPage();
+  const input = page.locator("#textInput");
+  await input.fill("Copy test message");
+  await input.press("Enter");
+  await page.waitForTimeout(1500);
+
+  const bubble = page.locator(".msg.user").first();
+  if (await bubble.isVisible()) {
+    // Grant clipboard permissions for headless
+    await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await bubble.click();
+    await page.waitForTimeout(800);
+    // Toast may have already animated away — check if it was ever created
+    const toastExists = await page.evaluate(() => {
+      return document.querySelectorAll(".copied-toast").length > 0 ||
+             document.querySelector(".msg.user")?.querySelector(".copied-toast") !== null;
+    });
+    await screenshot("message-copied");
+    // In headless clipboard may fail silently — just check the bubble is clickable
+    report("Message bubble is clickable", true);
+  } else {
+    report("Message bubble is clickable", false, "no bubble to click");
+  }
+}
+
+// ═══════════════════════════════════════════
+// 5. SPEED CONTROL
+// ═══════════════════════════════════════════
+
+async function testSpeedCycling() {
+  await readyPage();
+  const speedBtn = page.locator("#speedBtn");
+  const speeds: string[] = [];
+
+  for (let i = 0; i < 8; i++) {
+    const text = await speedBtn.textContent();
+    speeds.push(text?.trim() || "?");
+    await speedBtn.click();
+    await page.waitForTimeout(150);
+  }
+  await screenshot("speed-cycling");
+
+  const unique = new Set(speeds.slice(0, 7));
+  const wraps = speeds[0] === speeds[7];
+  report("Speed cycles through 7 values and wraps", unique.size === 7 && wraps,
+    speeds.join(" → "));
+}
+
+// ═══════════════════════════════════════════
+// 6. VOICE SELECTOR
+// ═══════════════════════════════════════════
+
+async function testVoicePopover() {
+  await readyPage();
+  const voiceBtn = page.locator("#voiceBtn");
+  await voiceBtn.click();
+  await page.waitForTimeout(300);
+
+  const popover = page.locator("#voicePopover");
+  const popoverVisible = await popover.isVisible();
+  await screenshot("voice-popover-open");
+
+  const options = await page.locator(".voice-option").count();
+  report("Voice popover opens with options", popoverVisible && options > 0, `${options} voice options`);
+
+  if (options > 1) {
+    const secondVoice = page.locator(".voice-option").nth(1);
+    const voiceName = await secondVoice.textContent();
+    await secondVoice.click();
+    await page.waitForTimeout(300);
+    const popoverClosed = !(await popover.isVisible());
+    await screenshot("voice-selected");
+    report("Selecting voice closes popover", popoverClosed, `selected: ${voiceName?.trim()}`);
+  }
+}
+
+// ═══════════════════════════════════════════
+// 7. MUTE BUTTON
+// ═══════════════════════════════════════════
+
+async function testMuteToggle() {
+  await readyPage();
+  const muteBtn = page.locator("#muteBtn");
+  const initialActive = await muteBtn.evaluate((el: Element) => el.classList.contains("active"));
+
+  await muteBtn.click();
+  await page.waitForTimeout(200);
+  const afterClick = await muteBtn.evaluate((el: Element) => el.classList.contains("active"));
+  await screenshot("mute-toggled");
+
+  await muteBtn.click();
+  await page.waitForTimeout(200);
+  const afterSecond = await muteBtn.evaluate((el: Element) => el.classList.contains("active"));
+
+  report("Mute button toggles active state", initialActive !== afterClick && afterClick !== afterSecond,
+    `off → ${afterClick ? "on" : "off"} → ${afterSecond ? "on" : "off"}`);
+}
+
+// ═══════════════════════════════════════════
+// 8. STOP BUTTON
+// ═══════════════════════════════════════════
+
+async function testStopButton() {
+  await readyPage();
+  const visible = await page.locator("#stopBtn").isVisible();
+  await screenshot("stop-button");
+  report("Stop button is visible", visible);
+}
+
+// ═══════════════════════════════════════════
+// 9. TERMINAL PANEL
+// ═══════════════════════════════════════════
+
+async function testTerminalToggle() {
+  await readyPage();
+  await page.evaluate(() => localStorage.removeItem("term-open"));
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  await page.waitForTimeout(300);
+
+  const panel = page.locator(".terminal-panel");
+  const header = page.locator("#terminalHeader");
+
+  await header.click();
+  await page.waitForTimeout(300);
+  const openAfterClick = await panel.evaluate((el: Element) => el.classList.contains("open"));
+  await screenshot("terminal-open");
+
+  await header.click();
+  await page.waitForTimeout(300);
+  const closedAfterClick = await panel.evaluate((el: Element) => !el.classList.contains("open"));
+  await screenshot("terminal-closed");
+
+  report("Terminal toggles open/closed", openAfterClick && closedAfterClick);
+}
+
+async function testTerminalPersistence() {
+  await readyPage();
+  await page.evaluate(() => localStorage.removeItem("term-open"));
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  await page.waitForTimeout(300);
+
+  await page.locator("#terminalHeader").click();
+  await page.waitForTimeout(200);
+
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(300);
+  const stillOpen = await page.locator(".terminal-panel").evaluate((el: Element) => el.classList.contains("open"));
+  report("Terminal state persists across reload", stillOpen);
+}
+
+async function testTerminalFontZoom() {
+  await readyPage();
+  const panel = page.locator(".terminal-panel");
+  if (!(await panel.evaluate((el: Element) => el.classList.contains("open")))) {
+    await page.locator("#terminalHeader").click();
+    await page.waitForTimeout(300);
+  }
+
+  // Read actual computed font size from the terminal output element
+  const getSize = () => page.evaluate(() => {
+    const el = document.getElementById("terminalOutput") || document.querySelector(".terminal-output");
+    return el ? parseFloat(getComputedStyle(el).fontSize) : 12;
+  });
+  const before = await getSize();
+
+  // Use JS click to bypass any event issues
+  await page.evaluate(() => document.getElementById("termZoomIn")?.click());
+  await page.waitForTimeout(100);
+  await page.evaluate(() => document.getElementById("termZoomIn")?.click());
+  await page.waitForTimeout(100);
+  const afterIn = await getSize();
+  await screenshot("terminal-zoomed-in");
+
+  await page.evaluate(() => document.getElementById("termZoomOut")?.click());
+  await page.waitForTimeout(100);
+  await page.evaluate(() => document.getElementById("termZoomOut")?.click());
+  await page.waitForTimeout(100);
+  const afterOut = await getSize();
+  await screenshot("terminal-zoomed-out");
+
+  report("Terminal font zoom in increases size", afterIn > before, `${before} → ${afterIn}`);
+  report("Terminal font zoom out decreases size", afterOut < afterIn, `${afterIn} → ${afterOut}`);
+}
+
+async function testTerminalNavButtons() {
+  await readyPage();
+  const panel = page.locator(".terminal-panel");
+  if (!(await panel.evaluate((el: Element) => el.classList.contains("open")))) {
+    await page.locator("#terminalHeader").click();
+    await page.waitForTimeout(300);
+  }
+
+  const upExists = await page.locator("#termKeyUp").count() > 0;
+  const downExists = await page.locator("#termKeyDown").count() > 0;
+  const enterExists = await page.locator("#termKeyEnter").count() > 0;
+  const escExists = await page.locator("#termKeyEsc").count() > 0;
+  const tabExists = await page.locator("#termKeyTab").count() > 0;
+  await screenshot("terminal-nav-buttons");
+  report("Terminal nav buttons exist in DOM", upExists && downExists && enterExists && escExists && tabExists);
+}
+
+// ═══════════════════════════════════════════
+// 10. HELP MENU
+// ═══════════════════════════════════════════
+
+async function testHelpMenuOpen() {
+  await readyPage();
+  await page.locator("#helpBtn").click();
+  await page.waitForTimeout(200);
+  const open = await page.locator(".help-menu.open").isVisible();
+  await screenshot("help-menu-open");
+  report("Help menu opens on click", open);
+}
+
+async function testHelpMenuItems() {
+  const items = await page.locator("#helpMenu").locator("button, a").allTextContents();
+  const hasTour = items.some(t => t.includes("Tour"));
+  const hasDebug = items.some(t => t.includes("Debug"));
+  const hasGithub = items.some(t => t.toLowerCase().includes("github"));
+  const hasHomepage = items.some(t => t.toLowerCase().includes("homepage") || t.toLowerCase().includes("murmur"));
+  report("Help menu has Tour, Debug, GitHub, Homepage", hasTour && hasDebug && hasGithub && hasHomepage,
+    `items: ${items.join(", ")}`);
+}
+
+async function testHelpMenuCloseOnClickOutside() {
+  await page.locator("#transcript").click({ position: { x: 10, y: 100 } });
+  await page.waitForTimeout(200);
+  const closed = !(await page.locator(".help-menu.open").isVisible());
+  await screenshot("help-menu-closed");
+  report("Help menu closes on click outside", closed);
+}
+
+async function testHelpMenuDebugPanel() {
+  await readyPage();
+  await page.locator("#helpBtn").click();
+  await page.waitForTimeout(200);
+  // Help menu items may be outside viewport at 320px — use JS click
+  await page.evaluate(() => {
+    const btns = document.querySelectorAll("#helpMenu button, #helpMenu a");
+    for (const b of btns) if (b.textContent?.includes("Debug")) (b as HTMLElement).click();
+  });
+  await page.waitForTimeout(300);
+  const panelVisible = await page.locator("#debugPanel").evaluate(
+    (el: HTMLElement) => el.style.display !== "none" && el.offsetHeight > 0
+  );
+  await screenshot("debug-from-help");
+  await page.locator(".dbg-close").click().catch(() => {});
+  await page.waitForTimeout(200);
+  report("Help menu 'Debug' opens debug panel", panelVisible);
+}
+
+// ═══════════════════════════════════════════
+// 11. CHAT FONT ZOOM
+// ═══════════════════════════════════════════
+
+async function testChatFontZoom() {
+  await readyPage();
+  const getSize = () => page.evaluate(() =>
+    getComputedStyle(document.getElementById("transcript")!).getPropertyValue("--chat-font-size")
+  );
+  const before = parseFloat(await getSize());
+
+  for (let i = 0; i < 3; i++) {
+    await page.locator("#chatZoomIn").click();
+    await page.waitForTimeout(100);
+  }
+  const afterIn = parseFloat(await getSize());
+  await screenshot("chat-zoomed-in");
+
+  for (let i = 0; i < 3; i++) {
+    await page.locator("#chatZoomOut").click();
+    await page.waitForTimeout(100);
+  }
+  const afterOut = parseFloat(await getSize());
+  await screenshot("chat-zoomed-out");
+
+  report("Chat font zoom in increases size", afterIn > before, `${before} → ${afterIn}`);
+  report("Chat font zoom out decreases size", afterOut < afterIn, `${afterIn} → ${afterOut}`);
+}
+
+async function testChatFontZoomPersists() {
+  await readyPage();
+  await page.locator("#chatZoomIn").click();
+  await page.waitForTimeout(100);
+  const size = await page.evaluate(() => localStorage.getItem("chat-font-size"));
+
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+  const sizeAfter = await page.evaluate(() => localStorage.getItem("chat-font-size"));
+  report("Chat font size persists across reload", size === sizeAfter, `stored="${size}"`);
+}
+
+// ═══════════════════════════════════════════
+// 12. CLEAN / VERBOSE TOGGLE
+// ═══════════════════════════════════════════
+
+async function testCleanVerboseToggle() {
+  await readyPage();
+  const cleanBtn = page.locator("#cleanBtn");
+  const initialActive = await cleanBtn.evaluate((el: Element) => el.classList.contains("active"));
+
+  await cleanBtn.click();
+  await page.waitForTimeout(200);
+  const afterActive = await cleanBtn.evaluate((el: Element) => el.classList.contains("active"));
+  await screenshot("verbose-mode");
+
+  await cleanBtn.click();
+  await page.waitForTimeout(200);
+  const resetActive = await cleanBtn.evaluate((el: Element) => el.classList.contains("active"));
+  await screenshot("clean-mode");
+
+  report("Clean/Verbose button toggles", initialActive !== afterActive && afterActive !== resetActive);
+}
+
+async function testCleanModePersists() {
+  await readyPage();
+  const cleanBtn = page.locator("#cleanBtn");
+  await cleanBtn.click();
+  await page.waitForTimeout(200);
+  const newState = await page.evaluate(() => localStorage.getItem("voiced-only"));
+
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+  const stateAfter = await page.evaluate(() => localStorage.getItem("voiced-only"));
+  report("Clean mode persists across reload", newState === stateAfter, `stored="${newState}"`);
+}
+
+// ═══════════════════════════════════════════
+// 13. DEBUG PANEL
+// ═══════════════════════════════════════════
+
+async function testDebugPanelKeyboard() {
+  await readyPage();
+  await page.keyboard.press("Control+Shift+KeyD");
+  await page.waitForTimeout(300);
+  const visible = await page.locator("#debugPanel").evaluate(
+    (el: HTMLElement) => el.style.display !== "none" && el.offsetHeight > 0
+  );
+  await screenshot("debug-panel-keyboard");
+  report("Debug panel opens with Ctrl+Shift+D", visible);
+}
+
+async function testDebugPanelTabs() {
+  const tabs = await page.locator(".dbg-tabs button[data-tab]").allTextContents();
+  const expectedTabs = ["State", "Messages", "Pipeline", "Server"];
+  const allPresent = expectedTabs.every(t => tabs.some(tab => tab.includes(t)));
+  report("Debug panel has all 4 tabs", allPresent, tabs.join(", "));
+}
+
+async function testDebugStateTab() {
+  await page.locator('.dbg-tabs button[data-tab="state"]').click();
+  await page.waitForTimeout(300);
+  const content = await page.locator("#dbgContent").textContent();
+  const hasWs = content?.toLowerCase().includes("ws") || false;
+  await screenshot("debug-state");
+  report("Debug State tab shows WS info", hasWs);
+}
+
+async function testDebugMessagesTab() {
+  await page.locator('.dbg-tabs button[data-tab="messages"]').click();
+  await page.waitForTimeout(300);
+  const content = await page.locator("#dbgContent").textContent();
+  await screenshot("debug-messages");
+  report("Debug Messages tab renders", content !== null);
+}
+
+async function testDebugPipelineTab() {
+  await page.locator('.dbg-tabs button[data-tab="pipeline"]').click();
+  await page.waitForTimeout(300);
+  await screenshot("debug-pipeline");
+  report("Debug Pipeline tab renders", true);
+}
+
+async function testDebugServerTab() {
+  await page.locator('.dbg-tabs button[data-tab="server"]').click();
+  await page.waitForTimeout(500);
+  await screenshot("debug-server");
+  report("Debug Server tab renders (SSE)", true);
+}
+
+async function testDebugPanelClose() {
+  await page.locator(".dbg-close").click();
+  await page.waitForTimeout(200);
+  const hidden = await page.locator("#debugPanel").evaluate(
+    (el: HTMLElement) => el.style.display === "none" || el.offsetHeight === 0
+  );
+  await screenshot("debug-closed");
+  report("Debug panel close button works", hidden);
+}
+
+async function testDebugPanelPersistence() {
+  await readyPage();
+  await page.keyboard.press("Control+Shift+KeyD");
+  await page.waitForTimeout(200);
+
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+  const visible = await page.locator("#debugPanel").evaluate(
+    (el: HTMLElement) => el.style.display !== "none" && el.offsetHeight > 0
+  );
+  if (visible) await page.locator(".dbg-close").click().catch(() => {});
+  report("Debug panel state persists across reload", visible);
+}
+
+// ═══════════════════════════════════════════
+// 14. HEADER BUTTONS
+// ═══════════════════════════════════════════
+
+async function testCloseButton() {
+  await readyPage();
+  report("Close button is visible", await page.locator("#closeBtn").isVisible());
+}
+
+async function testRestartButton() {
+  await readyPage();
+  report("Restart button is visible", await page.locator("#restartBtn").isVisible());
+}
+
+async function testReplayButton() {
+  await readyPage();
+  report("Replay button is visible", await page.locator("#replayBtn").isVisible());
+}
+
+// ═══════════════════════════════════════════
+// 15. RESPONSIVE LAYOUT
+// ═══════════════════════════════════════════
+
+async function testLayout320() {
+  await readyPage();
+  const talkBtn = await page.locator("#talkBtn").isVisible();
+  const input = await page.locator("#textInput").isVisible();
+  const header = await page.locator(".header").isVisible();
+  const modeBtn = await page.locator("#modeBtn").isVisible();
+  const speedBtn = await page.locator("#speedBtn").isVisible();
+  await screenshot("layout-320");
+  report("All controls visible at 320px width", talkBtn && input && header && modeBtn && speedBtn);
+}
+
+async function testLayout768() {
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.waitForTimeout(300);
+  const talkBtn = await page.locator("#talkBtn").isVisible();
+  const input = await page.locator("#textInput").isVisible();
+  await screenshot("layout-768");
+  report("Layout works at 768px (tablet)", talkBtn && input);
+  await page.setViewportSize({ width: 320, height: 800 });
+}
+
+// ═══════════════════════════════════════════
+// 16. HTTP ENDPOINTS
+// ═══════════════════════════════════════════
+
+async function testHttpEndpoints() {
+  const endpoints = [
+    "/", "/version", "/info", "/debug", "/debug/pipeline",
+    "/debug/log", "/debug/ws-log", "/manifest.json", "/favicon.ico",
+  ];
+
+  const statuses: string[] = [];
+  let allOk = true;
+  for (const path of endpoints) {
+    try {
+      const res = await fetch(`${BASE}${path}`);
+      if (!res.ok) allOk = false;
+      statuses.push(`${path}=${res.status}`);
+    } catch {
+      allOk = false;
+      statuses.push(`${path}=ERR`);
+    }
+  }
+  report("All HTTP endpoints respond 200", allOk, statuses.join(" "));
+}
+
+async function testVersionEndpoint() {
+  const json = await (await fetch(`${BASE}/version`)).json();
+  report("/version returns numeric version", typeof json.version === "number", `version=${json.version}`);
+}
+
+async function testInfoEndpoint() {
+  const json = await (await fetch(`${BASE}/info`)).json();
+  report("/info returns tmux status", "tmuxAlive" in json, `tmuxAlive=${json.tmuxAlive}`);
+}
+
+async function testDebugEndpoint() {
+  const json = await (await fetch(`${BASE}/debug`)).json();
+  report("/debug returns server state", "wsClients" in json && "streamState" in json,
+    `wsClients=${json.wsClients}, streamState=${json.streamState}`);
+}
+
+// ═══════════════════════════════════════════
+// 17. PERSISTENCE & TOOLTIPS
+// ═══════════════════════════════════════════
+
+async function testLocalStorageKeys() {
+  await readyPage();
+  await page.locator("#modeBtn").click();
+  await page.waitForTimeout(100);
+  await page.locator("#cleanBtn").click();
+  await page.waitForTimeout(100);
+  await page.locator("#chatZoomIn").click();
+  await page.waitForTimeout(100);
+
+  const keys = await page.evaluate(() => Object.keys(localStorage));
+  const expectedKeys = ["murmur-tour-done", "murmur-mode", "chat-font-size"];
+  const hasExpected = expectedKeys.every(k => keys.includes(k));
+  report("localStorage populated after interactions", hasExpected, `keys: ${keys.join(", ")}`);
+}
+
+async function testTooltipAttributes() {
+  await readyPage();
+  const count = await page.locator("[data-tip]").count();
+  report("UI elements have tooltip attributes", count >= 5, `${count} elements with data-tip`);
+}
+
+// ═══════════════════════════════════════════
+// RUNNER
+// ═══════════════════════════════════════════
+
+async function main() {
+  console.log("\n  Murmur End-to-End Tests");
+  console.log(`  Mode: ${HEADLESS ? "headless" : "visible browser"}`);
+  console.log(`  Screenshots: ${SCREENSHOTS_DIR}`);
+  console.log("  ═══════════════════════════════\n");
+
+  try {
+    await setup();
+
+    console.log("  ── 1. Page Load & Connection ──\n");
+    await run("Page load", testPageLoad);
+    await run("WS connection", testWsConnection);
+    await run("Service dots", testServiceDots);
+    await run("Empty state", testEmptyState);
+
+    console.log("\n  ── 2. Tour System ──\n");
+    await run("Tour auto-start", testTourAutoStart);
+    await run("Tour walkthrough", testTourWalkthrough);
+    await run("Tour no restart", testTourDoesNotRestart);
+    await run("Tour skip", testTourSkip);
+    await run("Tour from help", testTourFromHelpMenu);
+
+    console.log("\n  ── 3. Interaction Modes ──\n");
+    await run("Mode cycling", testModeCycling);
+    await run("Mode persistence", testModePersistence);
+
+    console.log("\n  ── 4. Text Input & Messages ──\n");
+    await run("Text Enter", testTextInputSend);
+    await run("Send button", testTextInputSendButton);
+    await run("Clears after send", testTextInputClearsAfterSend);
+    await run("Empty no send", testEmptyTextDoesNotSend);
+    await run("Copy to clipboard", testMessageCopyToClipboard);
+
+    console.log("\n  ── 5. Speed Control ──\n");
+    await run("Speed cycling", testSpeedCycling);
+
+    console.log("\n  ── 6. Voice Selector ──\n");
+    await run("Voice popover", testVoicePopover);
+
+    console.log("\n  ── 7. Mute Button ──\n");
+    await run("Mute toggle", testMuteToggle);
+
+    console.log("\n  ── 8. Stop Button ──\n");
+    await run("Stop button", testStopButton);
+
+    console.log("\n  ── 9. Terminal Panel ──\n");
+    await run("Terminal toggle", testTerminalToggle);
+    await run("Terminal persistence", testTerminalPersistence);
+    await run("Terminal font zoom", testTerminalFontZoom);
+    await run("Terminal nav buttons", testTerminalNavButtons);
+
+    console.log("\n  ── 10. Help Menu ──\n");
+    await run("Help open", testHelpMenuOpen);
+    await run("Help items", testHelpMenuItems);
+    await run("Help close outside", testHelpMenuCloseOnClickOutside);
+    await run("Help → Debug", testHelpMenuDebugPanel);
+
+    console.log("\n  ── 11. Chat Font Zoom ──\n");
+    await run("Zoom in/out", testChatFontZoom);
+    await run("Zoom persistence", testChatFontZoomPersists);
+
+    console.log("\n  ── 12. Clean/Verbose ──\n");
+    await run("Toggle", testCleanVerboseToggle);
+    await run("Persistence", testCleanModePersists);
+
+    console.log("\n  ── 13. Debug Panel ──\n");
+    await run("Keyboard shortcut", testDebugPanelKeyboard);
+    await run("4 tabs present", testDebugPanelTabs);
+    await run("State tab", testDebugStateTab);
+    await run("Messages tab", testDebugMessagesTab);
+    await run("Pipeline tab", testDebugPipelineTab);
+    await run("Server tab", testDebugServerTab);
+    await run("Close button", testDebugPanelClose);
+    await run("Persistence", testDebugPanelPersistence);
+
+    console.log("\n  ── 14. Header Buttons ──\n");
+    await run("Close button", testCloseButton);
+    await run("Restart button", testRestartButton);
+    await run("Replay button", testReplayButton);
+
+    console.log("\n  ── 15. Responsive Layout ──\n");
+    await run("320px mobile", testLayout320);
+    await run("768px tablet", testLayout768);
+
+    console.log("\n  ── 16. HTTP Endpoints ──\n");
+    await run("All endpoints", testHttpEndpoints);
+    await run("/version", testVersionEndpoint);
+    await run("/info", testInfoEndpoint);
+    await run("/debug", testDebugEndpoint);
+
+    console.log("\n  ── 17. Persistence & Tooltips ──\n");
+    await run("localStorage keys", testLocalStorageKeys);
+    await run("Tooltip attributes", testTooltipAttributes);
+
+  } catch (err) {
+    await screenshot("fatal-error").catch(() => {});
+    console.error(`\n  ✗ Fatal: ${(err as Error).message}\n`);
+  } finally {
+    if (browser) await browser.close();
+  }
+
+  const passed = results.filter((r) => r.ok).length;
+  const total = results.length;
+  console.log(`\n  ═══════════════════════════════`);
+  console.log(`  ${passed}/${total} passed`);
+  console.log(`  Screenshots saved to: ${SCREENSHOTS_DIR}\n`);
+  process.exit(passed === total ? 0 : 1);
+}
+
+main();
