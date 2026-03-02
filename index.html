@@ -300,6 +300,14 @@
   /* Entry-based clean mode: hide non-speakable entries via CSS */
   body.clean-mode .entry-nonspeakable { display: none; }
 
+  /* Turn separator between conversation turns */
+  .turn-separator {
+    width: 60%;
+    margin: 10px auto;
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
   .msg-wrap {
     position: relative;
     align-self: flex-start;
@@ -2119,13 +2127,31 @@
   // =============================================
 
   function renderEntries(entries, partial) {
-    // Build map of existing entry bubbles
+    // Build map of existing entry bubbles and turn separators
     const existing = new Map();
     document.querySelectorAll(".entry-bubble").forEach(el => {
       existing.set(el.dataset.entryId, el);
     });
+    const existingSeps = new Set();
+    document.querySelectorAll(".turn-separator").forEach(el => {
+      existingSeps.add(el.dataset.turnSep);
+    });
 
+    let lastTurn = null;
     entries.forEach((entry, i) => {
+      // Insert turn separator between different turns
+      if (entry.turn != null && lastTurn != null && entry.turn !== lastTurn) {
+        const sepKey = `${lastTurn}-${entry.turn}`;
+        if (!existingSeps.has(sepKey)) {
+          const sep = document.createElement("div");
+          sep.className = "turn-separator";
+          sep.dataset.turnSep = sepKey;
+          transcript.appendChild(sep);
+        }
+        existingSeps.delete(sepKey);
+      }
+      lastTurn = entry.turn;
+
       const idStr = String(entry.id);
       let div = existing.get(idStr);
 
@@ -2143,6 +2169,7 @@
         div.className = `msg ${entry.role} entry-bubble`;
         div.dataset.entryId = idStr;
         div.dataset.entrySpeakable = entry.speakable ? "1" : "0";
+        div.dataset.entryTurn = String(entry.turn || 0);
 
         const timeStr = fmtTime(entry.ts || Date.now());
         const roleName = entry.role === "user" ? "You" : "Claude";
@@ -2202,20 +2229,26 @@
       }
     });
 
-    // Remove stale bubbles
+    // Remove stale bubbles (not in current entries list)
     existing.forEach(el => {
       const wrap = el.closest(".msg-wrap");
       if (wrap) wrap.remove();
       else el.remove();
     });
+    // Remove stale turn separators
+    existingSeps.forEach(key => {
+      const el = document.querySelector(`.turn-separator[data-turn-sep="${key}"]`);
+      if (el) el.remove();
+    });
 
     transcript.scrollTop = transcript.scrollHeight;
 
-    // Save to history when not partial
+    // Save to history when not partial — only save current turn entries
     if (!partial && entries.length > 0) {
-      // Build text summary for localStorage history
-      const lastUser = entries.filter(e => e.role === "user").pop();
-      const assistantTexts = entries.filter(e => e.role === "assistant").map(e => e.text).join("\n\n");
+      const maxTurn = Math.max(...entries.map(e => e.turn || 0));
+      const currentTurnEntries = entries.filter(e => (e.turn || 0) === maxTurn);
+      const lastUser = currentTurnEntries.filter(e => e.role === "user").pop();
+      const assistantTexts = currentTurnEntries.filter(e => e.role === "assistant").map(e => e.text).join("\n\n");
       if (lastUser) addToHistory("user", lastUser.text, lastUser.ts);
       if (assistantTexts) addToHistory("assistant", assistantTexts, Date.now());
     }

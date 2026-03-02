@@ -811,10 +811,12 @@ interface ConversationEntry {
   speakable: boolean;
   spoken: boolean;
   ts: number;
+  turn: number;
 }
 
 let conversationEntries: ConversationEntry[] = [];
 let entryIdCounter = 0;
+let currentTurn = 0;
 let currentTtsEntryId: number | null = null;
 let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -827,6 +829,7 @@ function addUserEntry(text: string) {
     speakable: false,
     spoken: false,
     ts: Date.now(),
+    turn: currentTurn,
   };
   conversationEntries.push(entry);
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -1065,8 +1068,8 @@ function broadcastCurrentOutput() {
   if (normalized === lastBroadcastText) return;
   lastBroadcastText = normalized;
 
-  // Diff paragraphs against current entries (assistant only)
-  const assistantEntries = conversationEntries.filter(e => e.role === "assistant");
+  // Diff paragraphs against current turn's assistant entries only
+  const assistantEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
 
   for (let i = 0; i < paragraphs.length; i++) {
     const para = paragraphs[i];
@@ -1086,6 +1089,7 @@ function broadcastCurrentOutput() {
         speakable: para.speakable,
         spoken: false,
         ts: Date.now(),
+        turn: currentTurn,
       };
       conversationEntries.push(entry);
     }
@@ -1093,6 +1097,7 @@ function broadcastCurrentOutput() {
 
   // Remove stale assistant entries if paragraphs shrunk (rare reparse)
   // But never remove entries that were already spoken — they're real content
+  // Only consider current turn entries
   if (paragraphs.length < assistantEntries.length) {
     const staleEntries = assistantEntries.slice(paragraphs.length);
     const staleIds = new Set(staleEntries.filter(e => !e.spoken).map(e => e.id));
@@ -1109,7 +1114,7 @@ function broadcastCurrentOutput() {
   });
 
   // Trigger TTS for completed speakable entries (not the last one, which may still be growing)
-  const currentAssistant = conversationEntries.filter(e => e.role === "assistant");
+  const currentAssistant = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
   for (let i = 0; i < currentAssistant.length - 1; i++) {
     const entry = currentAssistant[i];
     if (entry.speakable && !entry.spoken) {
@@ -1127,7 +1132,7 @@ function broadcastCurrentOutput() {
     if (entryTtsTimer) clearTimeout(entryTtsTimer);
     entryTtsTimer = setTimeout(() => {
       entryTtsTimer = null;
-      const freshAssistant = conversationEntries.filter(e => e.role === "assistant");
+      const freshAssistant = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
       const freshLast = freshAssistant[freshAssistant.length - 1];
       if (freshLast && freshLast.id === lastEntry.id && !freshLast.spoken) {
         freshLast.spoken = true;
@@ -1243,8 +1248,13 @@ function startTmuxStreaming(userInput: string) {
   lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
-  conversationEntries = [];
-  entryIdCounter = 0;
+  // Start a new conversation turn — keep old entries for history
+  currentTurn++;
+  // Cap at ~200 entries to prevent unbounded memory growth (trim oldest turns)
+  if (conversationEntries.length > 200) {
+    const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
+    conversationEntries = conversationEntries.filter(e => e.turn >= oldestTurnToKeep);
+  }
   currentTtsEntryId = null;
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   streamFileOffset = 0;
@@ -1319,11 +1329,10 @@ function handleStreamDone() {
 
   console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s`);
 
-  // System context response — suppress all entries and TTS
+  // System context response — suppress current turn entries and TTS, keep old turns
   if (_isSystemContext) {
     _isSystemContext = false;
-    conversationEntries = [];
-    entryIdCounter = 0;
+    conversationEntries = conversationEntries.filter(e => e.turn !== currentTurn);
     currentTtsEntryId = null;
     broadcast({ type: "entry", entries: conversationEntries, partial: false });
     broadcast({ type: "voice_status", state: "idle" });
@@ -1336,8 +1345,8 @@ function handleStreamDone() {
   const pane = captureTmuxPane();
   const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
 
-  // Update entries from final paragraphs
-  const assistantEntries = conversationEntries.filter(e => e.role === "assistant");
+  // Update entries from final paragraphs (current turn only)
+  const assistantEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
   for (let i = 0; i < paragraphs.length; i++) {
     const para = paragraphs[i];
     if (i < assistantEntries.length) {
@@ -1351,6 +1360,7 @@ function handleStreamDone() {
         speakable: para.speakable,
         spoken: false,
         ts: Date.now(),
+        turn: currentTurn,
       });
     }
   }
@@ -1362,13 +1372,13 @@ function handleStreamDone() {
     partial: false,
   });
 
-  const totalEntries = conversationEntries.filter(e => e.role === "assistant").length;
-  console.log(`[stream] Final: ${totalEntries} assistant entries`);
+  const totalEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn).length;
+  console.log(`[stream] Final: ${totalEntries} assistant entries (turn ${currentTurn})`);
 
-  // Speak any remaining unspoken speakable entries
+  // Speak any remaining unspoken speakable entries (current turn only)
   let spokeAnything = false;
   for (const entry of conversationEntries) {
-    if (entry.role === "assistant" && entry.speakable && !entry.spoken) {
+    if (entry.role === "assistant" && entry.turn === currentTurn && entry.speakable && !entry.spoken) {
       entry.spoken = true;
       console.log(`[stream] Final TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
       plog("final_entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
@@ -1384,7 +1394,7 @@ function handleStreamDone() {
   }
 
   if (!spokeAnything) {
-    const hasSpeakable = conversationEntries.some(e => e.role === "assistant" && e.speakable);
+    const hasSpeakable = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.speakable);
     if (hasSpeakable) {
       console.log("[stream] All speakable entries already spoken");
     } else {
@@ -1555,9 +1565,8 @@ function startPassiveWatcher() {
 
       // Start streaming just like a Murmur-initiated input
       if (streamState === "DONE" || streamState === "IDLE") {
-        // Reset entries for new conversation turn
-        conversationEntries = [];
-        entryIdCounter = 0;
+        // New conversation turn — keep old entries for history
+        currentTurn++;
         currentTtsEntryId = null;
         if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
         lastBroadcastText = "";
@@ -2026,6 +2035,11 @@ function handleWsConnection(ws: WebSocket) {
   // Send service status
   ws.send(JSON.stringify({ type: "services", ...serviceStatus }));
 
+  // Send conversation entries so reconnecting clients see the full history
+  if (conversationEntries.length > 0) {
+    ws.send(JSON.stringify({ type: "entry", entries: conversationEntries, partial: streamState === "RESPONDING" }));
+  }
+
   // Send current panel settings (prefer persistent file, fall back to signal files)
   {
     const persisted = loadSettings();
@@ -2479,6 +2493,7 @@ function handleWsConnection(ws: WebSocket) {
             speakable: true,
             spoken: false,
             ts: Date.now(),
+            turn: currentTurn,
           };
           conversationEntries.push(entry);
           (ws as any)._testEntryIds?.add(entry.id);
@@ -2507,6 +2522,7 @@ function handleWsConnection(ws: WebSocket) {
           speakable: item.speakable !== false, // default true
           spoken: item.spoken === true,         // default false
           ts: Date.now(),
+          turn: currentTurn,
         };
         conversationEntries.push(entry);
         (ws as any)._testEntryIds?.add(entry.id);
@@ -2537,6 +2553,7 @@ function handleWsConnection(ws: WebSocket) {
             speakable: true,
             spoken: false,
             ts: Date.now(),
+            turn: currentTurn,
           };
           conversationEntries.push(entry);
           (ws as any)._testEntryIds?.add(entry.id);
@@ -2575,6 +2592,7 @@ function handleWsConnection(ws: WebSocket) {
         speakable: true,
         spoken: false,
         ts: Date.now(),
+        turn: currentTurn,
       };
       conversationEntries.push(entry);
       (ws as any)._testEntryIds?.add(entry.id);
