@@ -895,14 +895,14 @@
       <p class="subtitle">Grab the latest release for your platform.</p>
 
       <div class="dl-buttons">
-        <a href="#" class="dl-btn macos">
+        <a href="https://github.com/hdt325/murmur/releases/latest" class="dl-btn macos" id="dlMac">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
           <span class="dl-label">
             macOS
             <small>Apple Silicon & Intel (.dmg)</small>
           </span>
         </a>
-        <a href="#" class="dl-btn windows">
+        <a href="https://github.com/hdt325/murmur/releases/latest" class="dl-btn windows" id="dlWin">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 12V6.5l8-1.1V12H3zm0 .5h8v6.6l-8-1.1V12.5zm9-7.7L22 3.5V12h-10V4.8zM12 12.5h10v8.5l-10-1.4V12.5z"/></svg>
           <span class="dl-label">
             Windows
@@ -965,6 +965,17 @@ npm run electron</code></pre>
   </footer>
 
   <script>
+    // Resolve latest GitHub Release asset URLs for download buttons
+    fetch("https://api.github.com/repos/hdt325/murmur/releases/latest")
+      .then(r => r.json())
+      .then(rel => {
+        const dmg = rel.assets?.find(a => a.name.endsWith(".dmg"));
+        const exe = rel.assets?.find(a => a.name.endsWith(".exe"));
+        if (dmg) document.getElementById("dlMac").href = dmg.browser_download_url;
+        if (exe) document.getElementById("dlWin").href = exe.browser_download_url;
+      })
+      .catch(() => {}); // fallback: links go to /releases/latest
+
     function copyCode(btn) {
       const code = btn.previousElementSibling.textContent;
       navigator.clipboard.writeText(code).then(() => {

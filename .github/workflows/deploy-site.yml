@@ -3,7 +3,6 @@ name: Deploy Download Page
 on:
   push:
     branches: [main]
-    paths: [site/**]
 
 jobs:
   deploy:
