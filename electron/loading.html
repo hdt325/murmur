@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Murmur — Starting</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a1e;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-app-region: drag;
+  }
+  .container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 32px 24px 16px;
+    max-width: 100%;
+  }
+
+  /* Header */
+  .header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    color: #fff;
+    letter-spacing: 0.5px;
+  }
+  .header .subtitle {
+    font-size: 12px;
+    color: #888;
+    margin-top: 4px;
+  }
+
+  /* Waveform animation */
+  .waveform {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 32px;
+    margin-bottom: 20px;
+  }
+  .waveform .bar {
+    width: 3px;
+    background: #f04b5a;
+    border-radius: 2px;
+    animation: wave 1.2s ease-in-out infinite;
+  }
+  .waveform .bar:nth-child(1) { height: 8px; animation-delay: 0s; }
+  .waveform .bar:nth-child(2) { height: 14px; animation-delay: 0.1s; }
+  .waveform .bar:nth-child(3) { height: 22px; animation-delay: 0.2s; }
+  .waveform .bar:nth-child(4) { height: 30px; animation-delay: 0.3s; }
+  .waveform .bar:nth-child(5) { height: 22px; animation-delay: 0.4s; }
+  .waveform .bar:nth-child(6) { height: 14px; animation-delay: 0.5s; }
+  .waveform .bar:nth-child(7) { height: 8px; animation-delay: 0.6s; }
+  @keyframes wave {
+    0%, 100% { transform: scaleY(0.4); opacity: 0.5; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
+
+  /* Checklist */
+  .checklist {
+    margin-bottom: 16px;
+    -webkit-app-region: no-drag;
+  }
+  .checklist-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 13px;
+  }
+  .checklist-item .icon {
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .checklist-item.pending .icon { color: #555; }
+  .checklist-item.ok .icon { color: #4ade80; }
+  .checklist-item.warn .icon { color: #fbbf24; }
+  .checklist-item.fail .icon { color: #f04b5a; }
+  .checklist-item .label { color: #ccc; }
+  .checklist-item.ok .label { color: #e0e0e0; }
+  .checklist-item.fail .label { color: #f04b5a; }
+  .checklist-item .hint {
+    font-size: 11px;
+    color: #888;
+    margin-left: auto;
+    max-width: 160px;
+    text-align: right;
+  }
+
+  /* Log area */
+  .log-area {
+    flex: 1;
+    background: #111114;
+    border-radius: 8px;
+    padding: 10px 12px;
+    overflow-y: auto;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    border: 1px solid #2a2a2e;
+    min-height: 80px;
+    -webkit-app-region: no-drag;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line.info { color: #aaa; }
+  .log-line.warn { color: #fbbf24; }
+  .log-line.error { color: #f04b5a; }
+  .log-line.success { color: #4ade80; }
+
+  /* Footer */
+  .footer {
+    padding: 12px 0 4px;
+    text-align: center;
+    -webkit-app-region: no-drag;
+  }
+  .retry-btn {
+    display: none;
+    background: #f04b5a;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 20px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .retry-btn:hover { background: #d63d4b; }
+  .retry-btn.visible { display: inline-block; }
+  .status-text {
+    font-size: 11px;
+    color: #666;
+    margin-top: 6px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>Murmur</h1>
+    <div class="subtitle">Starting up...</div>
+  </div>
+
+  <div class="waveform">
+    <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+    <div class="bar"></div>
+    <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+  </div>
+
+  <div class="checklist" id="checklist">
+    <div class="checklist-item pending" data-check="node">
+      <span class="icon">&#9679;</span>
+      <span class="label">Node.js</span>
+    </div>
+    <div class="checklist-item pending" data-check="claude">
+      <span class="icon">&#9679;</span>
+      <span class="label">Claude Code CLI</span>
+    </div>
+    <div class="checklist-item pending" data-check="tmux" id="tmux-row">
+      <span class="icon">&#9679;</span>
+      <span class="label">tmux</span>
+    </div>
+    <div class="checklist-item pending" data-check="deps">
+      <span class="icon">&#9679;</span>
+      <span class="label">Dependencies</span>
+    </div>
+    <div class="checklist-item pending" data-check="server">
+      <span class="icon">&#9679;</span>
+      <span class="label">Server</span>
+    </div>
+    <div class="checklist-item pending" data-check="whisper">
+      <span class="icon">&#9679;</span>
+      <span class="label">Whisper STT</span>
+    </div>
+    <div class="checklist-item pending" data-check="kokoro">
+      <span class="icon">&#9679;</span>
+      <span class="label">Kokoro TTS</span>
+    </div>
+  </div>
+
+  <div class="log-area" id="log"></div>
+
+  <div class="footer">
+    <button class="retry-btn" id="retryBtn" onclick="handleRetry()">Retry</button>
+    <div class="status-text" id="statusText"></div>
+  </div>
+</div>
+
+<script>
+  const logEl = document.getElementById("log");
+  const retryBtn = document.getElementById("retryBtn");
+  const statusText = document.getElementById("statusText");
+  const subtitle = document.querySelector(".subtitle");
+  const waveform = document.querySelector(".waveform");
+
+  // Hide tmux row on Windows
+  if (window.murmurElectron && window.murmurElectron.platform === "win32") {
+    const tmuxRow = document.getElementById("tmux-row");
+    if (tmuxRow) tmuxRow.style.display = "none";
+  }
+
+  function addLog(msg, type) {
+    if (!msg) return;
+    const line = document.createElement("div");
+    line.className = "log-line " + (type || "info");
+    line.textContent = msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function updateCheck(name, status, hint) {
+    const item = document.querySelector(`[data-check="${name}"]`);
+    if (!item) return;
+    item.className = "checklist-item " + status;
+    const icon = item.querySelector(".icon");
+    if (status === "ok") icon.innerHTML = "&#10003;";
+    else if (status === "fail") icon.innerHTML = "&#10007;";
+    else if (status === "warn") icon.innerHTML = "!";
+    if (hint) {
+      let hintEl = item.querySelector(".hint");
+      if (!hintEl) {
+        hintEl = document.createElement("span");
+        hintEl.className = "hint";
+        item.appendChild(hintEl);
+      }
+      hintEl.textContent = hint;
+    }
+  }
+
+  function showError(msg) {
+    subtitle.textContent = "Startup failed";
+    waveform.style.display = "none";
+    retryBtn.classList.add("visible");
+    if (msg) statusText.textContent = msg;
+  }
+
+  function handleRetry() {
+    retryBtn.classList.remove("visible");
+    statusText.textContent = "";
+    subtitle.textContent = "Retrying...";
+    waveform.style.display = "flex";
+    logEl.innerHTML = "";
+    // Reset checklist
+    document.querySelectorAll(".checklist-item").forEach(item => {
+      item.className = "checklist-item pending";
+      item.querySelector(".icon").innerHTML = "&#9679;";
+      const hint = item.querySelector(".hint");
+      if (hint) hint.remove();
+    });
+    if (window.murmurElectron) window.murmurElectron.retry();
+  }
+
+  // Listen for startup status messages from main process
+  if (window.murmurElectron && window.murmurElectron.onStartupStatus) {
+    window.murmurElectron.onStartupStatus((data) => {
+      const { msg, type, check, checkStatus, checkHint } = data;
+      if (msg) addLog(msg, type);
+      if (check) updateCheck(check, checkStatus || "ok", checkHint);
+      if (type === "error" && !check) showError(msg);
+      if (type === "fatal") showError(msg);
+    });
+  }
+</script>
+</body>
+</html>

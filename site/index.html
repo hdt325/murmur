@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Murmur — Hands-free voice conversations with Claude Code</title>
+  <meta name="description" content="Murmur is a desktop voice interface for Claude Code. Speak naturally, hear responses read aloud, and watch Claude work in a live terminal.">
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #1a1a1e;
+      --bg-card: #232328;
+      --bg-code: #16161a;
+      --accent: #f04b5a;
+      --accent-glow: rgba(240, 75, 90, 0.25);
+      --green: #4ade80;
+      --text: #e4e4e7;
+      --text-muted: #a1a1aa;
+      --border: #2e2e34;
+      --radius: 12px;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ── Hero ──────────────────────────────────────── */
+
+    .hero {
+      min-height: 80vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 80px 24px 64px;
+    }
+
+    .waveform {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 64px;
+      margin-bottom: 40px;
+    }
+
+    .waveform .bar {
+      width: 6px;
+      border-radius: 3px;
+      background: var(--accent);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    /* Crescendo-decrescendo: short edges, tall center (heartbeat murmur shape) */
+    .waveform .bar:nth-child(1) { height: 12px; animation-delay: 0s; }
+    .waveform .bar:nth-child(2) { height: 24px; animation-delay: 0.1s; }
+    .waveform .bar:nth-child(3) { height: 42px; animation-delay: 0.2s; }
+    .waveform .bar:nth-child(4) { height: 56px; animation-delay: 0.3s; }
+    .waveform .bar:nth-child(5) { height: 42px; animation-delay: 0.4s; }
+    .waveform .bar:nth-child(6) { height: 24px; animation-delay: 0.5s; }
+    .waveform .bar:nth-child(7) { height: 12px; animation-delay: 0.6s; }
+
+    @keyframes pulse {
+      0%, 100% { transform: scaleY(0.4); opacity: 0.5; }
+      50%      { transform: scaleY(1.0); opacity: 1.0; }
+    }
+
+    .hero h1 {
+      font-size: clamp(3rem, 8vw, 5rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: #fff;
+      margin-bottom: 16px;
+    }
+
+    .hero .tagline {
+      font-size: clamp(1.1rem, 3vw, 1.4rem);
+      color: var(--text-muted);
+      max-width: 520px;
+      margin-bottom: 40px;
+    }
+
+    .hero-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 32px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.15s;
+    }
+
+    .hero-cta:hover {
+      background: #d93d4c;
+      transform: translateY(-1px);
+    }
+
+    .hero-cta svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    /* ── Features ──────────────────────────────────── */
+
+    .features {
+      padding: 64px 24px 80px;
+    }
+
+    .features h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 48px;
+      color: #fff;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 32px 28px;
+      transition: border-color 0.25s, transform 0.2s, box-shadow 0.25s;
+    }
+
+    .feature-card:hover {
+      border-color: #444;
+      transform: translateY(-3px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 16px;
+      font-size: 1.3rem;
+    }
+
+    .feature-icon.mic    { background: rgba(240, 75, 90, 0.15); color: var(--accent); }
+    .feature-icon.speaker { background: rgba(74, 222, 128, 0.15); color: var(--green); }
+    .feature-icon.terminal { background: rgba(96, 165, 250, 0.15); color: #60a5fa; }
+    .feature-icon.globe  { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+
+    .feature-card h3 {
+      font-size: 1.15rem;
+      font-weight: 650;
+      color: #fff;
+      margin-bottom: 8px;
+    }
+
+    .feature-card p {
+      color: var(--text-muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+
+    /* ── Download ──────────────────────────────────── */
+
+    .download {
+      padding: 64px 24px 80px;
+    }
+
+    .download h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+    }
+
+    .download .subtitle {
+      text-align: center;
+      color: var(--text-muted);
+      margin-bottom: 40px;
+    }
+
+    .dl-buttons {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 48px;
+      flex-wrap: wrap;
+    }
+
+    .dl-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 36px;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: transform 0.15s, box-shadow 0.2s;
+      border: 1px solid var(--border);
+    }
+
+    .dl-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    }
+
+    .dl-btn.macos {
+      background: #fff;
+      color: #1a1a1e;
+    }
+
+    .dl-btn.windows {
+      background: var(--bg-card);
+      color: var(--text);
+      border-color: #3a3a42;
+    }
+
+    .dl-btn svg {
+      width: 22px;
+      height: 22px;
+    }
+
+    .dl-btn .dl-label {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.2;
+    }
+
+    .dl-btn .dl-label small {
+      font-size: 0.75rem;
+      font-weight: 400;
+      opacity: 0.65;
+    }
+
+    .source-section {
+      max-width: 600px;
+      margin: 0 auto;
+    }
+
+    .source-section h3 {
+      text-align: center;
+      font-size: 1rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      margin-bottom: 16px;
+    }
+
+    .code-block {
+      position: relative;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .code-block pre {
+      padding: 24px;
+      padding-right: 80px;
+      overflow-x: auto;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 0.88rem;
+      line-height: 1.7;
+      color: var(--text-muted);
+    }
+
+    .code-block .copy-btn {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-family: inherit;
+      cursor: pointer;
+      transition: color 0.2s, border-color 0.2s;
+    }
+
+    .code-block .copy-btn:hover {
+      color: var(--text);
+      border-color: #555;
+    }
+
+    .code-block .copy-btn.copied {
+      color: var(--green);
+      border-color: var(--green);
+    }
+
+    /* ── Prerequisites ────────────────────────────── */
+
+    .prereqs {
+      padding: 0 24px 80px;
+    }
+
+    .prereqs details {
+      max-width: 600px;
+      margin: 0 auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .prereqs summary {
+      padding: 20px 24px;
+      font-weight: 600;
+      font-size: 1rem;
+      cursor: pointer;
+      color: #fff;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      user-select: none;
+    }
+
+    .prereqs summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .prereqs summary .chevron {
+      transition: transform 0.2s;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+
+    .prereqs details[open] summary .chevron {
+      transform: rotate(90deg);
+    }
+
+    .prereqs .prereq-list {
+      padding: 0 24px 24px;
+      list-style: none;
+    }
+
+    .prereqs .prereq-list li {
+      padding: 12px 0;
+      border-top: 1px solid var(--border);
+      font-size: 0.93rem;
+      color: var(--text-muted);
+    }
+
+    .prereqs .prereq-list li strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .prereqs .prereq-list li code {
+      background: var(--bg-code);
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      font-family: "SF Mono", "Fira Code", Consolas, monospace;
+      color: var(--green);
+    }
+
+    .prereqs .prereq-list li .platform-tag {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: rgba(240, 75, 90, 0.12);
+      color: var(--accent);
+      margin-left: 6px;
+    }
+
+    /* ── Footer ────────────────────────────────────── */
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.88rem;
+    }
+
+    footer .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+
+    footer a {
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: color 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    footer a:hover {
+      color: var(--text);
+    }
+
+    footer svg {
+      width: 20px;
+      height: 20px;
+    }
+
+    footer .sep {
+      color: var(--border);
+    }
+
+    /* ── Responsive ────────────────────────────────── */
+
+    @media (max-width: 640px) {
+      .feature-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        min-height: auto;
+        padding: 60px 20px 48px;
+      }
+
+      .dl-buttons {
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .dl-btn {
+        width: 100%;
+        max-width: 300px;
+        justify-content: center;
+      }
+
+      footer .footer-inner {
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      footer .sep {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="waveform" aria-hidden="true">
+      <div class="bar"></div>
+      <div class="bar"></div>
+      <div class="bar"></div>
+      <div class="bar"></div>
+      <div class="bar"></div>
+      <div class="bar"></div>
+      <div class="bar"></div>
+    </div>
+    <h1>Murmur</h1>
+    <p class="tagline">Hands-free voice conversations with Claude Code</p>
+    <a href="#download" class="hero-cta">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download
+    </a>
+  </section>
+
+  <!-- Features -->
+  <section class="features">
+    <div class="container">
+      <h2>What you get</h2>
+      <div class="feature-grid">
+
+        <div class="feature-card">
+          <div class="feature-icon mic">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+          </div>
+          <h3>Voice Input</h3>
+          <p>Speak naturally -- local Whisper STT transcribes on-device with zero cloud latency.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon speaker">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          </div>
+          <h3>Voice Output</h3>
+          <p>Responses read aloud via local Kokoro TTS with selectable voices and adjustable speed.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon terminal">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          </div>
+          <h3>Live Terminal</h3>
+          <p>See Claude Code working in real-time with full ANSI color support and scrollback.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon globe">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3>Cross-Platform</h3>
+          <p>Works on macOS and Windows with a single Electron codebase. One app, every desktop.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- Download -->
+  <section class="download" id="download">
+    <div class="container">
+      <h2>Download</h2>
+      <p class="subtitle">Grab the latest release for your platform.</p>
+
+      <div class="dl-buttons">
+        <a href="#" class="dl-btn macos">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+          <span class="dl-label">
+            macOS
+            <small>Apple Silicon & Intel (.dmg)</small>
+          </span>
+        </a>
+        <a href="#" class="dl-btn windows">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 12V6.5l8-1.1V12H3zm0 .5h8v6.6l-8-1.1V12.5zm9-7.7L22 3.5V12h-10V4.8zM12 12.5h10v8.5l-10-1.4V12.5z"/></svg>
+          <span class="dl-label">
+            Windows
+            <small>64-bit (.exe)</small>
+          </span>
+        </a>
+      </div>
+
+      <div class="source-section">
+        <h3>Or build from source</h3>
+        <div class="code-block">
+          <pre><code>git clone https://github.com/happythakkar/murmur.git
+cd murmur && npm install
+cd electron && npm install && cd ..
+npm run electron</code></pre>
+          <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Prerequisites -->
+  <section class="prereqs">
+    <details>
+      <summary>
+        <span class="chevron">&#9654;</span>
+        Prerequisites
+      </summary>
+      <ul class="prereq-list">
+        <li>
+          <strong>Node.js 18+</strong> -- required on both platforms
+        </li>
+        <li>
+          <strong>Claude Code CLI</strong><br>
+          <code>npm i -g @anthropic-ai/claude-code</code>
+        </li>
+        <li>
+          <strong>VoiceMode</strong> -- provides local Whisper STT and Kokoro TTS<br>
+          <code>uv tool install voicemode</code>
+        </li>
+        <li>
+          <strong>tmux</strong> <span class="platform-tag">macOS only</span><br>
+          <code>brew install tmux</code>
+        </li>
+      </ul>
+    </details>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="footer-inner">
+      <span>Built by Happy Thakkar</span>
+      <span class="sep">&middot;</span>
+      <a href="https://github.com/happythakkar/murmur" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+        GitHub
+      </a>
+      <span class="sep">&middot;</span>
+      <span>MIT License</span>
+    </div>
+  </footer>
+
+  <script>
+    function copyCode(btn) {
+      const code = btn.previousElementSibling.textContent;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>

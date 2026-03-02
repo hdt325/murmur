@@ -1,13 +1,13 @@
 /**
- * Murmur Electron preload — minimal bridge.
- * The web UI (index.html) communicates with server.ts via WebSocket,
- * so no IPC bridge is needed. This preload exists for security isolation.
+ * Murmur Electron preload — bridge for startup diagnostics + runtime info.
  */
 
-const { contextBridge } = require("electron");
+const { contextBridge, ipcRenderer } = require("electron");
 
-// Expose minimal info to the renderer
 contextBridge.exposeInMainWorld("murmurElectron", {
   platform: process.platform,
   isElectron: true,
+  // Startup diagnostics
+  onStartupStatus: (callback) => ipcRenderer.on("startup-status", (_e, data) => callback(data)),
+  retry: () => ipcRenderer.send("retry-startup"),
 });

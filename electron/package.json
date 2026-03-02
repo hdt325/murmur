@@ -5,8 +5,10 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build:mac": "electron-builder --mac",
-    "build:win": "electron-builder --win"
+    "build:mac": "electron-builder --mac --publish never",
+    "build:win": "electron-builder --win --publish never",
+    "release:mac": "electron-builder --mac --publish always",
+    "release:win": "electron-builder --win --publish always"
   },
   "build": {
     "appId": "com.murmur.app",
@@ -14,8 +16,26 @@
     "directories": {
       "output": "dist"
     },
+    "publish": {
+      "provider": "github",
+      "owner": "hdt325",
+      "repo": "murmur"
+    },
     "mac": {
-      "target": "dmg",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
       "icon": "icons/icon.icns",
       "category": "public.app-category.developer-tools"
     },
@@ -30,6 +50,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "loading.html",
       "icons/**/*"
     ],
     "extraResources": [
@@ -48,6 +69,9 @@
         ]
       }
     ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3"
   },
   "devDependencies": {
     "electron": "^33.0.0",
