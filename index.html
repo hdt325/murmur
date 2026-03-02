@@ -453,7 +453,7 @@
     border-color: #3a9ca566;
     background: #3a9ca512;
   }
-  .talk-bar button.idle-state.mode-read .murmur-icon { color: #3a9ca5; }
+  .talk-bar button.idle-state.mode-read .murmur-icon { filter: hue-rotate(160deg); }
   .talk-bar button.idle-state.mode-read .talk-idle-hint { color: #3a9ca5; }
 
   .talk-bar button.idle-state.mode-type {
@@ -461,6 +461,7 @@
     background: #9b7dd412;
   }
   .talk-bar button.idle-state.mode-type .talk-idle-hint { color: #9b7dd4; }
+  .talk-bar button.idle-state.mode-type .murmur-icon { filter: hue-rotate(280deg) saturate(0.8); }
 
   .talk-bar button.idle-state.mode-text {
     border-color: #55555566;
@@ -470,7 +471,7 @@
   .talk-bar button.idle-state.mode-text .talk-idle-hint { color: #777; }
 
   .talk-idle-hint {
-    font-size: 9px;
+    font-size: 11px;
     color: #666;
     letter-spacing: 0.3px;
   }
@@ -616,7 +617,8 @@
     white-space: nowrap;
     padding: 0 5px;
     width: auto;
-    max-width: 90px;
+    max-width: 120px;
+    text-align: left;
   }
   .controls button.voice-btn:hover { background: #2a2a30; color: #e0d8d5; }
 
@@ -846,7 +848,7 @@
     position: relative; display: flex; align-items: center;
   }
   .help-menu {
-    display: none; position: absolute; bottom: calc(100% + 6px); right: 0;
+    display: none; position: absolute; top: calc(100% + 6px); right: 0;
     background: #2a2a30; border: 1px solid #444; border-radius: 8px;
     padding: 6px 0; min-width: 160px; z-index: 100;
     box-shadow: 0 8px 24px rgba(0,0,0,0.5);
@@ -1324,8 +1326,13 @@
     document.getElementById("micMeter").classList.toggle("muted", muted);
     talkBtn.style.opacity = m.micOn ? "1" : "0.4";
     talkBtn.style.pointerEvents = m.micOn ? "auto" : "none";
-    // Sync mute button visual
+    // Sync mute button — disable when mic is off (Type/Text modes)
     muteBtn.classList.toggle("active", muted);
+    muteBtn.style.opacity = m.micOn ? "1" : "0.3";
+    muteBtn.style.pointerEvents = m.micOn ? "auto" : "none";
+    // Disable stop button when TTS is off (Text mode)
+    stopBtn.style.opacity = m.ttsOn ? "1" : "0.3";
+    stopBtn.style.pointerEvents = m.ttsOn ? "auto" : "none";
     if (ws?.readyState === WebSocket.OPEN) ws.send("mute:" + (muted ? "1" : "0"));
     if (_modeReady && muted && isRecording) stopRecording();
     localStorage.setItem("murmur-mode", String(modeIdx));
@@ -2354,13 +2361,12 @@
       pendingIdle = false; // New audio coming, cancel deferred idle
       setTalkState("speaking");
     } else if (state === "idle") {
-      // If TTS is still playing or just finished (server may be synthesizing next chunk), defer idle
-      const recentTts = Date.now() - ttsEndedAt < 800;
-      if (ttsPlaying || (recentTts && talkBtn.classList.contains("speaking"))) {
-        rlog(`[voice_status] idle deferred — ttsPlaying=${ttsPlaying} recentTts=${recentTts}`);
+      // If TTS is still actively playing, defer idle briefly (server may be synthesizing next chunk)
+      if (ttsPlaying) {
+        rlog(`[voice_status] idle deferred — ttsPlaying=${ttsPlaying}`);
         pendingIdle = true;
-        // Safety: if no new speaking arrives within 2s, go idle anyway
-        setTimeout(() => { if (pendingIdle && !ttsPlaying) applyIdleState(); }, 2000);
+        // Safety: if no new speaking arrives within 500ms, go idle anyway
+        setTimeout(() => { if (pendingIdle && !ttsPlaying) applyIdleState(); }, 500);
         return;
       }
       applyIdleState();
@@ -2513,8 +2519,8 @@
   let autoListenEnabled = true;
   let autoListenActive = false;
   let speechConfirmStart = 0;
-  const SPEECH_THRESHOLD = 0.008;  // Require clear speech signal above ambient noise
-  const SPEECH_CONFIRM_MS = 200;   // Sustained speech for 200ms before triggering recording
+  const SPEECH_THRESHOLD = 0.015;  // Require clear speech signal above ambient/keyboard noise
+  const SPEECH_CONFIRM_MS = 350;   // Sustained speech for 350ms before triggering recording
   let conversationHot = false;     // After Claude speaks, next speech goes direct (no wake word)
   let ttsStartedAt = 0;
   let ttsEndedAt = 0;
@@ -3009,6 +3015,7 @@
       // Diagnostic: log blocking reason every 5s
       const shouldLog = autoListenDebugCounter % 100 === 0;
       if (muted) { if (shouldLog) rlog("[auto-listen] BLOCKED: muted"); return; }
+      if (document.activeElement === textInput) { speechConfirmStart = 0; return; } // Suppress while typing
       if (isRecording) { if (shouldLog) rlog("[auto-listen] BLOCKED: isRecording"); return; }
       if (!micAnalyser || !micDataArray) { if (shouldLog) rlog("[auto-listen] BLOCKED: no mic"); return; }
       const btnClass = talkBtn.className;

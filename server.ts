@@ -185,6 +185,7 @@ const MURMUR_CONTEXT_LINES = [
 
 let contextSentAt = 0;
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
+let _isSystemContext = false; // true while system context is being sent — suppresses entry creation
 function sendMurmurContext(delayMs = 2000) {
   // Debounce: only send once per 30s, cancel pending timers
   if (Date.now() - contextSentAt < 30000) return;
@@ -193,9 +194,10 @@ function sendMurmurContext(delayMs = 2000) {
     contextTimer = null;
     if (Date.now() - contextSentAt < 30000) return;
     if (terminal.isSessionAlive()) {
+      _isSystemContext = true;
       terminal.sendText(MURMUR_CONTEXT_LINES.join(" "));
       contextSentAt = Date.now();
-      console.log("[context] Sent Murmur system context to Claude");
+      console.log("[context] Sent Murmur system context to Claude (suppressed from UI)");
     }
   }, delayMs);
 }
@@ -1042,6 +1044,7 @@ const ENTRY_TTS_DELAY_MS = 200;
 // Diffs extractStructuredOutput() against conversationEntries, creates/updates entries,
 // broadcasts { type: "entry" }, and triggers TTS for completed speakable entries.
 function broadcastCurrentOutput() {
+  if (_isSystemContext) return; // Suppress UI during system context
   const pane = captureTmuxPane();
   if (!pane) return;
 
@@ -1303,6 +1306,19 @@ function handleStreamDone() {
 
   console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s`);
 
+  // System context response — suppress all entries and TTS
+  if (_isSystemContext) {
+    _isSystemContext = false;
+    conversationEntries = [];
+    entryIdCounter = 0;
+    currentTtsEntryId = null;
+    broadcast({ type: "entry", entries: conversationEntries, partial: false });
+    broadcast({ type: "voice_status", state: "idle" });
+    broadcastPipelineTrace();
+    console.log("[stream] System context response suppressed from UI");
+    return;
+  }
+
   // Final extraction into entry model
   const pane = captureTmuxPane();
   const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
@@ -1347,6 +1363,11 @@ function handleStreamDone() {
       speakText(entry.text);
       spokeAnything = true;
     }
+  }
+
+  // Re-broadcast with final spoken states so client has correct fading
+  if (spokeAnything) {
+    broadcast({ type: "entry", entries: conversationEntries, partial: false });
   }
 
   if (!spokeAnything) {
@@ -1523,7 +1544,7 @@ function startPassiveWatcher() {
         if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
         lastBroadcastText = "";
 
-        if (userInput) {
+        if (userInput && !_isSystemContext) {
           addUserEntry(userInput);
         }
 
@@ -1730,7 +1751,7 @@ let idleTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleIdleReset(delayMs = 15000) {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    if ((vmState.phase === "thinking" || vmState.phase === "standby") && !vmState.ttsPlaying && !vmState.micActive) {
+    if ((vmState.phase === "thinking" || vmState.phase === "standby" || vmState.phase === "listening") && !vmState.ttsPlaying && !vmState.micActive) {
       // If the last cycle had no TTS, it was standby — go to standby, not idle
       // The conversation skill will keep looping, so stay in standby
       if (!currentCycleHadTts && vmState.conversationActive) {
@@ -1779,6 +1800,8 @@ function handleVoiceModeEvent(event: { event_type: string; data?: Record<string,
     case "TTS_PLAYBACK_END":
       vmState.ttsPlaying = false;
       vmState.phase = "listening";
+      // Auto-reset to idle if no recording starts within 15s
+      scheduleIdleReset(15000);
       break;
     case "RECORDING_START":
       cancelIdleReset();
@@ -2405,10 +2428,159 @@ function handleWsConnection(ws: WebSocket) {
       return;
     }
 
+    // test:entries:JSON — simulate multi-paragraph assistant response via entry system
+    // Input: JSON array of paragraph strings, e.g. ["First paragraph.", "Second paragraph."]
+    // Broadcasts: thinking → responding → incremental entry broadcasts → idle
+    if (msg.startsWith("test:entries:")) {
+      const paragraphs: string[] = JSON.parse(msg.slice(13));
+      console.log(`[test] Simulating ${paragraphs.length} assistant entries`);
+
+      broadcast({ type: "voice_status", state: "thinking" });
+
+      setTimeout(() => {
+        broadcast({ type: "voice_status", state: "responding" });
+
+        // Add entries progressively with small delays between them
+        let i = 0;
+        const addNext = () => {
+          if (i >= paragraphs.length) {
+            broadcast({ type: "entry", entries: conversationEntries, partial: false });
+            broadcast({ type: "voice_status", state: "idle" });
+            return;
+          }
+          const entry: ConversationEntry = {
+            id: ++entryIdCounter,
+            role: "assistant",
+            text: paragraphs[i],
+            speakable: true,
+            spoken: false,
+            ts: Date.now(),
+          };
+          conversationEntries.push(entry);
+          (ws as any)._testEntryIds?.add(entry.id);
+          i++;
+          broadcast({ type: "entry", entries: conversationEntries, partial: i < paragraphs.length });
+          setTimeout(addNext, 150);
+        };
+        addNext();
+      }, 300);
+
+      return;
+    }
+
+    // test:entries-mixed:JSON — create entries with per-entry spoken/speakable control
+    // Input: JSON array of { text, spoken?, speakable? } objects
+    // Broadcasts: entry list immediately (no TTS, no state transitions)
+    if (msg.startsWith("test:entries-mixed:")) {
+      const items: Array<{ text: string; spoken?: boolean; speakable?: boolean }> = JSON.parse(msg.slice(19));
+      console.log(`[test] Creating ${items.length} mixed entries`);
+
+      for (const item of items) {
+        const entry: ConversationEntry = {
+          id: ++entryIdCounter,
+          role: "assistant",
+          text: item.text,
+          speakable: item.speakable !== false, // default true
+          spoken: item.spoken === true,         // default false
+          ts: Date.now(),
+        };
+        conversationEntries.push(entry);
+        (ws as any)._testEntryIds?.add(entry.id);
+      }
+      broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      return;
+    }
+
+    // test:entries-tts:JSON — simulate multi-paragraph response WITH TTS for each entry
+    // Like test:entries but also speaks each entry, setting currentTtsEntryId correctly.
+    // This exercises the full entryId→tts_highlight→audio chain per paragraph.
+    if (msg.startsWith("test:entries-tts:")) {
+      const paragraphs: string[] = JSON.parse(msg.slice(17));
+      console.log(`[test] Simulating ${paragraphs.length} entries with TTS`);
+
+      broadcast({ type: "voice_status", state: "thinking" });
+
+      setTimeout(() => {
+        broadcast({ type: "voice_status", state: "responding" });
+
+        // Create all entries first
+        const newEntries: ConversationEntry[] = [];
+        for (const text of paragraphs) {
+          const entry: ConversationEntry = {
+            id: ++entryIdCounter,
+            role: "assistant",
+            text,
+            speakable: true,
+            spoken: false,
+            ts: Date.now(),
+          };
+          conversationEntries.push(entry);
+          (ws as any)._testEntryIds?.add(entry.id);
+          newEntries.push(entry);
+        }
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+
+        // Speak each entry in sequence via TTS queue
+        // The first one speaks immediately; rest are queued
+        for (const entry of newEntries) {
+          entry.spoken = true;
+          currentTtsEntryId = entry.id;
+          speakText(entry.text);
+        }
+      }, 300);
+
+      return;
+    }
+
+    // test:interactive:JSON — simulate Claude presenting numbered choices
+    // Input: JSON object { question: "...", options: ["a", "b", "c"] }
+    // Broadcasts: assistant entries with question + options, then interactive_prompt active
+    if (msg.startsWith("test:interactive:")) {
+      const { question, options } = JSON.parse(msg.slice(17));
+      console.log(`[test] Simulating interactive prompt: "${question}" with ${options.length} options`);
+
+      // Build text like Claude would render
+      const optionLines = options.map((o: string, idx: number) => `❯ ${idx + 1}. ${o}`).join("\n");
+      const fullText = question + "\n" + optionLines;
+
+      // Add as assistant entry
+      const entry: ConversationEntry = {
+        id: ++entryIdCounter,
+        role: "assistant",
+        text: fullText,
+        speakable: true,
+        spoken: false,
+        ts: Date.now(),
+      };
+      conversationEntries.push(entry);
+      (ws as any)._testEntryIds?.add(entry.id);
+      broadcast({ type: "entry", entries: conversationEntries, partial: false });
+
+      // Broadcast interactive prompt
+      interactivePromptActive = true;
+      broadcast({ type: "interactive_prompt", active: true });
+
+      return;
+    }
+
     // test:client — mark this connection as a test client (skip context/exit messages)
     if (msg === "test:client") {
       (ws as any)._isTestClient = true;
+      (ws as any)._testEntryIds = new Set<number>();
       console.log("[test] Client marked as test — skipping context/exit");
+      return;
+    }
+
+    // test:clear-entries — remove all entries created by this test client
+    if (msg === "test:clear-entries") {
+      const ids: Set<number> = (ws as any)._testEntryIds;
+      if (ids && ids.size > 0) {
+        const before = conversationEntries.length;
+        conversationEntries = conversationEntries.filter(e => !ids.has(e.id));
+        ids.clear();
+        console.log(`[test] Cleared ${before - conversationEntries.length} test entries`);
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
       return;
     }
 
@@ -2423,6 +2595,18 @@ function handleWsConnection(ws: WebSocket) {
   ws.on("close", () => {
     clients.delete(ws);
     slog("ws", "disconnect", { clients: clients.size });
+
+    // Auto-cleanup: remove entries created by this test client
+    const testIds: Set<number> | undefined = (ws as any)._testEntryIds;
+    if (testIds && testIds.size > 0) {
+      const before = conversationEntries.length;
+      conversationEntries = conversationEntries.filter(e => !testIds.has(e.id));
+      console.log(`[test] Auto-cleaned ${before - conversationEntries.length} test entries on disconnect`);
+      if (clients.size > 0) {
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
+    }
+
     // Last client disconnected — debounce exit message (5s) to avoid spam from rapid reconnects
     if (clients.size === 0 && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
       if (exitTimer) clearTimeout(exitTimer);

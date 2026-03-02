@@ -131,7 +131,9 @@ async function ensureServer() {
     return true;
   }
 
-  const murmurDir = path.resolve(__dirname, "..");
+  const murmurDir = app.isPackaged
+    ? path.join(process.resourcesPath, "murmur")
+    : path.resolve(__dirname, "..");
 
   // Install deps if needed
   const nodeModules = path.join(murmurDir, "node_modules");
@@ -231,8 +233,10 @@ async function startup() {
   // All good — redirect to Murmur
   sendStatus("Loading Murmur...", "success");
   startupComplete = true;
-  setTimeout(() => {
+  setTimeout(async () => {
     if (win && !win.isDestroyed()) {
+      // Clear cache to ensure fresh load after app updates
+      await session.defaultSession.clearCache();
       win.loadURL(SERVER_URL);
     }
   }, 600);
@@ -279,9 +283,12 @@ function createWindow() {
     `);
   });
 
-  // Auto-grant microphone permission for localhost
+  // Auto-grant all permissions (microphone, camera, etc.) for localhost
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(true);
+  });
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
+    return true;
   });
 
   // Load the startup diagnostics page first

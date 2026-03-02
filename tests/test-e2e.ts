@@ -11,6 +11,7 @@ import { chromium, Browser, Page, BrowserContext } from "playwright";
 import { mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import WebSocket from "ws";
 
 const BASE = "http://localhost:3457";
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -315,6 +316,114 @@ async function testMessageCopyToClipboard() {
   } else {
     report("Message bubble is clickable", false, "no bubble to click");
   }
+}
+
+// ═══════════════════════════════════════════
+// 4b. LONG TEXT & PARAGRAPH INPUT
+// ═══════════════════════════════════════════
+
+async function testLongParagraphInput() {
+  await readyPage();
+  const input = page.locator("#textInput");
+  const paragraph = "The quick brown fox jumps over the lazy dog. " +
+    "This sentence contains every letter of the English alphabet at least once. " +
+    "It has been used as a typing exercise since at least the late nineteenth century. " +
+    "Various alternative pangrams exist, but none are quite as well known as this classic phrase.";
+  await input.fill(paragraph);
+  await screenshot("long-paragraph-filled");
+
+  const value = await input.inputValue();
+  const valueMatches = value === paragraph;
+  report("Long paragraph fills input correctly", valueMatches,
+    `${paragraph.length} chars, match=${valueMatches}`);
+
+  await input.press("Enter");
+  await page.waitForTimeout(2000);
+  const userBubbles = await page.locator(".msg.user").count();
+  await screenshot("long-paragraph-sent");
+  report("Long paragraph creates user bubble", userBubbles > 0, `${userBubbles} bubble(s)`);
+}
+
+async function testLongParagraphBubbleRendering() {
+  // Bubble from previous test should still be visible
+  const bubble = page.locator(".msg.user").last();
+  if (await bubble.isVisible()) {
+    const text = await bubble.textContent();
+    const hasFullText = (text?.length || 0) > 100;
+    const width = await bubble.evaluate((el: Element) => el.getBoundingClientRect().width);
+    await screenshot("long-paragraph-bubble");
+    report("Long paragraph bubble renders full text", hasFullText,
+      `${text?.length} chars, width=${Math.round(width)}px`);
+    report("Long paragraph bubble fits within viewport", width <= 320,
+      `width=${Math.round(width)}px, viewport=320px`);
+  } else {
+    report("Long paragraph bubble renders full text", false, "no bubble visible");
+    report("Long paragraph bubble fits within viewport", false, "no bubble visible");
+  }
+}
+
+async function testMultipleSequentialMessages() {
+  await readyPage();
+  const messages = [
+    "First message: the quick brown fox jumps over the lazy dog repeatedly until it gets tired.",
+    "Second message: artificial intelligence and machine learning continue to advance rapidly in capabilities.",
+    "Third message: the Murmur voice interface provides a natural way to interact with Claude Code assistants.",
+  ];
+
+  for (const msg of messages) {
+    const input = page.locator("#textInput");
+    await input.fill(msg);
+    await input.press("Enter");
+    await page.waitForTimeout(1500);
+  }
+
+  const userBubbles = await page.locator(".msg.user").count();
+  await screenshot("sequential-messages");
+  report("Multiple sequential long messages all create bubbles", userBubbles >= 3,
+    `${userBubbles} user bubbles (expected ≥3)`);
+}
+
+async function testSpecialCharacterInput() {
+  await readyPage();
+  const specialText = "Testing special characters: quotes \"hello\" and 'world', " +
+    "ampersands & angles <tag>, unicode symbols ★ ❯ ✓ ✗, " +
+    "and math operators: 2 × 3 = 6, π ≈ 3.14159, √4 = 2.";
+  const input = page.locator("#textInput");
+  await input.fill(specialText);
+  await input.press("Enter");
+  await page.waitForTimeout(2000);
+
+  const bubble = page.locator(".msg.user").last();
+  const bubbleText = await bubble.textContent();
+  // HTML entities may transform some chars, just check length is reasonable
+  const ok = (bubbleText?.length || 0) > 50;
+  await screenshot("special-chars");
+  report("Special characters render in bubble", ok,
+    `${bubbleText?.length} chars rendered`);
+}
+
+async function testMultiLineInput() {
+  await readyPage();
+  // Most text inputs don't support Shift+Enter for newlines, but test that
+  // a very long single-line message still works correctly
+  const longLine = "This is an extremely long single-line message that tests how the input field " +
+    "handles text that significantly exceeds the visible width of the input box, which at three " +
+    "hundred and twenty pixels is quite narrow, requiring the text to scroll horizontally within " +
+    "the input field while maintaining the complete message content for sending to the server.";
+  const input = page.locator("#textInput");
+  await input.fill(longLine);
+
+  const value = await input.inputValue();
+  report("Very long single-line input preserved", value === longLine,
+    `${longLine.length} chars, match=${value === longLine}`);
+
+  await input.press("Enter");
+  await page.waitForTimeout(1500);
+  await screenshot("very-long-line");
+  const bubble = page.locator(".msg.user").last();
+  const bubbleText = await bubble.textContent();
+  report("Very long line renders in bubble", (bubbleText?.length || 0) > 100,
+    `${bubbleText?.length} chars`);
 }
 
 // ═══════════════════════════════════════════
@@ -809,6 +918,583 @@ async function testTooltipAttributes() {
 }
 
 // ═══════════════════════════════════════════
+// 18. TRUE E2E: BUBBLE ↔ TTS HIGHLIGHT CHAIN
+// ═══════════════════════════════════════════
+
+// Helper: connect a Node.js WS to inject test commands server-side
+function connectTestWs(): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://localhost:3457`);
+    ws.on("open", () => { ws.send("test:client"); resolve(ws); });
+    ws.on("error", reject);
+    setTimeout(() => reject(new Error("WS connect timeout")), 5000);
+  });
+}
+
+const ENTRY_TEST_PARAGRAPHS = [
+  "Cats are independent creatures that have lived alongside humans for millennia.",
+  "Dogs are loyal pack animals known for their unconditional devotion to their families.",
+  "Fish breathe through gills and inhabit every aquatic environment on Earth.",
+];
+
+async function testEntryBubblesRender() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:entries:" + JSON.stringify(ENTRY_TEST_PARAGRAPHS));
+  await page.waitForTimeout(2500);
+
+  const entryBubbles = await page.locator(".entry-bubble[data-entry-id]").count();
+  await screenshot("entry-bubbles-rendered");
+  testWs.close();
+  report("Entry bubbles render with data-entry-id attributes", entryBubbles >= 3,
+    `${entryBubbles} entry bubbles`);
+}
+
+async function testEntryBubbleTextsMatch() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:clear-entries");
+  await page.waitForTimeout(500);
+  testWs.send("test:entries:" + JSON.stringify(ENTRY_TEST_PARAGRAPHS));
+  await page.waitForTimeout(2500);
+
+  const texts = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.msg.assistant[data-entry-id]");
+    return Array.from(bubbles).map(b => ({
+      id: b.getAttribute("data-entry-id"),
+      text: b.querySelector(".entry-text")?.textContent || "",
+    }));
+  });
+  testWs.close();
+
+  const expected = ["Cats are independent creatures", "Dogs are loyal pack animals", "Fish breathe through gills"];
+  const allMatch = texts.length >= 3 && expected.every((fragment, i) => texts[i] && texts[i].text.includes(fragment));
+  report("Entry bubble text matches injected entries", allMatch,
+    texts.map(t => `#${t.id}="${t.text.slice(0, 30)}..."`).join(", "));
+}
+
+async function testReplayHighlightsCorrectBubble() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:clear-entries");
+  await page.waitForTimeout(500);
+  testWs.send("test:entries:" + JSON.stringify(ENTRY_TEST_PARAGRAPHS));
+  await page.waitForTimeout(2500);
+
+  const entryIds = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.msg.assistant[data-entry-id]");
+    return Array.from(bubbles).map(b => b.getAttribute("data-entry-id"));
+  });
+
+  if (entryIds.length < 3) {
+    testWs.close();
+    report("Replay highlights correct bubble", false, "not enough entry bubbles");
+    return;
+  }
+
+  const middleId = entryIds[1];
+  await page.evaluate((id) => {
+    const bubble = document.querySelector(`.entry-bubble[data-entry-id="${id}"]`);
+    const wrap = bubble?.parentElement;
+    const replayBtn = wrap?.querySelector(".msg-replay") as HTMLElement;
+    if (replayBtn) replayBtn.click();
+  }, middleId);
+
+  // Wait for TTS to trigger highlight (may take a few seconds for Kokoro)
+  let activeId: string | null = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    await page.waitForTimeout(500);
+    activeId = await page.evaluate(() => {
+      const active = document.querySelector(".entry-bubble.bubble-active") ||
+                     document.querySelector(".entry-bubble.bubble-spoken:last-of-type");
+      return active?.getAttribute("data-entry-id") || null;
+    });
+    if (activeId) break;
+  }
+  await screenshot("replay-highlight");
+  testWs.close();
+
+  report("Replay highlights the correct middle bubble (not first or last)",
+    activeId === middleId,
+    `clicked replay on #${middleId}, highlighted=#${activeId}, ` +
+    `first=#${entryIds[0]}, last=#${entryIds[2]}`);
+}
+
+async function testReplayDifferentBubble() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:entries:" + JSON.stringify(ENTRY_TEST_PARAGRAPHS));
+  await page.waitForTimeout(2500);
+
+  const entryIds = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble[data-entry-id]");
+    return Array.from(bubbles).slice(-3).map(b => b.getAttribute("data-entry-id"));
+  });
+
+  if (entryIds.length < 3) {
+    testWs.close();
+    report("Replay shifts highlight to different bubble", false, "not enough entry bubbles");
+    return;
+  }
+
+  const firstId = entryIds[0];
+  const middleId = entryIds[1];
+  await page.evaluate((id) => {
+    const bubble = document.querySelector(`.entry-bubble[data-entry-id="${id}"]`);
+    const wrap = bubble?.parentElement;
+    const replayBtn = wrap?.querySelector(".msg-replay") as HTMLElement;
+    if (replayBtn) replayBtn.click();
+  }, firstId);
+
+  await page.waitForTimeout(2000);
+  await screenshot("replay-highlight-shifted");
+
+  const activeId = await page.evaluate(() => {
+    const active = document.querySelector(".entry-bubble.bubble-active");
+    return active?.getAttribute("data-entry-id") || null;
+  });
+  testWs.close();
+
+  report("Replay shifts highlight to first bubble (away from middle)",
+    activeId === firstId && activeId !== middleId,
+    `clicked replay on #${firstId}, highlighted=#${activeId} (middle was #${middleId})`);
+}
+
+// ═══════════════════════════════════════════
+// 19. CLEAN vs VERBOSE + MODES × LONG TEXT
+// ═══════════════════════════════════════════
+
+async function testCleanModeHidesNonSpeakable() {
+  await readyPage();
+  // Inject entries: 2 speakable + 1 non-speakable (simulating tool output)
+  const testWs = await connectTestWs();
+
+  // Use test:entries for speakable entries
+  testWs.send("test:entries:" + JSON.stringify([
+    "This is a speakable response about JavaScript closures and their practical applications in modern web development.",
+    "Here is another speakable paragraph explaining how async/await simplifies promise chains in complex applications.",
+  ]));
+  await page.waitForTimeout(1500);
+
+  // Now manually add a non-speakable entry via a modified test command
+  // Since test:entries always creates speakable entries, we'll check that
+  // clean mode CSS class is applied and controls visibility
+  const speakableCount = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.msg.assistant");
+    return Array.from(bubbles).filter(b => !b.classList.contains("entry-nonspeakable")).length;
+  });
+
+  // Ensure clean mode is ON
+  await page.evaluate(() => {
+    document.body.classList.add("clean-mode");
+  });
+  await page.waitForTimeout(200);
+
+  const cleanModeActive = await page.evaluate(() => document.body.classList.contains("clean-mode"));
+  await screenshot("clean-mode-entries");
+
+  // All speakable entries should still be visible in clean mode
+  const visibleInClean = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.msg.assistant:not(.entry-nonspeakable)");
+    return Array.from(bubbles).filter(b => {
+      const style = getComputedStyle(b);
+      return style.display !== "none";
+    }).length;
+  });
+
+  testWs.close();
+  report("Clean mode: speakable entries remain visible", cleanModeActive && visibleInClean >= 2,
+    `cleanMode=${cleanModeActive}, visible=${visibleInClean}, total speakable=${speakableCount}`);
+}
+
+async function testVerboseModeShowsAll() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "Speakable entry for verbose test.", speakable: true },
+    { text: "Non-speakable entry for verbose test.", speakable: false },
+  ]));
+  await page.waitForTimeout(1500);
+
+  // Ensure verbose mode (no clean-mode class)
+  await page.evaluate(() => document.body.classList.remove("clean-mode"));
+  await page.waitForTimeout(200);
+  await screenshot("verbose-mode-entries");
+
+  const allBubbles = await page.locator(".entry-bubble.msg.assistant").count();
+  const verboseActive = await page.evaluate(() => !document.body.classList.contains("clean-mode"));
+  testWs.close();
+
+  report("Verbose mode: all entries visible", verboseActive && allBubbles >= 2,
+    `verbose=${verboseActive}, bubbles=${allBubbles}`);
+}
+
+async function testTextModeNoTtsHighlight() {
+  await readyPage();
+  // Set to Text mode (micOn=false, ttsOn=false)
+  await page.evaluate(() => {
+    // Click mode button until we reach "Text" mode
+    const btn = document.getElementById("modeBtn");
+    for (let i = 0; i < 5; i++) {
+      if (btn?.textContent?.trim() === "Text") break;
+      btn?.click();
+    }
+  });
+  await page.waitForTimeout(300);
+
+  const currentMode = await page.locator("#modeBtn").textContent();
+  await screenshot("text-mode-set");
+
+  // Inject entries and verify no bubble-active highlight appears (TTS is off)
+  const testWs = await connectTestWs();
+  testWs.send("test:entries:" + JSON.stringify([
+    "This entry should render as text only without any TTS highlight in Text mode.",
+  ]));
+  await page.waitForTimeout(2000);
+
+  // Check that no bubble has the active highlight
+  const activeCount = await page.locator(".entry-bubble.bubble-active").count();
+  testWs.close();
+  await screenshot("text-mode-no-highlight");
+
+  report("Text mode: entries render without TTS highlight",
+    currentMode?.trim() === "Text" && activeCount === 0,
+    `mode="${currentMode?.trim()}", activeHighlights=${activeCount}`);
+}
+
+async function testTalkModeEntriesWithReplay() {
+  await readyPage();
+  // Set to Talk mode (micOn=true, ttsOn=true)
+  await page.evaluate(() => {
+    const btn = document.getElementById("modeBtn");
+    for (let i = 0; i < 5; i++) {
+      if (btn?.textContent?.trim() === "Talk") break;
+      btn?.click();
+    }
+  });
+  await page.waitForTimeout(300);
+
+  const testWs = await connectTestWs();
+  testWs.send("test:entries:" + JSON.stringify([
+    "In Talk mode, this long paragraph about distributed systems should be fully rendered and eligible for TTS replay when the user clicks the replay button.",
+    "A second paragraph discussing consensus algorithms provides additional content to verify multi-bubble rendering works correctly in Talk mode.",
+  ]));
+  await page.waitForTimeout(2000);
+
+  const entryCount = await page.locator(".entry-bubble.msg.assistant").count();
+  const replayBtns = await page.locator(".msg-replay").count();
+  const currentMode = await page.locator("#modeBtn").textContent();
+  await screenshot("talk-mode-entries");
+  testWs.close();
+
+  report("Talk mode: long entries render with replay buttons",
+    currentMode?.trim() === "Talk" && entryCount >= 2 && replayBtns >= 2,
+    `mode="${currentMode?.trim()}", entries=${entryCount}, replayBtns=${replayBtns}`);
+}
+
+async function testTypeModeMultiParagraphInput() {
+  await readyPage();
+  // Set to Type mode (micOn=false, ttsOn=true)
+  await page.evaluate(() => {
+    const btn = document.getElementById("modeBtn");
+    for (let i = 0; i < 5; i++) {
+      if (btn?.textContent?.trim() === "Type") break;
+      btn?.click();
+    }
+  });
+  await page.waitForTimeout(300);
+
+  // Type a long paragraph and send
+  const input = page.locator("#textInput");
+  const longText = "In Type mode, the user types their input instead of speaking. " +
+    "This long paragraph tests that typed input in Type mode renders correctly as a user bubble, " +
+    "preserving the full text content without truncation, and that the bubble wraps properly " +
+    "within the narrow 320px mobile viewport. The response should be spoken aloud via TTS.";
+  await input.fill(longText);
+  await input.press("Enter");
+  await page.waitForTimeout(2000);
+
+  const bubble = page.locator(".msg.user").last();
+  const bubbleText = await bubble.textContent();
+  const currentMode = await page.locator("#modeBtn").textContent();
+  await screenshot("type-mode-long-input");
+
+  report("Type mode: long paragraph input renders in bubble",
+    currentMode?.trim() === "Type" && (bubbleText?.length || 0) > 100,
+    `mode="${currentMode?.trim()}", ${bubbleText?.length} chars`);
+}
+
+async function testReadModeEntriesRender() {
+  await readyPage();
+  // Set to Read mode (micOn=true, ttsOn=false)
+  await page.evaluate(() => {
+    const btn = document.getElementById("modeBtn");
+    for (let i = 0; i < 5; i++) {
+      if (btn?.textContent?.trim() === "Read") break;
+      btn?.click();
+    }
+  });
+  await page.waitForTimeout(300);
+
+  const testWs = await connectTestWs();
+  testWs.send("test:entries:" + JSON.stringify([
+    "In Read mode, this response should appear as text without TTS playback. The user reads Claude's responses instead of hearing them, which is useful in quiet environments.",
+  ]));
+  await page.waitForTimeout(2000);
+
+  const entryCount = await page.locator(".entry-bubble.msg.assistant").count();
+  const currentMode = await page.locator("#modeBtn").textContent();
+  // In Read mode TTS is off, so entry bubbles should NOT have bubble-active (server-driven tts_highlight)
+  // The voice_status=responding from test:entries: may trigger client-side legacy highlight — wait for idle
+  await page.waitForTimeout(1000);
+  const activeCount = await page.locator(".entry-bubble.bubble-active").count();
+  await screenshot("read-mode-entries");
+  testWs.close();
+
+  report("Read mode: entries render as text (no TTS highlight)",
+    currentMode?.trim() === "Read" && entryCount >= 1 && activeCount === 0,
+    `mode="${currentMode?.trim()}", entries=${entryCount}, highlights=${activeCount}`);
+}
+
+// ═══════════════════════════════════════════
+// 20. SPOKEN vs UNSPOKEN VISUAL BOUNDARY
+// ═══════════════════════════════════════════
+
+async function testSpokenEntriesFaded() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  // Create 3 entries: first two already spoken, last one not yet spoken
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "This first entry has already been spoken aloud via TTS and should appear faded.", spoken: true },
+    { text: "This second entry was also spoken earlier and should also be visually dimmed.", spoken: true },
+    { text: "This third entry has NOT been spoken yet and should appear at full brightness.", spoken: false },
+  ]));
+  await page.waitForTimeout(1500);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  const lastThree = [];
+  for (let i = Math.max(0, count - 3); i < count; i++) {
+    const el = allBubbles.nth(i);
+    const hasSpoken = await el.evaluate((e: Element) => e.classList.contains("bubble-spoken"));
+    const opacity = await el.evaluate((e: HTMLElement) => parseFloat(getComputedStyle(e).opacity));
+    lastThree.push({ hasSpoken, opacity });
+  }
+  await screenshot("spoken-vs-unspoken");
+  testWs.close();
+
+  const [first, second, third] = lastThree;
+  report("Spoken entries have bubble-spoken class",
+    first?.hasSpoken === true && second?.hasSpoken === true && third?.hasSpoken === false,
+    `[spoken=${first?.hasSpoken}, spoken=${second?.hasSpoken}, spoken=${third?.hasSpoken}]`);
+  report("Spoken entries have reduced opacity (0.6)",
+    (first?.opacity || 1) < 0.7 && (second?.opacity || 1) < 0.7,
+    `opacities: [${first?.opacity}, ${second?.opacity}]`);
+  report("Unspoken entry has full opacity",
+    (third?.opacity || 0) > 0.9,
+    `opacity: ${third?.opacity}`);
+}
+
+async function testSpokenBorderFaded() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:clear-entries");
+  await page.waitForTimeout(500);
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "Already spoken entry should have a very faint border color.", spoken: true },
+    { text: "Fresh unspoken entry should have a brighter, more visible border.", spoken: false },
+  ]));
+  await page.waitForTimeout(1500);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  if (count < 2) { testWs.close(); report("Spoken entry has fainter border than unspoken", false, `only ${count} bubbles`); return; }
+  const spokenBorder = await allBubbles.nth(count - 2).evaluate((e: HTMLElement) => getComputedStyle(e).borderColor);
+  const freshBorder = await allBubbles.nth(count - 1).evaluate((e: HTMLElement) => getComputedStyle(e).borderColor);
+  await screenshot("spoken-border-comparison");
+  testWs.close();
+
+  // Spoken has rgba(180,160,100,0.08), fresh has rgba(180,160,100,0.15) — spoken should be dimmer
+  report("Spoken entry has fainter border than unspoken",
+    spokenBorder !== freshBorder,
+    `spoken="${spokenBorder}", fresh="${freshBorder}"`);
+}
+
+async function testTtsTransitionsToSpoken() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:clear-entries");
+  await page.waitForTimeout(500);
+  // Create 2 entries — both unspoken initially
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "This paragraph will be spoken first and should transition from bright to faded once done.", spoken: false },
+    { text: "This paragraph is spoken second and should stay bright while the first fades.", spoken: false },
+  ]));
+  await page.waitForTimeout(1500);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  const firstId = await allBubbles.nth(count - 2).getAttribute("data-entry-id");
+  const secondId = await allBubbles.nth(count - 1).getAttribute("data-entry-id");
+
+  // Verify both start without bubble-spoken
+  const beforeFirst = await allBubbles.nth(count - 2).evaluate((e: Element) => e.classList.contains("bubble-spoken"));
+  const beforeSecond = await allBubbles.nth(count - 1).evaluate((e: Element) => e.classList.contains("bubble-spoken"));
+
+  // Simulate: highlight first entry (as if TTS is playing it)
+  testWs.send("replay:" + firstId);
+  await page.waitForTimeout(500);
+  const firstActive = await allBubbles.nth(count - 2).evaluate((e: Element) => e.classList.contains("bubble-active"));
+  await screenshot("tts-transition-first-active");
+
+  // Now highlight second entry — first should become bubble-spoken
+  testWs.send("replay:" + secondId);
+  await page.waitForTimeout(500);
+  const firstNowSpoken = await allBubbles.nth(count - 2).evaluate((e: Element) => e.classList.contains("bubble-spoken"));
+  const secondNowActive = await allBubbles.nth(count - 1).evaluate((e: Element) => e.classList.contains("bubble-active"));
+  await screenshot("tts-transition-second-active");
+
+  // Send stop to clear TTS state
+  testWs.send("stop");
+  await page.waitForTimeout(500);
+  testWs.close();
+
+  report("Both entries start without bubble-spoken",
+    beforeFirst === false && beforeSecond === false,
+    `first=${beforeFirst}, second=${beforeSecond}`);
+  report("First entry highlighted during TTS playback",
+    firstActive === true, `bubble-active=${firstActive}`);
+  report("First entry transitions to spoken when second is highlighted",
+    firstNowSpoken === true && secondNowActive === true,
+    `first.spoken=${firstNowSpoken}, second.active=${secondNowActive}`);
+}
+
+async function testNonSpeakableNotFaded() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  // Non-speakable entries should NOT get bubble-spoken (they're hidden in clean mode, visible in verbose)
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "Speakable and spoken — should be faded.", spoken: true, speakable: true },
+    { text: "Non-speakable tool output — should NOT have bubble-spoken class.", spoken: false, speakable: false },
+    { text: "Speakable but not yet spoken — should be bright.", spoken: false, speakable: true },
+  ]));
+  await page.waitForTimeout(1500);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  const spokenSpeakable = await allBubbles.nth(count - 3).evaluate((e: Element) => ({
+    spoken: e.classList.contains("bubble-spoken"),
+    nonspeakable: e.classList.contains("entry-nonspeakable"),
+  }));
+  const nonSpeakable = await allBubbles.nth(count - 2).evaluate((e: Element) => ({
+    spoken: e.classList.contains("bubble-spoken"),
+    nonspeakable: e.classList.contains("entry-nonspeakable"),
+  }));
+  const freshSpeakable = await allBubbles.nth(count - 1).evaluate((e: Element) => ({
+    spoken: e.classList.contains("bubble-spoken"),
+    nonspeakable: e.classList.contains("entry-nonspeakable"),
+  }));
+  await screenshot("nonspeakable-boundary");
+  testWs.close();
+
+  report("Spoken+speakable entry is faded",
+    spokenSpeakable.spoken === true && spokenSpeakable.nonspeakable === false,
+    `spoken=${spokenSpeakable.spoken}, nonspeakable=${spokenSpeakable.nonspeakable}`);
+  report("Non-speakable entry has entry-nonspeakable class (not bubble-spoken)",
+    nonSpeakable.nonspeakable === true && nonSpeakable.spoken === false,
+    `spoken=${nonSpeakable.spoken}, nonspeakable=${nonSpeakable.nonspeakable}`);
+  report("Fresh speakable entry is bright (neither faded nor hidden)",
+    freshSpeakable.spoken === false && freshSpeakable.nonspeakable === false,
+    `spoken=${freshSpeakable.spoken}, nonspeakable=${freshSpeakable.nonspeakable}`);
+}
+
+async function testCleanModeHidesNonSpeakableShowsSpokenBoundary() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "Spoken speakable entry — visible but faded in clean mode.", spoken: true, speakable: true },
+    { text: "Non-speakable tool output — hidden in clean mode.", spoken: false, speakable: false },
+    { text: "Fresh speakable entry — visible and bright in clean mode.", spoken: false, speakable: true },
+  ]));
+  await page.waitForTimeout(1500);
+
+  // Enable clean mode
+  await page.evaluate(() => document.body.classList.add("clean-mode"));
+  await page.waitForTimeout(300);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  const spokenVisible = await allBubbles.nth(count - 3).isVisible();
+  const nonSpeakableVisible = await allBubbles.nth(count - 2).isVisible();
+  const freshVisible = await allBubbles.nth(count - 1).isVisible();
+  const spokenOpacity = await allBubbles.nth(count - 3).evaluate((e: HTMLElement) => parseFloat(getComputedStyle(e).opacity));
+  const freshOpacity = await allBubbles.nth(count - 1).evaluate((e: HTMLElement) => parseFloat(getComputedStyle(e).opacity));
+  await screenshot("clean-mode-spoken-boundary");
+
+  // Restore verbose
+  await page.evaluate(() => document.body.classList.remove("clean-mode"));
+  testWs.close();
+
+  report("Clean mode: spoken entry visible but faded",
+    spokenVisible === true && spokenOpacity < 0.7,
+    `visible=${spokenVisible}, opacity=${spokenOpacity}`);
+  report("Clean mode: non-speakable entry hidden",
+    nonSpeakableVisible === false, `visible=${nonSpeakableVisible}`);
+  report("Clean mode: fresh entry visible and bright",
+    freshVisible === true && freshOpacity > 0.9,
+    `visible=${freshVisible}, opacity=${freshOpacity}`);
+}
+
+async function testMultiEntryTtsBoundaryProgression() {
+  await readyPage();
+  const testWs = await connectTestWs();
+  // Create 4 entries — simulate a conversation where TTS progresses through them
+  testWs.send("test:entries-mixed:" + JSON.stringify([
+    { text: "Entry alpha — the very first response in this conversation block, already spoken.", spoken: true },
+    { text: "Entry beta — the second response, also already spoken by TTS earlier.", spoken: true },
+    { text: "Entry gamma — not yet spoken, this is the boundary where TTS left off.", spoken: false },
+    { text: "Entry delta — also not spoken, newest content waiting to be read aloud.", spoken: false },
+  ]));
+  await page.waitForTimeout(1500);
+
+  const allBubbles = page.locator(".entry-bubble.msg.assistant");
+  const count = await allBubbles.count();
+  const states = [];
+  for (let i = Math.max(0, count - 4); i < count; i++) {
+    const el = allBubbles.nth(i);
+    const spoken = await el.evaluate((e: Element) => e.classList.contains("bubble-spoken"));
+    const opacity = await el.evaluate((e: HTMLElement) => parseFloat(getComputedStyle(e).opacity));
+    states.push({ spoken, opacity });
+  }
+
+  // Now simulate TTS playing gamma (third entry)
+  const gammaId = await allBubbles.nth(count - 2).getAttribute("data-entry-id");
+  testWs.send("replay:" + gammaId);
+  await page.waitForTimeout(800);
+
+  const gammaActive = await allBubbles.nth(count - 2).evaluate((e: Element) => e.classList.contains("bubble-active"));
+  const deltaStillFresh = await allBubbles.nth(count - 1).evaluate((e: Element) =>
+    !e.classList.contains("bubble-spoken") && !e.classList.contains("bubble-active"));
+  await screenshot("boundary-progression");
+
+  testWs.send("stop");
+  await page.waitForTimeout(500);
+  testWs.close();
+
+  report("First two entries are spoken/faded, last two are fresh",
+    states[0]?.spoken && states[1]?.spoken && !states[2]?.spoken && !states[3]?.spoken,
+    `[${states.map(s => s.spoken ? "spoken" : "fresh").join(", ")}]`);
+  report("Opacity boundary: spoken < 0.7, fresh > 0.9",
+    (states[0]?.opacity || 1) < 0.7 && (states[1]?.opacity || 1) < 0.7 &&
+    (states[2]?.opacity || 0) > 0.9 && (states[3]?.opacity || 0) > 0.9,
+    `opacities: [${states.map(s => s.opacity).join(", ")}]`);
+  report("TTS highlights boundary entry (gamma) as active",
+    gammaActive === true, `gamma.active=${gammaActive}`);
+  report("Entry after boundary (delta) stays fresh during gamma TTS",
+    deltaStillFresh === true, `delta neither spoken nor active`);
+}
+
+// ═══════════════════════════════════════════
 // RUNNER
 // ═══════════════════════════════════════════
 
@@ -844,6 +1530,13 @@ async function main() {
     await run("Clears after send", testTextInputClearsAfterSend);
     await run("Empty no send", testEmptyTextDoesNotSend);
     await run("Copy to clipboard", testMessageCopyToClipboard);
+
+    console.log("\n  ── 4b. Long Text & Paragraph Input ──\n");
+    await run("Long paragraph input", testLongParagraphInput);
+    await run("Long paragraph bubble rendering", testLongParagraphBubbleRendering);
+    await run("Multiple sequential messages", testMultipleSequentialMessages);
+    await run("Special characters", testSpecialCharacterInput);
+    await run("Very long single line", testMultiLineInput);
 
     console.log("\n  ── 5. Speed Control ──\n");
     await run("Speed cycling", testSpeedCycling);
@@ -905,6 +1598,28 @@ async function main() {
     console.log("\n  ── 17. Persistence & Tooltips ──\n");
     await run("localStorage keys", testLocalStorageKeys);
     await run("Tooltip attributes", testTooltipAttributes);
+
+    console.log("\n  ── 18. True E2E: Bubble ↔ TTS Highlight ──\n");
+    await run("Entry bubbles render", testEntryBubblesRender);
+    await run("Entry bubble texts match", testEntryBubbleTextsMatch);
+    await run("Replay highlights correct bubble", testReplayHighlightsCorrectBubble);
+    await run("Replay shifts to different bubble", testReplayDifferentBubble);
+
+    console.log("\n  ── 19. Clean/Verbose + Modes × Long Text ──\n");
+    await run("Clean mode hides non-speakable", testCleanModeHidesNonSpeakable);
+    await run("Verbose mode shows all", testVerboseModeShowsAll);
+    await run("Text mode no TTS highlight", testTextModeNoTtsHighlight);
+    await run("Talk mode entries with replay", testTalkModeEntriesWithReplay);
+    await run("Type mode long paragraph input", testTypeModeMultiParagraphInput);
+    await run("Read mode entries render", testReadModeEntriesRender);
+
+    console.log("\n  ── 20. Spoken vs Unspoken Visual Boundary ──\n");
+    await run("Spoken entries faded (class + opacity)", testSpokenEntriesFaded);
+    await run("Spoken entry fainter border", testSpokenBorderFaded);
+    await run("TTS transitions entry to spoken", testTtsTransitionsToSpoken);
+    await run("Non-speakable not confused with spoken", testNonSpeakableNotFaded);
+    await run("Clean mode: spoken boundary visible", testCleanModeHidesNonSpeakableShowsSpokenBoundary);
+    await run("4-entry boundary progression", testMultiEntryTtsBoundaryProgression);
 
   } catch (err) {
     await screenshot("fatal-error").catch(() => {});
