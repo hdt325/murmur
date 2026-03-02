@@ -111,6 +111,7 @@ let pipelineLog: PipelineEvent[] = [];
 
 function plog(event: string, detail?: string) {
   pipelineLog.push({ ts: Date.now(), event, detail });
+  if (pipelineLog.length > 1000) pipelineLog.shift();
 }
 
 function resetPipelineLog() {
@@ -141,7 +142,7 @@ function slog(cat: string, event: string, detail?: Record<string, unknown>) {
   _serverLog.push(entry);
   if (_serverLog.length > 500) _serverLog.shift();
   const line = `data: ${JSON.stringify(entry)}\n\n`;
-  for (const res of _sseClients) {
+  for (const res of Array.from(_sseClients)) {
     try { res.write(line); } catch { _sseClients.delete(res); }
   }
 }
@@ -271,7 +272,13 @@ function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
       `-map "[out]" -c:a libopus "${outFile}"`,
     { stdio: "ignore", timeout: 10000 }
   );
-  return Buffer.from(readFileSync(outFile));
+  try {
+    return Buffer.from(readFileSync(outFile));
+  } finally {
+    for (const f of [preFile, mainFile, outFile]) {
+      try { unlinkSync(f); } catch {}
+    }
+  }
 }
 
 // --- Direct Voice Input: Transcribe + Type into tmux ---
@@ -341,6 +348,7 @@ const TTS_MAX_RETRIES = 3;
 async function speakText(text: string, interrupt = false): Promise<void> {
   // If TTS is in progress and not interrupting, queue the text
   if (ttsInProgress && !interrupt) {
+    if (ttsQueue.length >= 50) { console.warn("[tts] Queue full, dropping"); return; }
     console.log(`[tts] Queuing text (${text.length} chars) — ${ttsQueue.length + 1} in queue`);
     ttsQueue.push(text);
     return;
@@ -545,7 +553,7 @@ function handleTtsDone() {
 }
 
 function broadcastBinary(data: Buffer) {
-  for (const ws of clients) {
+  for (const ws of Array.from(clients)) {
     if (ws.readyState === WebSocket.OPEN) {
       try { ws.send(data); } catch { clients.delete(ws); }
     }
@@ -1771,7 +1779,7 @@ function broadcast(msg: Record<string, unknown>) {
   wslog("out", (msg.type as string) || "unknown", JSON.stringify(msg).length);
   const data = JSON.stringify(msg);
   let sent = 0;
-  for (const ws of clients) {
+  for (const ws of Array.from(clients)) {
     if (ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(data);
@@ -1789,7 +1797,7 @@ function broadcast(msg: Record<string, unknown>) {
 }
 
 setInterval(() => {
-  for (const ws of clients) {
+  for (const ws of Array.from(clients)) {
     if (ws.readyState === WebSocket.OPEN) ws.ping();
     else clients.delete(ws);
   }
@@ -2316,7 +2324,7 @@ app.get("/favicon-16.png", (_req, res) => {
 });
 
 app.get("/version", (_req, res) => {
-  res.json({ version: 62 });
+  res.json({ version: 63 });
 });
 
 app.get("/debug", (_req, res) => {
@@ -2348,7 +2356,8 @@ app.get("/debug/log/stream", (_req, res) => {
   });
   res.write("data: {\"type\":\"connected\"}\n\n");
   _sseClients.add(res);
-  _req.on("close", () => _sseClients.delete(res));
+  res.on("error", () => _sseClients.delete(res));
+  _req.on("close", () => { _sseClients.delete(res); res.end(); });
 });
 
 app.get("/info", (_req, res) => {
