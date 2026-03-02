@@ -379,7 +379,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   }
   ttsInProgress = true;
   const settings = loadSettings();
-  const voice = settings.voice || "af_sky";
+  const voice = settings.voice || "_local:default";
   const speed = settings.speed || 1;
 
   // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
@@ -419,6 +419,25 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   }
 
   const ttsText = speakable;
+
+  // Local TTS: send text to client for Web Speech API playback (no Kokoro needed)
+  if (voice.startsWith("_local")) {
+    plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
+    slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
+    console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to client`);
+    ttsActiveGen = myGen;
+    broadcast({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
+    broadcast({ type: "voice_status", state: "speaking" });
+    // Client will send tts_done when speechSynthesis finishes
+    // Safety timeout in case client never responds
+    ttsClientTimeout = setTimeout(() => {
+      if (myGen === ttsGeneration) {
+        console.warn("[tts] Local TTS client timeout — forcing done");
+        handleTtsDone();
+      }
+    }, 60000);
+    return;
+  }
 
   const ttsFile = join(TEMP_DIR, `murmur-tts-${Date.now()}.mp3`);
   const payload = JSON.stringify({
@@ -802,8 +821,6 @@ function addUserEntry(text: string) {
   };
   conversationEntries.push(entry);
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
-  // Also broadcast old transcription message for backward compat during transition
-  broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
 }
 
 // Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
@@ -1455,9 +1472,127 @@ function stopTmuxStreaming() {
   if (promptCheckInterval) { clearInterval(promptCheckInterval); promptCheckInterval = null; }
   if (reEngageWatcher) { clearInterval(reEngageWatcher); reEngageWatcher = null; }
   streamState = "IDLE";
+  lastStreamEndTime = Date.now();
 
   // Clean up stream file
   try { unlinkSync(STREAM_FILE); } catch {}
+}
+
+// --- Passive Pane Watcher ---
+// Detects when user types directly into the CLI (not through Murmur).
+// Polls tmux pane every 2s while IDLE. If spinner detected, starts streaming.
+let passiveWatcher: ReturnType<typeof setInterval> | null = null;
+let lastPassiveSnapshot: string = "";
+let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
+const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
+
+function startPassiveWatcher() {
+  if (passiveWatcher) return;
+  passiveWatcher = setInterval(() => {
+    if (streamState !== "IDLE" && streamState !== "DONE") return;
+    if (!terminal.isSessionAlive()) return;
+    // Cooldown: don't trigger if streaming just ended (prevents re-triggering on same session)
+    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
+
+    const pane = captureTmuxPane();
+    if (!pane) return;
+
+    if (hasSpinnerChars(pane)) {
+      console.log("[passive] Spinner detected — native CLI input");
+
+      // Try to extract the user's input from the pane (line starting with ❯)
+      const lines = pane.split("\n");
+      let userInput = "";
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const trimmed = lines[i].trim();
+        if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
+          userInput = trimmed.slice(2).trim();
+          break;
+        }
+      }
+
+      // Take pre-snapshot from saved state (before spinner appeared)
+      const snapshot = lastPassiveSnapshot || pane;
+
+      // Start streaming just like a Murmur-initiated input
+      if (streamState === "DONE" || streamState === "IDLE") {
+        // Reset entries for new conversation turn
+        conversationEntries = [];
+        entryIdCounter = 0;
+        currentTtsEntryId = null;
+        if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
+        lastBroadcastText = "";
+
+        if (userInput) {
+          addUserEntry(userInput);
+        }
+
+        preInputSnapshot = snapshot;
+        lastUserInput = userInput || "(native input)";
+        pollStartTime = Date.now();
+        lastStreamActivity = Date.now();
+        sawActivity = true;
+        streamFileOffset = 0;
+        stopClientPlayback();
+
+        try { writeFileSync(STREAM_FILE, ""); } catch {}
+        terminal.startPipeStream(STREAM_FILE);
+
+        streamState = "THINKING";
+        broadcast({ type: "voice_status", state: "thinking" });
+
+        // Set up watchers (same as startTmuxStreaming)
+        streamWatcher = setInterval(() => {
+          try {
+            const stat = statSync(STREAM_FILE);
+            if (stat.size > streamFileOffset) {
+              streamFileOffset = stat.size;
+              onStreamActivity();
+            } else {
+              const quietMs = Date.now() - lastStreamActivity;
+              if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
+                scheduleDoneCheck();
+              }
+            }
+          } catch {}
+        }, 50);
+
+        promptCheckInterval = setInterval(() => {
+          if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
+          if (!sawActivity) return;
+          const p = captureTmuxPane();
+          if (hasPromptReady(p) && !hasSpinnerChars(p)) {
+            handleStreamDone();
+          } else if (streamState === "RESPONDING") {
+            broadcastCurrentOutput();
+          }
+        }, 1000);
+
+        streamTimeout = setTimeout(() => {
+          const p = captureTmuxPane();
+          const paragraphs = extractStructuredOutput(preInputSnapshot, p, lastUserInput);
+          if (paragraphs.length > 0) {
+            handleStreamDone();
+          } else {
+            stopTmuxStreaming();
+            broadcast({ type: "voice_status", state: "idle" });
+          }
+        }, STREAM_TIMEOUT_MS);
+
+        console.log(`[passive] Started streaming for native CLI input: "${userInput.slice(0, 60)}"`);
+      }
+    } else {
+      // Save clean snapshot for next comparison
+      lastPassiveSnapshot = pane;
+    }
+  }, 2000);
+}
+
+function stopPassiveWatcher() {
+  if (passiveWatcher) {
+    clearInterval(passiveWatcher);
+    passiveWatcher = null;
+  }
 }
 
 // --- VoiceMode Event Log Watching ---
@@ -2111,7 +2246,7 @@ function handleWsConnection(ws: WebSocket) {
     // Voice
     if (msg.startsWith("voice:")) {
       const voice = msg.slice(6).trim();
-      if (voice && VALID_VOICES.has(voice)) {
+      if (voice && (VALID_VOICES.has(voice) || voice.startsWith("_local:"))) {
         writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), voice);
         saveSettings({ voice });
       } else if (voice) {
@@ -2332,7 +2467,7 @@ app.get("/favicon-16.png", (_req, res) => {
 });
 
 app.get("/version", (_req, res) => {
-  res.json({ version: 64 });
+  res.json({ version: 75 });
 });
 
 app.get("/debug", (_req, res) => {
@@ -2458,6 +2593,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Terminal backend: ${terminal.constructor.name}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);
   console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
+  startPassiveWatcher();
+  console.log(`  Passive pane watcher: active (2s poll)`);
 });
 
 // HTTPS server for remote access (Tailscale) — needed for mic permission on non-localhost

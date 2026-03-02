@@ -301,27 +301,27 @@
   body.clean-mode .entry-nonspeakable { display: none; }
 
   .msg-wrap {
-    display: flex;
-    align-items: flex-start;
-    gap: 4px;
+    position: relative;
     align-self: flex-start;
-    max-width: 92%;
+    max-width: 88%;
   }
-  .msg-wrap .msg { flex: 1; min-width: 0; }
+  .msg-wrap .msg { max-width: 100%; }
   .msg-replay {
-    flex-shrink: 0;
-    margin-top: 2px;
-    background: none;
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(26, 26, 30, 0.8);
     border: 1px solid #333338;
     border-radius: 4px;
     color: #9a9aa0;
     font-size: 10px;
     padding: 1px 5px;
     cursor: pointer;
-    opacity: 0.3;
+    opacity: 0;
+    transition: opacity 0.2s;
   }
   .msg-wrap:hover .msg-replay { opacity: 0.7; }
-  .msg-replay:hover { opacity: 1; color: #e8636b; border-color: #e8636b88; }
+  .msg-replay:hover { opacity: 1 !important; color: #e8636b; border-color: #e8636b88; }
 
   .msg .meta {
     display: flex;
@@ -446,22 +446,28 @@
     padding: 4px 0;
   }
   .talk-bar button.idle-state .murmur-icon {
-    width: 64px;
-    height: 22px;
+    width: 56px;
+    height: 56px;
   }
   .talk-bar button.idle-state.mode-read {
-    border-color: #3a7ca5;
-    background: #3a7ca512;
+    border-color: #3a9ca566;
+    background: #3a9ca512;
   }
-  .talk-bar button.idle-state.mode-read .murmur-icon { color: #3a7ca5; }
-  .talk-bar button.idle-state.mode-read .talk-idle-hint { color: #3a7ca5; }
+  .talk-bar button.idle-state.mode-read .murmur-icon { color: #3a9ca5; }
+  .talk-bar button.idle-state.mode-read .talk-idle-hint { color: #3a9ca5; }
 
   .talk-bar button.idle-state.mode-type {
-    border-color: #555;
+    border-color: #9b7dd466;
+    background: #9b7dd412;
+  }
+  .talk-bar button.idle-state.mode-type .talk-idle-hint { color: #9b7dd4; }
+
+  .talk-bar button.idle-state.mode-text {
+    border-color: #55555566;
     background: #1a1a1e;
     opacity: 0.5;
   }
-  .talk-bar button.idle-state.mode-type .talk-idle-hint { color: #888; }
+  .talk-bar button.idle-state.mode-text .talk-idle-hint { color: #777; }
 
   .talk-idle-hint {
     font-size: 9px;
@@ -473,14 +479,18 @@
   .talk-bar button:active { transform: scale(0.97); }
 
   .talk-bar button .murmur-icon {
-    width: 56px;
-    height: 24px;
-    color: #e8636b;
-    opacity: 0.6;
-    flex-shrink: 0;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 48px;
+    height: 48px;
+    opacity: 0.08;
+    pointer-events: none;
   }
-  .talk-bar button.recording .murmur-icon { opacity: 1; color: #e74c3c; }
-  .talk-bar button.speaking .murmur-icon { opacity: 0.8; color: #c9b07c; }
+  .talk-bar button.idle-state .murmur-icon { opacity: 0.12; }
+  .talk-bar button.recording .murmur-icon { opacity: 0.15; }
+  .talk-bar button.speaking .murmur-icon { opacity: 0.1; }
 
   .talk-bar button.recording {
     border-color: #e74c3c;
@@ -581,9 +591,13 @@
     padding: 0 5px;
     color: #e8636b;
     border-color: #e8636b66;
+    transition: color 0.2s, border-color 0.2s;
   }
   .controls button.mode-btn:hover { background: #ffffff08; }
-  .controls button.mode-btn.active { color: #2ecc71; border-color: #2ecc7166; }
+  .controls button.mode-btn.mode-talk { color: #e8636b; border-color: #e8636b66; }
+  .controls button.mode-btn.mode-type { color: #9b7dd4; border-color: #9b7dd466; }
+  .controls button.mode-btn.mode-read { color: #3a9ca5; border-color: #3a9ca566; }
+  .controls button.mode-btn.mode-text { color: #777; border-color: #77777766; }
 
   .controls button.speed {
     border-color: #333338;
@@ -602,6 +616,7 @@
     white-space: nowrap;
     padding: 0 5px;
     width: auto;
+    max-width: 90px;
   }
   .controls button.voice-btn:hover { background: #2a2a30; color: #e0d8d5; }
 
@@ -969,7 +984,7 @@
 
 <!-- Section 5: Controls + Input -->
 <div class="controls">
-  <button class="stop" id="stopBtn" data-tip="Stop Claude + TTS">■</button>
+  <button class="stop" id="stopBtn" data-tip="Stop voice playback">■</button>
   <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
   <button class="mode-btn" id="modeBtn" data-tip="Talk ↔ Talk">Talk</button>
   <button class="replay-btn" id="replayBtn" data-tip="Replay last">↻</button>
@@ -1002,26 +1017,27 @@
 
 <!-- Voice selection popover -->
 <div class="voice-popover" id="voicePopover">
-  <div class="voice-group">American English</div>
+  <div class="voice-group">Kokoro — American English</div>
   <div class="voice-option" data-voice="af_sky">Sky ♀</div>
   <div class="voice-option" data-voice="af_heart">Heart ♀</div>
   <div class="voice-option" data-voice="af_nova">Nova ♀</div>
   <div class="voice-option" data-voice="am_adam">Adam ♂</div>
   <div class="voice-option" data-voice="am_echo">Echo ♂</div>
-  <div class="voice-group">British English</div>
+  <div class="voice-group">Kokoro — British English</div>
   <div class="voice-option" data-voice="bf_emma">Emma ♀</div>
   <div class="voice-option" data-voice="bf_alice">Alice ♀</div>
   <div class="voice-option" data-voice="bm_george">George ♂</div>
   <div class="voice-option" data-voice="bm_daniel">Daniel ♂</div>
-  <div class="voice-group">Other</div>
+  <div class="voice-group">Kokoro — Other</div>
   <div class="voice-option" data-voice="ff_siwis">Siwis (FR)</div>
   <div class="voice-option" data-voice="ef_dora">Dora (ES)</div>
   <div class="voice-option" data-voice="jf_alpha">Alpha (JP)</div>
   <div class="voice-option" data-voice="zf_xiaoxiao">Xiaoxiao (ZH)</div>
+  <div id="localVoiceSlot"></div>
 </div>
 
 <script>
-  const PAGE_VERSION = 64; // Bump this when making changes that require reload
+  const PAGE_VERSION = 75; // Bump this when making changes that require reload
 
   // --- Debug Panel ---
   const _wsLog = [];
@@ -1173,10 +1189,13 @@
     ff_siwis: "Siwis (FR)", ef_dora: "Dora (ES)",
     jf_alpha: "Alpha (JP)", zf_xiaoxiao: "Xiaoxiao (ZH)"
   };
-  function friendlyVoice(raw) { return VOICE_NAMES[raw] || raw; }
+  function friendlyVoice(raw) {
+    if (raw.startsWith("_local:")) return raw.slice(7) + " ⚡";
+    return VOICE_NAMES[raw] || raw;
+  }
 
-  // Inline murmur waveform SVG for talk button
-  const MURMUR_SVG = '<svg viewBox="0 0 80 24" class="murmur-icon"><polyline points="2.0,12.0 2.6,12.2 3.3,12.2 3.9,11.8 4.5,11.6 5.2,11.6 5.8,12.0 6.4,12.6 7.1,13.5 7.7,11.1 8.3,10.2 9.0,12.3 9.6,12.7 10.2,13.3 10.9,12.1 11.5,11.5 12.1,10.5 12.8,10.7 13.4,13.8 14.0,15.2 14.7,10.5 15.3,10.0 15.9,11.2 16.6,12.0 17.2,14.1 17.8,13.1 18.5,13.0 19.1,8.7 19.7,8.9 20.4,14.8 21.0,15.7 21.6,11.3 22.3,11.0 22.9,9.5 23.5,10.9 24.2,13.4 24.8,15.0 25.4,15.2 26.1,6.6 26.7,8.3 27.3,14.2 28.0,14.8 28.6,13.4 29.2,12.5 29.9,8.8 30.5,9.1 31.1,11.2 31.8,17.7 32.4,16.5 33.0,6.0 33.7,9.3 34.3,11.4 34.9,13.6 35.6,15.4 36.2,14.5 36.8,9.9 37.5,6.2 38.1,9.1 38.7,19.7 39.4,16.1 40.0,8.4 40.6,10.7 41.3,7.9 41.9,12.2 42.5,15.2 43.2,17.0 43.8,11.7 44.4,4.8 45.1,9.2 45.7,17.3 46.3,14.1 47.0,12.8 47.6,11.8 48.2,7.2 48.9,10.5 49.5,13.3 50.1,18.3 50.8,12.4 51.4,6.4 52.0,10.3 52.7,13.4 53.3,12.9 53.9,15.2 54.6,12.6 55.2,8.6 55.8,9.0 56.5,12.2 57.1,17.8 57.7,12.1 58.4,9.7 59.0,10.9 59.6,10.6 60.3,12.4 60.9,15.1 61.5,13.4 62.2,10.2 62.8,8.6 63.4,12.0 64.1,15.4 64.7,12.0 65.3,12.4 66.0,11.0 66.6,10.0 67.2,11.8 67.9,13.9 68.5,13.8 69.1,11.2 69.8,9.8 70.4,12.0 71.0,12.8 71.7,12.2 72.3,13.1 72.9,11.5 73.6,11.0 74.2,11.5 74.8,12.6 75.5,12.8 76.1,11.8 76.7,11.7 77.4,12.0 78.0,12.0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  // App icon for talk button background
+  const MURMUR_SVG = '<img src="/icon-256.png" class="murmur-icon" alt="">';
 
   // Remote logging — send key client events to server for debugging
   function rlog(msg) {
@@ -1213,6 +1232,7 @@
     { id: "full",   label: "Talk", tip: "Talk mode: speak to Claude, hear responses aloud",  micOn: true,  ttsOn: true  },
     { id: "type",   label: "Type",  tip: "Type mode: type input, hear responses aloud",         micOn: false, ttsOn: true  },
     { id: "listen", label: "Read",  tip: "Read mode: speak to Claude, read responses as text",  micOn: true,  ttsOn: false },
+    { id: "text",   label: "Text",  tip: "Text mode: type input, read responses — no audio",    micOn: false, ttsOn: false },
   ];
   let modeIdx = parseInt(localStorage.getItem("murmur-mode") || "1") % MODES.length;
 
@@ -1286,7 +1306,7 @@
   let muted = false;
   let _statusDebounceTimer = null;
   let ttsMuted = false;
-  let currentVoice = "";
+  let currentVoice = "_local:default";
   let thinkingBubble = null;
 
   // Apply saved interaction mode
@@ -1295,6 +1315,10 @@
     const m = MODES[modeIdx];
     modeBtn.textContent = m.label;
     modeBtn.setAttribute("data-tip", m.tip);
+    // Color the mode button per mode
+    modeBtn.classList.remove("mode-talk", "mode-type", "mode-read", "mode-text");
+    const modeClass = m.id === "full" ? "talk" : m.id === "listen" ? "read" : m.id;
+    modeBtn.classList.add("mode-" + modeClass);
     muted = !m.micOn;
     ttsMuted = !m.ttsOn;
     document.getElementById("micMeter").classList.toggle("muted", muted);
@@ -1829,25 +1853,12 @@
       }
 
       if (msg.type === "transcription") {
-        // Skip historic messages from server if we already restored from localStorage
-        if (msg.historic && historyLoaded) return;
-        // Always show partial messages for real-time feedback
+        // Only handle historic messages for session restore — live messages use entry system
+        if (!msg.historic) return;
+        if (historyLoaded) return;
         removeThinkingBubble();
         emptyState.style.display = "none";
-        if (msg.partial && msg.role === "assistant") {
-          // In clean mode, skip verbose streaming output
-          if (!voicedOnly) updatePartialMessage(msg.text, msg.ts);
-        } else {
-          // Final message — remove partials and add permanent bubbles
-          removePartialMessage();
-          // In clean mode, remove spoken partials and show final transcription as permanent bubble
-          if (voicedOnly && msg.role === "assistant") {
-            document.querySelectorAll(".spoken-partial").forEach(el => el.remove());
-            _spokenAccum = "";
-            _lastSpokenText = "";
-          }
-          addMessage(msg.role, msg.text, msg.ts);
-        }
+        addMessage(msg.role, msg.text, msg.ts);
       }
 
       // Entry-based rendering — single source of truth for conversation display
@@ -1860,6 +1871,11 @@
       // Server-driven TTS highlight — replaces client-side bubble guesswork
       if (msg.type === "tts_highlight") {
         highlightEntry(msg.entryId);
+      }
+
+      // Local TTS — server sends text instead of audio when voice is _local
+      if (msg.type === "local_tts") {
+        playLocalTts(msg.text, msg.entryId);
       }
 
       if (msg.type === "voice_status") {
@@ -2152,8 +2168,8 @@
         }
       }
 
-      // Apply speakable/non-speakable class
-      if (!entry.speakable) {
+      // Apply speakable/non-speakable class (only assistant entries — user entries always visible)
+      if (!entry.speakable && entry.role === "assistant") {
         div.classList.add("entry-nonspeakable");
       } else {
         div.classList.remove("entry-nonspeakable");
@@ -2225,7 +2241,9 @@
         const hint = document.createElement("span");
         hint.className = "talk-idle-hint";
         const mode = MODES[modeIdx];
-        if (mode.id === "type") {
+        if (mode.id === "text") {
+          hint.textContent = "Text mode — no audio";
+        } else if (mode.id === "type") {
           hint.textContent = "Type mode — mic off";
         } else if (mode.id === "listen") {
           hint.textContent = "Read mode — voice in, text out";
@@ -2236,6 +2254,7 @@
         talkBtn.className = "idle-state";
         if (mode.id === "listen") talkBtn.classList.add("mode-read");
         if (mode.id === "type") talkBtn.classList.add("mode-type");
+        if (mode.id === "text") talkBtn.classList.add("mode-text");
         talkBtn.setAttribute("data-tip", mode.tip);
         setHeaderState("ready", mode.id === "type" ? "Type mode" : "Ready");
         // Show subtle mic level on idle button (red palette, low opacity)
@@ -2315,7 +2334,7 @@
       else if (state === "responding") setHeaderState("responding", "Claude is responding...");
       return;
     }
-    if (talkBtn.classList.contains("transcribing") && !["thinking", "blank", "idle", "wake_no_match", "error"].includes(state)) {
+    if (talkBtn.classList.contains("transcribing") && !["thinking", "sent", "blank", "wake_no_match"].includes(state)) {
       rlog(`[voice_status] ${state} IGNORED — transcribing in progress`);
       return;
     }
@@ -2366,9 +2385,7 @@
   stopBtn.addEventListener("click", () => {
     idleFromTtsCompletion = false; // Prevent beep after manual stop
     stopTtsPlayback();
-    if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
     setTalkState("idle");
-    removeThinkingBubble();
   });
 
   muteBtn.addEventListener("click", () => {
@@ -2429,6 +2446,46 @@
     voiceLabels[el.dataset.voice] = el.textContent;
   });
 
+  // Populate local voices from Web Speech API
+  function populateLocalVoices() {
+    const slot = document.getElementById("localVoiceSlot");
+    if (!slot || !window.speechSynthesis) return;
+    const voices = speechSynthesis.getVoices();
+    if (voices.length === 0) return;
+    slot.innerHTML = "";
+    // Only English voices, deduplicated by name, sorted alphabetically
+    const seen = new Set();
+    const enVoices = voices
+      .filter(v => v.lang.startsWith("en") && !seen.has(v.name) && (seen.add(v.name), true))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (enVoices.length === 0) return;
+    const header = document.createElement("div");
+    header.className = "voice-group";
+    header.textContent = "Device \u26A1";
+    slot.appendChild(header);
+    enVoices.forEach(v => {
+      const key = "_local:" + v.name;
+      const label = v.name.replace(/^Microsoft /, "").replace(/^Google /, "");
+      voiceLabels[key] = label;
+      const div = document.createElement("div");
+      div.className = "voice-option";
+      div.dataset.voice = key;
+      div.textContent = label;
+      slot.appendChild(div);
+    });
+    // If current voice is unresolved local default, pick first English voice
+    if ((currentVoice === "_local" || currentVoice === "_local:default") && enVoices.length > 0) {
+      currentVoice = "_local:" + enVoices[0].name;
+      voiceBtn.textContent = friendlyVoice(currentVoice);
+      if (ws?.readyState === WebSocket.OPEN) ws.send("voice:" + currentVoice);
+    }
+    updateVoiceSelection();
+  }
+  if (window.speechSynthesis) {
+    populateLocalVoices();
+    speechSynthesis.addEventListener("voiceschanged", populateLocalVoices);
+  }
+
   function updateVoiceSelection() {
     voicePopover.querySelectorAll(".voice-option").forEach(el => {
       const v = el.dataset.voice;
@@ -2456,8 +2513,8 @@
   let autoListenEnabled = true;
   let autoListenActive = false;
   let speechConfirmStart = 0;
-  const SPEECH_THRESHOLD = 0.002;  // Very low threshold — ffmpeg loudnorm handles quiet audio
-  const SPEECH_CONFIRM_MS = 0;     // No confirmation delay — start recording immediately on speech
+  const SPEECH_THRESHOLD = 0.008;  // Require clear speech signal above ambient noise
+  const SPEECH_CONFIRM_MS = 200;   // Sustained speech for 200ms before triggering recording
   let conversationHot = false;     // After Claude speaks, next speech goes direct (no wake word)
   let ttsStartedAt = 0;
   let ttsEndedAt = 0;
@@ -2467,8 +2524,8 @@
   function applyIdleState() {
     pendingIdle = false;
     // Don't override recording/transcribing state with idle
-    if (isRecording || talkBtn.classList.contains("transcribing")) {
-      rlog(`[voice_status] idle SKIPPED — isRecording=${isRecording} transcribing=${talkBtn.classList.contains("transcribing")}`);
+    if (isRecording || talkBtn.classList.contains("recording") || talkBtn.classList.contains("transcribing")) {
+      rlog(`[voice_status] idle SKIPPED — isRecording=${isRecording} btnClass=${talkBtn.className}`);
       return;
     }
     conversationHot = true;
@@ -2569,6 +2626,15 @@
 
       mediaRecorder.onstop = () => {
         const recBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
+
+        // Pre-filter: skip sending to Whisper if audio was just noise
+        if (recordingPeakRms < AUDIO_ENERGY_THRESHOLD) {
+          rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${AUDIO_ENERGY_THRESHOLD}`);
+          setTalkState("idle");
+          autoListenActive = false;
+          return;
+        }
+
         if (preBufferBlob) {
           // Send both pre-buffer (WAV) and recording (WebM) — server combines them
           sendAudioToServer(recBlob, preBufferBlob);
@@ -2610,6 +2676,7 @@
 
   function startSilenceDetection() {
     silenceStart = 0;
+    recordingPeakRms = 0; // Reset peak tracker for this recording
 
     function checkSilence() {
       if (!isRecording) return;
@@ -2619,6 +2686,7 @@
         let sum = 0;
         for (let i = 0; i < micDataArray.length; i++) sum += micDataArray[i] * micDataArray[i];
         const rms = Math.sqrt(sum / micDataArray.length);
+        if (rms > recordingPeakRms) recordingPeakRms = rms; // Track peak
         const elapsed = Date.now() - recordingStartTime;
 
         if (rms < SILENCE_THRESHOLD && elapsed > MIN_RECORDING_MS) {
@@ -2792,6 +2860,76 @@
     });
   }
 
+  // Local TTS using Web Speech API (speechSynthesis)
+  let localTtsUtterance = null;
+
+  function playLocalTts(text, entryId) {
+    if (ttsMuted) {
+      rlog("[local-tts] Skipping — text-out mode");
+      if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+      return;
+    }
+    if (isRecording) {
+      rlog("[local-tts] Skipping — user is recording");
+      if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+      return;
+    }
+    if (!window.speechSynthesis) {
+      rlog("[local-tts] speechSynthesis not available — sending tts_done");
+      if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+      return;
+    }
+
+    // Stop any current playback (both local and remote TTS)
+    stopTtsPlaybackInternal(false);
+    // Always cancel speechSynthesis before starting new speech
+    // (needed even if localTtsUtterance is null, to clear any pending tts_stop cancel)
+    window.speechSynthesis.cancel();
+    localTtsUtterance = null;
+
+    // Find the selected local voice object
+    const localVoiceName = currentVoice.startsWith("_local:") ? currentVoice.slice(7) : null;
+    rlog(`[local-tts] Speaking ${text.length} chars, voice=${localVoiceName || "default"}`);
+
+    // Delay speak() after cancel() — some browsers silently drop speak() immediately after cancel()
+    setTimeout(() => {
+      const utter = new SpeechSynthesisUtterance(text);
+      if (localVoiceName) {
+        const match = speechSynthesis.getVoices().find(v => v.name === localVoiceName);
+        if (match) utter.voice = match;
+      }
+      utter.rate = 1.1;
+      utter.pitch = 1.0;
+      localTtsUtterance = utter;
+      ttsPlaying = true;
+
+      // Highlight the entry being spoken
+      if (entryId != null) highlightEntry(entryId);
+
+      utter.onend = () => {
+        rlog("[local-tts] onend fired");
+        ttsPlaying = false;
+        localTtsUtterance = null;
+        ttsEndedAt = Date.now();
+        idleFromTtsCompletion = true;
+        advanceBubbleHighlight();
+        if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        if (pendingIdle) applyIdleState();
+      };
+      utter.onerror = (ev) => {
+        rlog("[local-tts] onerror: " + ev.error);
+        ttsPlaying = false;
+        localTtsUtterance = null;
+        ttsEndedAt = Date.now();
+        if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        if (pendingIdle) applyIdleState();
+      };
+
+      window.speechSynthesis.speak(utter);
+      rlog("[local-tts] speak() called");
+    }, 50);
+  }
+
   function stopTtsPlaybackInternal(sendDone) {
     if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
     const wasPlaying = ttsPlaying;
@@ -2801,6 +2939,11 @@
         if (ttsCurrentSource.pause) ttsCurrentSource.pause(); // Audio element
       } catch {}
       ttsCurrentSource = null;
+    }
+    // Also stop local TTS
+    if (localTtsUtterance) {
+      window.speechSynthesis.cancel();
+      localTtsUtterance = null;
     }
     ttsPlaying = false;
     ttsEndedAt = Date.now();
@@ -2853,6 +2996,9 @@
   // =============================================
   let autoListenInterval = null;
   let autoListenDebugCounter = 0;
+  // Audio pre-filter: track peak RMS during recording to skip noise-only audio
+  let recordingPeakRms = 0;
+  const AUDIO_ENERGY_THRESHOLD = 0.02; // Minimum peak RMS to consider as speech (not just noise)
 
   function startAutoListen() {
     if (autoListenInterval) return;

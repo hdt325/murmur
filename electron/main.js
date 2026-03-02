@@ -14,6 +14,26 @@ const { autoUpdater } = require("electron-updater");
 const SERVER_PORT = 3457;
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
 
+// macOS GUI apps don't inherit shell PATH — add common tool locations
+if (process.platform === "darwin") {
+  const extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/sbin"];
+  const currentPath = process.env.PATH || "";
+  const missing = extraPaths.filter(p => !currentPath.includes(p));
+  if (missing.length > 0) {
+    process.env.PATH = missing.join(":") + ":" + currentPath;
+  }
+  // Also try to source the user's shell PATH for globally installed npm packages
+  try {
+    const shellPath = execSync("zsh -ilc 'echo $PATH'", { encoding: "utf8", timeout: 5000 }).trim();
+    if (shellPath) {
+      const shellParts = shellPath.split(":").filter(p => !process.env.PATH.includes(p));
+      if (shellParts.length > 0) {
+        process.env.PATH = process.env.PATH + ":" + shellParts.join(":");
+      }
+    }
+  } catch {}
+}
+
 let win = null;
 let tray = null;
 let serverProcess = null;
@@ -364,6 +384,11 @@ ipcMain.on("retry-startup", () => {
   startup();
 });
 
+// Handle close from panel UI
+ipcMain.on("close-panel", () => {
+  app.quit();
+});
+
 // App lifecycle
 app.whenReady().then(async () => {
   // macOS: force dock icon visibility and set custom icon
@@ -393,9 +418,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
+  app.quit();
 });
 
 app.on("will-quit", () => {

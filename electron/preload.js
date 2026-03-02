@@ -10,4 +10,5 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   // Startup diagnostics
   onStartupStatus: (callback) => ipcRenderer.on("startup-status", (_e, data) => callback(data)),
   retry: () => ipcRenderer.send("retry-startup"),
+  close: () => ipcRenderer.send("close-panel"),
 });
