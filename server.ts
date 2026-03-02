@@ -691,12 +691,19 @@ function detectInteractivePrompt(pane: string): boolean {
   const lines = pane.split("\n");
   const tail = lines.slice(-15).join("\n");
 
-  // Plan approval: "❯ 1. Yes" style numbered menus
+  // Plan approval: "❯ 1. Yes" style numbered menus, "1: Bad  2: Fine" style choices
   // Permission prompts, confirmation dialogs
   const hasNumberedMenu = /❯\s+\d+\.\s+/i.test(tail);
+  const hasNumberedChoices = /\d+:\s+\w+.*\d+:\s+\w+/.test(tail); // "1: Bad  2: Fine  3: Good"
   const hasQuestion = /(Would you like to proceed|Do you want to)/i.test(tail);
 
-  if (hasNumberedMenu || hasQuestion) {
+  if (hasNumberedMenu || hasNumberedChoices || hasQuestion) {
+    // Auto-dismiss Claude's session feedback prompt ("1: Bad  2: Fine  3: Good  0: Dismiss")
+    if (/\b0:\s*Dismiss\b/i.test(tail)) {
+      console.log("[interactive] Auto-dismissing session feedback prompt");
+      terminal.sendKey("0");
+      return true;
+    }
     if (!interactivePromptActive) {
       interactivePromptActive = true;
       console.log("[interactive] Prompt detected — notifying client to open terminal");
@@ -881,7 +888,9 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
       /^\+\d+ lines/.test(trimmed) ||
       /^… \+\d+/.test(trimmed) ||
       // File paths
-      (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100);
+      (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100) ||
+      // Numbered choice menus (e.g. "1: Bad  2: Fine  3: Good  0: Dismiss")
+      /^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed);
 
     // ── Tool block tracking ──
     if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
@@ -1512,11 +1521,16 @@ function startPassiveWatcher() {
   passiveWatcher = setInterval(() => {
     if (streamState !== "IDLE" && streamState !== "DONE") return;
     if (!terminal.isSessionAlive()) return;
-    // Cooldown: don't trigger if streaming just ended (prevents re-triggering on same session)
-    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
 
     const pane = captureTmuxPane();
     if (!pane) return;
+
+    // Check for interactive prompts during idle (e.g. "How is Claude?" feedback)
+    // This runs even during cooldown — auto-dismiss doesn't re-trigger streaming
+    if (detectInteractivePrompt(pane)) return;
+
+    // Cooldown: don't trigger streaming if it just ended (prevents re-triggering on same session)
+    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
 
     if (hasSpinnerChars(pane)) {
       console.log("[passive] Spinner detected — native CLI input");
@@ -2351,10 +2365,16 @@ function handleWsConnection(ws: WebSocket) {
     if (msg.startsWith("text:")) {
       const text = msg.slice(5);
       if (text) {
-        console.log(`[terminal] Text input: "${text}"`);
-        startTmuxStreaming(text);
-        addUserEntry(text); // After startTmuxStreaming which resets entries
-        terminal.sendText(text);
+        if (interactivePromptActive) {
+          // Interactive prompt — send keystroke directly (e.g. "1" + Enter for numbered choices)
+          console.log(`[terminal] Interactive response: "${text}"`);
+          terminal.sendText(text);
+        } else {
+          console.log(`[terminal] Text input: "${text}"`);
+          startTmuxStreaming(text);
+          addUserEntry(text); // After startTmuxStreaming which resets entries
+          terminal.sendText(text);
+        }
       }
       return;
     }

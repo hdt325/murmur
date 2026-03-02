@@ -1938,12 +1938,15 @@
       if (msg.type === "interactive_prompt") {
         const termNav = document.getElementById("termNav");
         if (msg.active) {
-          // Open terminal and show nav buttons
+          // Open terminal, show nav buttons, redirect text input to terminal
           if (!terminalOpen) { terminalOpen = true; terminalPanel.classList.add("open"); document.getElementById("termToggleLabel").textContent = "▼ Terminal"; localStorage.setItem("term-open", "1"); }
           termNav.classList.add("show");
           terminalOutput.scrollTop = terminalOutput.scrollHeight;
+          terminalInput.placeholder = "Type response here (e.g. 1, 2, 3)...";
+          terminalInput.focus();
         } else {
           termNav.classList.remove("show");
+          terminalInput.placeholder = "Type a message...";
         }
       }
 
@@ -2059,7 +2062,8 @@
 
   function clearBubbleHighlights() {
     // Mark any still-active bubbles as spoken before clearing
-    document.querySelectorAll(".msg.bubble-active").forEach(el => {
+    // Skip entry-bubbles — those are managed by server-driven tts_highlight
+    document.querySelectorAll(".msg.bubble-active:not(.entry-bubble)").forEach(el => {
       el.classList.remove("bubble-active");
       el.classList.add("bubble-spoken");
     });
@@ -2182,8 +2186,8 @@
         div.classList.remove("entry-nonspeakable");
       }
 
-      // Mark spoken entries
-      if (entry.spoken) {
+      // Mark spoken entries — but don't override active TTS highlight
+      if (entry.spoken && !div.classList.contains("bubble-active")) {
         div.classList.add("bubble-spoken");
       }
 
@@ -2223,12 +2227,18 @@
     });
 
     if (entryId != null) {
-      const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
-      if (el) {
-        el.classList.add("bubble-active");
-        el.classList.remove("bubble-spoken");
-        el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
+      const apply = (retries) => {
+        const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
+        if (el) {
+          el.classList.add("bubble-active");
+          el.classList.remove("bubble-spoken");
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } else if (retries > 0) {
+          // Entry DOM may not exist yet (broadcast arrives before render) — retry
+          setTimeout(() => apply(retries - 1), 50);
+        }
+      };
+      apply(10);
     }
   }
 
@@ -2320,7 +2330,7 @@
           }
         };
         tryStartTtsWave(20);
-        startBubbleHighlight();
+        // Don't call startBubbleHighlight() — server drives highlights via tts_highlight messages
         setHeaderState("speaking", "Speaking");
         removeThinkingBubble();
         break;
@@ -2359,7 +2369,10 @@
       ttsStartedAt = Date.now();
       idleFromTtsCompletion = false;
       pendingIdle = false; // New audio coming, cancel deferred idle
-      setTalkState("speaking");
+      // If already speaking, don't re-run setTalkState — it clears server-driven highlights
+      if (!talkBtn.classList.contains("speaking")) {
+        setTalkState("speaking");
+      }
     } else if (state === "idle") {
       // If TTS is still actively playing, defer idle briefly (server may be synthesizing next chunk)
       if (ttsPlaying) {
