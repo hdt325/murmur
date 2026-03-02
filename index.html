@@ -2187,9 +2187,12 @@
       }
 
       // Mark spoken entries — but don't override active TTS highlight
+      // Once bubble-spoken is set (by TTS highlight advancement), never remove it
       if (entry.spoken && !div.classList.contains("bubble-active")) {
         div.classList.add("bubble-spoken");
       }
+      // Don't un-gray entries that were already spoken client-side
+      // (server may re-broadcast with spoken:false during streaming updates)
 
       // Partial opacity on last entry when streaming
       if (partial && i === entries.length - 1 && entry.role === "assistant") {

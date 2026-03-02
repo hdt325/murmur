@@ -1092,9 +1092,13 @@ function broadcastCurrentOutput() {
   }
 
   // Remove stale assistant entries if paragraphs shrunk (rare reparse)
+  // But never remove entries that were already spoken — they're real content
   if (paragraphs.length < assistantEntries.length) {
-    const staleIds = new Set(assistantEntries.slice(paragraphs.length).map(e => e.id));
-    conversationEntries = conversationEntries.filter(e => !staleIds.has(e.id));
+    const staleEntries = assistantEntries.slice(paragraphs.length);
+    const staleIds = new Set(staleEntries.filter(e => !e.spoken).map(e => e.id));
+    if (staleIds.size > 0) {
+      conversationEntries = conversationEntries.filter(e => !staleIds.has(e.id));
+    }
   }
 
   // Broadcast all entries
