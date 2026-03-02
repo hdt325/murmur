@@ -67,14 +67,15 @@ async function testPageLoad() {
 }
 
 async function testWsConnection() {
-  // Check that WebSocket connects (status should say "Ready" after connection)
+  // Check that WebSocket connects (dot should not be red/disconnected)
   await page.goto(BASE, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(2000);
   const statusText = await page.locator("#statusText").textContent();
   const dotClass = await page.locator("#statusDot").getAttribute("class");
-  const isGreen = dotClass?.includes("green") ?? false;
+  // Accept green (ready) or yellow (thinking/active) — just not red/disconnected
+  const isConnected = dotClass?.includes("green") || dotClass?.includes("yellow") || false;
   await screenshot("ws-connection");
-  report("WebSocket connects (green dot)", isGreen, `status="${statusText}", class="${dotClass}"`);
+  report("WebSocket connects (not disconnected)", isConnected, `status="${statusText}", class="${dotClass}"`);
 }
 
 async function testTextInput() {
@@ -146,17 +147,17 @@ async function testModeCycling() {
   await page.waitForTimeout(500);
   const modeBtn = page.locator("#modeBtn");
   const labels: string[] = [];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     const text = await modeBtn.textContent();
     labels.push(text?.trim() || "?");
     await screenshot(`mode-${labels[labels.length - 1].toLowerCase()}`);
     await modeBtn.click();
     await page.waitForTimeout(200);
   }
-  const unique = new Set(labels.slice(0, 3));
-  // 4th label should match 1st (full cycle)
-  const cycled = labels[0] === labels[3];
-  report("Mode cycles through 3 modes and wraps", unique.size === 3 && cycled, labels.join(" → "));
+  const unique = new Set(labels.slice(0, 4));
+  // 5th label should match 1st (full cycle)
+  const cycled = labels[0] === labels[4];
+  report("Mode cycles through 4 modes and wraps", unique.size === 4 && cycled, labels.join(" → "));
 }
 
 async function testTerminalToggle() {
