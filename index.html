@@ -7,6 +7,10 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="icon" type="image/png" sizes="256x256" href="/icon-256.png">
+<link rel="apple-touch-icon" href="/icon-256.png">
 <title>Murmur</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -49,9 +53,10 @@
     border-bottom: 1px solid #333338;
     height: 28px;
     flex-shrink: 0;
+    position: relative;
     -webkit-app-region: drag; /* Electron: makes header a drag handle */
   }
-  .header * { -webkit-app-region: no-drag; /* Allow clicks on child elements */ }
+  .header button, .header .svc-indicators { -webkit-app-region: no-drag; }
 
   .header .status-dot {
     width: 8px;
@@ -74,6 +79,27 @@
     50% { opacity: 0.4; }
   }
 
+  .header .app-title {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 1px;
+    color: rgba(180, 100, 100, 0.3);
+    text-transform: uppercase;
+    pointer-events: none;
+    -webkit-app-region: drag;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .header .app-icon {
+    width: 16px;
+    height: 16px;
+    opacity: 0.5;
+  }
+
   .header .status-text {
     font-size: 11px;
     font-weight: 600;
@@ -81,6 +107,26 @@
     color: #aaa;
     flex: 1;
   }
+
+  .header .close-btn {
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: transparent;
+    color: #888;
+    font-size: 15px;
+    line-height: 22px;
+    text-align: center;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0;
+    flex-shrink: 0;
+    transition: color 0.15s, background 0.15s;
+    -webkit-app-region: no-drag;
+    order: 99; /* default: right side (Windows) */
+  }
+  body.platform-mac .header .close-btn { order: -1; } /* macOS: left side */
+  .header .close-btn:hover { color: #e74c3c; background: rgba(231, 76, 60, 0.15); }
 
   .header .svc-indicators {
     display: flex;
@@ -176,7 +222,8 @@
     letter-spacing: 0.3px;
   }
   .conv-toolbar button:hover { color: #e5e5e5; border-color: #4b5263; background: #3e4451; }
-  .conv-toolbar button.active { color: #e0d8d5; }
+  .conv-toolbar button#cleanBtn { color: #666; border-color: #333338; }
+  .conv-toolbar button#cleanBtn.active { color: #e0d8d5; border-color: #555; background: #3e4451; }
   .conv-toolbar-spacer { flex: 1; }
 
   .msg {
@@ -215,26 +262,44 @@
   }
 
   .msg.user {
-    background: #2c2c32;
+    background: rgba(180, 60, 60, 0.12);
+    border: 1px solid rgba(180, 60, 60, 0.2);
     align-self: flex-end;
     border-bottom-right-radius: 3px;
+    transition: background 0.4s, border-color 0.3s, opacity 0.4s;
   }
 
   .msg.assistant {
-    background: #222226;
-    border: 1px solid #333338;
+    background: rgba(180, 160, 100, 0.1);
+    border: 1px solid rgba(180, 160, 100, 0.15);
     align-self: flex-start;
     border-bottom-left-radius: 3px;
+    transition: background 0.4s, border-color 0.3s, opacity 0.4s;
   }
 
-  .msg.user.bubble-active {
-    border: 1.5px solid #e74c3c;
-    transition: border-color 0.3s;
-  }
+  /* Currently being spoken — bright border */
   .msg.assistant.bubble-active {
-    border-color: #c9b07c;
-    transition: border-color 0.3s;
+    border-color: rgba(200, 175, 110, 0.7);
+    background: rgba(180, 160, 100, 0.18);
   }
+  .msg.user.bubble-active {
+    border-color: rgba(200, 80, 80, 0.7);
+  }
+
+  /* Already spoken — faded to indicate staleness */
+  .msg.assistant.bubble-spoken {
+    background: rgba(180, 160, 100, 0.04);
+    border-color: rgba(180, 160, 100, 0.08);
+    opacity: 0.6;
+  }
+  .msg.user.bubble-spoken {
+    background: rgba(180, 60, 60, 0.05);
+    border-color: rgba(180, 60, 60, 0.08);
+    opacity: 0.6;
+  }
+
+  /* Entry-based clean mode: hide non-speakable entries via CSS */
+  body.clean-mode .entry-nonspeakable { display: none; }
 
   .msg-wrap {
     position: relative;
@@ -724,12 +789,137 @@
     flex: 1;
   }
   .term-nav button.term-nav-enter:hover { background: #d4545c; }
+
+  /* --- Guided Tour --- */
+  .tour-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 200;
+    pointer-events: auto;
+  }
+  .tour-spotlight {
+    position: fixed;
+    z-index: 201;
+    border-radius: 8px;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,0.6);
+    pointer-events: none;
+    transition: left 0.3s ease, top 0.3s ease, width 0.3s ease, height 0.3s ease;
+  }
+  .tour-tip {
+    position: fixed;
+    z-index: 202;
+    background: #2a2a30;
+    border: 1px solid #444;
+    border-radius: 10px;
+    padding: 16px 20px;
+    max-width: 260px;
+    color: #e4e4e7;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    pointer-events: auto;
+    opacity: 0;
+    transition: opacity 0.25s, top 0.3s ease, left 0.3s ease;
+  }
+  .tour-tip.visible { opacity: 1; }
+  .tour-tip h4 { font-size: 14px; color: #fff; margin-bottom: 6px; font-weight: 600; }
+  .tour-tip p { font-size: 12.5px; color: #aaa; line-height: 1.5; margin: 0; }
+  .tour-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; }
+  .tour-step { font-size: 11px; color: #666; }
+  .tour-btns { display: flex; gap: 8px; }
+  .tour-skip { background: none; border: none; color: #888; font-size: 12px; cursor: pointer; padding: 4px 8px; }
+  .tour-skip:hover { color: #ccc; }
+  .tour-next {
+    background: #f04b5a; border: none; color: #fff;
+    padding: 6px 16px; border-radius: 6px; font-size: 12px;
+    font-weight: 600; cursor: pointer;
+  }
+  .tour-next:hover { background: #d93d4c; }
+  .help-wrap {
+    position: relative; display: flex; align-items: center;
+  }
+  .help-menu {
+    display: none; position: absolute; bottom: calc(100% + 6px); right: 0;
+    background: #2a2a30; border: 1px solid #444; border-radius: 8px;
+    padding: 6px 0; min-width: 160px; z-index: 100;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+  .help-menu.open { display: block; }
+  .help-menu a, .help-menu button {
+    display: block; width: 100%; text-align: left;
+    background: none; border: none; color: #ccc; font-size: 12px;
+    padding: 7px 14px; cursor: pointer; text-decoration: none;
+    font-family: inherit;
+  }
+  .help-menu a:hover, .help-menu button:hover { background: #3e4451; color: #fff; }
+  .help-menu .help-sep { height: 1px; background: #3a3a42; margin: 4px 0; }
+
+  /* Debug panel */
+  #debugPanel {
+    display: none; position: absolute; inset: 0; z-index: 50;
+    background: rgba(22,22,26,0.97); color: #ccc;
+    font-family: ui-monospace, "SF Mono", monospace; font-size: 10px;
+    flex-direction: column; overflow: hidden;
+  }
+  #debugPanel.open { display: flex; }
+  .dbg-tabs {
+    display: flex; gap: 0; border-bottom: 1px solid #333;
+    background: #1e1e22; flex-shrink: 0;
+  }
+  .dbg-tabs button {
+    background: none; border: none; color: #777; font-size: 10px;
+    padding: 6px 12px; cursor: pointer; font-family: inherit;
+    border-bottom: 2px solid transparent;
+  }
+  .dbg-tabs button:hover { color: #bbb; }
+  .dbg-tabs button.active { color: #e5e5e5; border-bottom-color: #f04b5a; }
+  .dbg-tabs .dbg-close {
+    margin-left: auto; color: #666; font-size: 12px; padding: 6px 10px;
+  }
+  .dbg-content { flex: 1; overflow-y: auto; padding: 8px; }
+  .dbg-row {
+    padding: 2px 0; border-bottom: 1px solid #1a1a1e;
+    display: flex; gap: 6px; align-items: baseline;
+  }
+  .dbg-row:hover { background: #2a2a30; }
+  .dbg-ts { color: #555; flex-shrink: 0; width: 65px; }
+  .dbg-dir { flex-shrink: 0; width: 14px; text-align: center; }
+  .dbg-dir.out { color: #4fc3f7; }
+  .dbg-dir.in { color: #81c784; }
+  .dbg-type { color: #f0b05a; flex-shrink: 0; min-width: 70px; }
+  .dbg-detail { color: #999; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dbg-badge {
+    display: inline-block; padding: 1px 5px; border-radius: 3px;
+    font-size: 9px; font-weight: 600; text-transform: uppercase;
+    flex-shrink: 0; min-width: 40px; text-align: center;
+  }
+  .dbg-badge.ws { background: #2a3a4a; color: #4fc3f7; }
+  .dbg-badge.stt { background: #2a4a2a; color: #81c784; }
+  .dbg-badge.tts { background: #4a3a2a; color: #f0b05a; }
+  .dbg-badge.stream { background: #3a2a4a; color: #b39ddb; }
+  .dbg-badge.terminal { background: #4a2a3a; color: #f48fb1; }
+  .dbg-state-grid {
+    display: grid; grid-template-columns: 100px 1fr; gap: 2px 8px; padding: 4px 0;
+  }
+  .dbg-state-label { color: #666; }
+  .dbg-state-val { color: #ccc; }
+  .dbg-state-val.ok { color: #81c784; }
+  .dbg-state-val.warn { color: #f0b05a; }
+  .dbg-state-val.err { color: #ef5350; }
+  .dbg-pipeline-row { display: flex; gap: 8px; padding: 2px 0; }
+  .dbg-pipeline-delta { color: #666; width: 50px; text-align: right; flex-shrink: 0; }
+  .dbg-pipeline-event { color: #f0b05a; }
+  .dbg-pipeline-detail { color: #888; }
+  .dbg-expanded {
+    background: #1a1a1e; padding: 4px 8px; margin: 2px 0 4px;
+    border-radius: 4px; white-space: pre-wrap; word-break: break-all;
+    color: #888; max-height: 120px; overflow-y: auto;
+  }
 </style>
 </head>
 <body>
 
 <!-- Section 1: Header -->
 <div class="header">
+  <span class="app-title"><img src="/icon-256.png" class="app-icon" alt="">MURMUR</span>
   <div class="status-dot green" id="statusDot"></div>
   <span class="status-text" id="statusText">Ready</span>
   <div class="svc-indicators">
@@ -737,6 +927,7 @@
     <span class="svc-label">TTS</span><div class="svc-dot" id="svcKokoro" data-tip="Kokoro TTS"></div>
     <button class="svc-restart" id="restartBtn" data-tip="Restart Murmur server">⟳</button>
   </div>
+  <button class="close-btn" id="closeBtn" data-tip="Close panel">✕</button>
 </div>
 
 <!-- Section 2: Mic meter -->
@@ -751,8 +942,28 @@
     <span class="conv-toolbar-spacer"></span>
     <button id="chatZoomOut" data-tip="Decrease font size">−</button>
     <button id="chatZoomIn" data-tip="Increase font size">+</button>
+    <div class="help-wrap">
+      <button class="help-btn" id="helpBtn">?</button>
+      <div class="help-menu" id="helpMenu">
+        <button onclick="startTour(); document.getElementById('helpMenu').classList.remove('open')">Take Guided Tour</button>
+        <button onclick="toggleDebugPanel(); document.getElementById('helpMenu').classList.remove('open')">Debug Panel</button>
+        <div class="help-sep"></div>
+        <a href="https://murmur.happythakkar.com" target="_blank">Murmur Homepage</a>
+        <a href="https://github.com/hdt325/murmur" target="_blank">GitHub</a>
+      </div>
+    </div>
   </div>
   <div class="empty-state" id="emptyState">Press Right ⌘ or tap to talk</div>
+  <div id="debugPanel">
+    <div class="dbg-tabs">
+      <button class="active" data-tab="state">State</button>
+      <button data-tab="messages">Messages</button>
+      <button data-tab="pipeline">Pipeline</button>
+      <button data-tab="server">Server</button>
+      <button class="dbg-close" onclick="toggleDebugPanel()">✕</button>
+    </div>
+    <div class="dbg-content" id="dbgContent"></div>
+  </div>
 </div>
 
 <!-- Section 4: Talk button -->
@@ -764,7 +975,7 @@
 <div class="controls">
   <button class="stop" id="stopBtn" data-tip="Stop Claude + TTS">■</button>
   <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
-  <button class="mode-btn" id="modeBtn" data-tip="Voice ↔ Voice">Voice</button>
+  <button class="mode-btn" id="modeBtn" data-tip="Talk ↔ Talk">Talk</button>
   <button class="replay-btn" id="replayBtn" data-tip="Replay last">↻</button>
   <button class="speed" id="speedBtn" data-tip="TTS speed">1x</button>
   <button class="voice-btn" id="voiceBtn" data-tip="Change voice">...</button>
@@ -781,7 +992,6 @@
     <div class="term-controls">
       <button id="termZoomOut">−</button>
       <button id="termZoomIn">+</button>
-      <button id="termClearBtn" style="color:#e06c75">Clear</button>
     </div>
   </div>
   <div class="term-nav" id="termNav">
@@ -815,7 +1025,148 @@
 </div>
 
 <script>
-  const PAGE_VERSION = 47; // Bump this when making changes that require reload
+  const PAGE_VERSION = 62; // Bump this when making changes that require reload
+
+  // --- Debug Panel ---
+  const _wsLog = [];
+  let _pipelineTrace = [];
+  let _dbgTab = "state";
+  let _dbgStateInterval = null;
+  let _dbgSse = null;
+  const _serverLogEntries = [];
+
+  function classifyOut(data) {
+    if (typeof data !== "string") return "binary";
+    const colon = data.indexOf(":");
+    return colon > 0 && colon < 20 ? data.slice(0, colon) : data;
+  }
+
+  function dbgTime(ts) {
+    const d = new Date(ts);
+    return d.toLocaleTimeString("en-US", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+  }
+
+  function toggleDebugPanel() {
+    const panel = document.getElementById("debugPanel");
+    const isOpen = panel.classList.toggle("open");
+    localStorage.setItem("murmur-debug", isOpen ? "1" : "0");
+    if (isOpen) renderDbgTab();
+    else stopDbgPolling();
+  }
+
+  function stopDbgPolling() {
+    if (_dbgStateInterval) { clearInterval(_dbgStateInterval); _dbgStateInterval = null; }
+    if (_dbgSse) { _dbgSse.close(); _dbgSse = null; }
+  }
+
+  function renderDbgTab() {
+    stopDbgPolling();
+    const c = document.getElementById("dbgContent");
+    if (!c) return;
+    if (_dbgTab === "state") renderDbgState(c);
+    else if (_dbgTab === "messages") renderDbgMessages(c);
+    else if (_dbgTab === "pipeline") renderDbgPipeline(c);
+    else if (_dbgTab === "server") renderDbgServer(c);
+  }
+
+  function renderDbgState(c) {
+    function update() {
+      // These vars are in the same script scope — read directly when available
+      const wsObj = typeof ws !== "undefined" ? ws : null;
+      const wsState = wsObj ? ["CONNECTING","OPEN","CLOSING","CLOSED"][wsObj.readyState] || "?" : "none";
+      const micState = (typeof micStream !== "undefined" && micStream) ? "active" : "none";
+      const ttsState = (typeof ttsPlaying !== "undefined" && ttsPlaying) ? "playing" : "idle";
+      const mode = (typeof MODES !== "undefined" && typeof modeIdx !== "undefined") ? MODES[modeIdx]?.label || "?" : "?";
+      const isMuted = (typeof muted !== "undefined") ? (muted ? "yes" : "no") : "?";
+      const recState = (typeof isRecording !== "undefined" && isRecording) ? "recording" : "idle";
+      c.innerHTML = `<div class="dbg-state-grid">
+        <span class="dbg-state-label">WebSocket</span><span class="dbg-state-val ${wsState === "OPEN" ? "ok" : "err"}">${wsState}</span>
+        <span class="dbg-state-label">Mic</span><span class="dbg-state-val">${micState}</span>
+        <span class="dbg-state-label">Recording</span><span class="dbg-state-val ${recState === "recording" ? "warn" : ""}">${recState}</span>
+        <span class="dbg-state-label">TTS</span><span class="dbg-state-val ${ttsState === "playing" ? "warn" : ""}">${ttsState}</span>
+        <span class="dbg-state-label">Mode</span><span class="dbg-state-val">${mode}</span>
+        <span class="dbg-state-label">Muted</span><span class="dbg-state-val">${isMuted}</span>
+        <span class="dbg-state-label">WS Log</span><span class="dbg-state-val">${_wsLog.length} msgs</span>
+        <span class="dbg-state-label">Pipeline</span><span class="dbg-state-val">${_pipelineTrace.length} events</span>
+      </div>`;
+    }
+    update();
+    _dbgStateInterval = setInterval(update, 500);
+  }
+
+  function renderDbgMessages(c) {
+    function update() {
+      const rows = _wsLog.slice(-100).reverse().map(m => {
+        const dir = m.dir === "out" ? "→" : "←";
+        const detail = typeof m.data === "string" ? m.data.slice(0, 80) : (m.data?.type || "binary") + (m.data?.state ? ` (${m.data.state})` : "") + (m.data?.text ? ` "${m.data.text.slice(0,40)}"` : "");
+        return `<div class="dbg-row" onclick="this.nextElementSibling?.classList.toggle('dbg-expanded')||0">
+          <span class="dbg-ts">${dbgTime(m.ts)}</span>
+          <span class="dbg-dir ${m.dir}">${dir}</span>
+          <span class="dbg-type">${m.type}</span>
+          <span class="dbg-detail">${detail}</span>
+        </div><div class="dbg-expanded" style="display:none">${JSON.stringify(m.data, null, 2)}</div>`;
+      }).join("");
+      c.innerHTML = rows || '<div style="color:#555;padding:20px;text-align:center">No messages yet</div>';
+    }
+    update();
+    _dbgStateInterval = setInterval(update, 1000);
+  }
+
+  function renderDbgPipeline(c) {
+    function update() {
+      if (!_pipelineTrace.length) {
+        c.innerHTML = '<div style="color:#555;padding:20px;text-align:center">No pipeline trace yet — send a voice message</div>';
+        return;
+      }
+      const t0 = _pipelineTrace[0].ts;
+      c.innerHTML = _pipelineTrace.map(e => `<div class="dbg-pipeline-row">
+        <span class="dbg-pipeline-delta">+${e.ts - t0}ms</span>
+        <span class="dbg-pipeline-event">${e.event}</span>
+        <span class="dbg-pipeline-detail">${e.detail || ""}</span>
+      </div>`).join("");
+    }
+    update();
+  }
+
+  function renderDbgServer(c) {
+    c.innerHTML = '<div style="color:#555;padding:8px">Connecting to server log stream...</div>';
+    // Fetch existing log first
+    fetch("/debug/log").then(r => r.json()).then(entries => {
+      _serverLogEntries.length = 0;
+      _serverLogEntries.push(...entries);
+      updateServerLog(c);
+    }).catch(() => {});
+    // SSE for live updates
+    _dbgSse = new EventSource("/debug/log/stream");
+    _dbgSse.onmessage = (e) => {
+      try {
+        const entry = JSON.parse(e.data);
+        if (entry.type === "connected") return;
+        _serverLogEntries.push(entry);
+        if (_serverLogEntries.length > 500) _serverLogEntries.shift();
+        updateServerLog(c);
+      } catch {}
+    };
+  }
+
+  function updateServerLog(c) {
+    const rows = _serverLogEntries.slice(-100).reverse().map(e => {
+      const cat = e.cat || "?";
+      const detail = e.detail ? JSON.stringify(e.detail) : "";
+      return `<div class="dbg-row">
+        <span class="dbg-ts">${dbgTime(e.ts)}</span>
+        <span class="dbg-badge ${cat}">${cat}</span>
+        <span class="dbg-type">${e.event}</span>
+        <span class="dbg-detail">${detail.slice(0, 100)}</span>
+      </div>`;
+    }).join("");
+    c.innerHTML = rows || '<div style="color:#555;padding:20px;text-align:center">No server log entries</div>';
+  }
+
+  // Platform detection — close button goes left on macOS, right on Windows
+  const isMac = (window.murmurElectron && window.murmurElectron.platform === "darwin")
+    || /Mac/.test(navigator.platform);
+  if (isMac) document.body.classList.add("platform-mac");
 
   // Friendly voice name lookup
   const VOICE_NAMES = {
@@ -850,7 +1201,7 @@
   const terminalOutput = document.getElementById("terminalOutput");
   const terminalInput = document.getElementById("textInput");
   const termSendBtn = document.getElementById("textSendBtn");
-  const termClearBtn = document.getElementById("termClearBtn");
+
   const termZoomIn = document.getElementById("termZoomIn");
   const termZoomOut = document.getElementById("termZoomOut");
   const terminalHeader = document.getElementById("terminalHeader");
@@ -861,9 +1212,9 @@
   document.body.setAttribute("tabindex", "-1");
   document.body.focus();
 
-  // Interaction modes: voice↔voice, text→voice, voice→text
+  // Interaction modes: talk↔talk, text→voice, voice→text
   const MODES = [
-    { id: "full",   label: "Voice", tip: "Voice mode: speak to Claude, hear responses aloud",  micOn: true,  ttsOn: true  },
+    { id: "full",   label: "Talk", tip: "Talk mode: speak to Claude, hear responses aloud",  micOn: true,  ttsOn: true  },
     { id: "type",   label: "Type",  tip: "Type mode: type input, hear responses aloud",         micOn: false, ttsOn: true  },
     { id: "listen", label: "Read",  tip: "Read mode: speak to Claude, read responses as text",  micOn: true,  ttsOn: false },
   ];
@@ -875,6 +1226,7 @@
   function applyCleanMode() {
     cleanBtn.textContent = voicedOnly ? "Clean" : "Verbose";
     cleanBtn.classList.toggle("active", voicedOnly);
+    document.body.classList.toggle("clean-mode", voicedOnly);
   }
   applyCleanMode();
   let termFontSize = parseInt(localStorage.getItem("term-font-size") || "10");
@@ -1373,6 +1725,15 @@
     if (!location.host) { console.warn("[ws] No host, skipping connect"); return; }
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${wsProto}//${location.host}`);
+    window._ws = ws;
+
+    // Intercept ws.send for debug log
+    const _origSend = ws.send.bind(ws);
+    ws.send = (data) => {
+      _wsLog.push({ ts: Date.now(), dir: "out", type: classifyOut(data), size: typeof data === "string" ? data.length : (data.size || data.byteLength || 0), data: typeof data === "string" ? data : "(binary)" });
+      if (_wsLog.length > 200) _wsLog.shift();
+      _origSend(data);
+    };
 
     ws.onopen = () => {
       setHeaderState("ready", "Ready");
@@ -1396,10 +1757,17 @@
     ws.onmessage = (e) => {
       // Binary message = TTS audio streamed from server
       if (e.data instanceof Blob) {
+        _wsLog.push({ ts: Date.now(), dir: "in", type: "binary", size: e.data.size, data: `(audio ${e.data.size}b)` });
+        if (_wsLog.length > 200) _wsLog.shift();
         playTtsAudio(e.data);
         return;
       }
       const msg = JSON.parse(e.data);
+      _wsLog.push({ ts: Date.now(), dir: "in", type: msg.type || "?", size: e.data.length, data: msg });
+      if (_wsLog.length > 200) _wsLog.shift();
+
+      // Capture pipeline traces for debug panel
+      if (msg.type === "pipeline_trace") { _pipelineTrace = msg.events || []; }
 
       if (msg.type === "status") {
         const phase = msg.phase || "idle";
@@ -1471,12 +1839,51 @@
         } else {
           // Final message — remove partials and add permanent bubbles
           removePartialMessage();
+          // In clean mode, remove spoken partials and show final transcription as permanent bubble
+          if (voicedOnly && msg.role === "assistant") {
+            document.querySelectorAll(".spoken-partial").forEach(el => el.remove());
+            _spokenAccum = "";
+            _lastSpokenText = "";
+          }
           addMessage(msg.role, msg.text, msg.ts);
         }
       }
 
+      // Entry-based rendering — single source of truth for conversation display
+      if (msg.type === "entry") {
+        removeThinkingBubble();
+        emptyState.style.display = "none";
+        renderEntries(msg.entries, msg.partial);
+      }
+
+      // Server-driven TTS highlight — replaces client-side bubble guesswork
+      if (msg.type === "tts_highlight") {
+        highlightEntry(msg.entryId);
+      }
+
       if (msg.type === "voice_status") {
         handleVoiceStatus(msg.state);
+      }
+
+      // Legacy: spoken_text for backward compat (will be removed in cleanup phase)
+      if (msg.type === "spoken_text" && voicedOnly) {
+        removeThinkingBubble();
+        emptyState.style.display = "none";
+        _spokenAccum = (_spokenAccum ? _spokenAccum + "\n\n" : "") + msg.text;
+        _lastSpokenText = _spokenAccum;
+        document.querySelectorAll(".spoken-partial").forEach(el => el.remove());
+        const paragraphs = _spokenAccum.split(/\n\n+/).map(p => p.trim()).filter(Boolean);
+        const timeStr = fmtTime(msg.ts || Date.now());
+        paragraphs.forEach((para, i) => {
+          const div = document.createElement("div");
+          div.className = "msg assistant spoken-partial";
+          const metaHtml = i === 0
+            ? `<div class="meta"><span class="role">Claude</span><span class="time">${timeStr}</span></div>`
+            : "";
+          div.innerHTML = metaHtml + escapeHtml(para);
+          transcript.appendChild(div);
+        });
+        transcript.scrollTop = transcript.scrollHeight;
       }
 
       if (msg.type === "services") {
@@ -1561,11 +1968,16 @@
         replayBtn.textContent = "↻";
         replayBtn.addEventListener("click", (e) => {
           e.stopPropagation();
+          _replayTargetBubble = div;
           if (ws && ws.readyState === WebSocket.OPEN) ws.send("replay:" + para);
         });
         wrap.appendChild(div);
         wrap.appendChild(replayBtn);
         transcript.appendChild(wrap);
+        // Track new assistant bubbles arriving during TTS so advanceBubbleHighlight can reach them
+        if (talkBtn.classList.contains("speaking")) {
+          activeSpeakBubbles.push(div);
+        }
       } else {
         transcript.appendChild(div);
       }
@@ -1613,16 +2025,34 @@
 
   let activeSpeakBubbles = [];
   let activeSpeakIdx = 0;
+  let _replayTargetBubble = null; // Set when user clicks replay on a specific bubble
+  let _lastSpokenText = ""; // Track text shown via spoken_text to avoid duplicate final transcription
+  let _spokenAccum = ""; // Accumulate spoken_text chunks for clean mode display
 
   function clearBubbleHighlights() {
-    document.querySelectorAll(".msg.bubble-active").forEach(el => el.classList.remove("bubble-active"));
+    // Mark any still-active bubbles as spoken before clearing
+    document.querySelectorAll(".msg.bubble-active").forEach(el => {
+      el.classList.remove("bubble-active");
+      el.classList.add("bubble-spoken");
+    });
     activeSpeakBubbles = [];
     activeSpeakIdx = 0;
   }
 
   function startBubbleHighlight() {
     clearBubbleHighlights();
-    // Collect all consecutive assistant bubbles from the end
+
+    // If replay was triggered on a specific bubble, highlight just that one
+    if (_replayTargetBubble) {
+      activeSpeakBubbles = [_replayTargetBubble];
+      _replayTargetBubble = null;
+      activeSpeakIdx = 0;
+      activeSpeakBubbles[0].classList.add("bubble-active");
+      activeSpeakBubbles[0].scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return;
+    }
+
+    // Collect all consecutive assistant bubbles from the end, highlight only the first
     const all = Array.from(document.querySelectorAll(".msg"));
     const bubbles = [];
     for (let i = all.length - 1; i >= 0; i--) {
@@ -1639,15 +2069,138 @@
 
   function advanceBubbleHighlight() {
     if (activeSpeakBubbles.length === 0) return;
-    // Remove current highlight
+    // Mark current as spoken (faded) and remove active highlight
     if (activeSpeakIdx < activeSpeakBubbles.length) {
       activeSpeakBubbles[activeSpeakIdx].classList.remove("bubble-active");
+      activeSpeakBubbles[activeSpeakIdx].classList.add("bubble-spoken");
     }
     activeSpeakIdx++;
     // Highlight next bubble if available
     if (activeSpeakIdx < activeSpeakBubbles.length) {
       activeSpeakBubbles[activeSpeakIdx].classList.add("bubble-active");
       activeSpeakBubbles[activeSpeakIdx].scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  // =============================================
+  // Entry-based rendering — keyed update by entry ID
+  // =============================================
+
+  function renderEntries(entries, partial) {
+    // Build map of existing entry bubbles
+    const existing = new Map();
+    document.querySelectorAll(".entry-bubble").forEach(el => {
+      existing.set(el.dataset.entryId, el);
+    });
+
+    entries.forEach((entry, i) => {
+      const idStr = String(entry.id);
+      let div = existing.get(idStr);
+
+      if (div) {
+        // Update existing bubble text if changed
+        const textEl = div.querySelector(".entry-text");
+        const newText = escapeHtml(entry.text);
+        if (textEl && textEl.innerHTML !== newText) {
+          textEl.innerHTML = newText;
+        }
+        existing.delete(idStr);
+      } else {
+        // Create new bubble
+        div = document.createElement("div");
+        div.className = `msg ${entry.role} entry-bubble`;
+        div.dataset.entryId = idStr;
+        div.dataset.entrySpeakable = entry.speakable ? "1" : "0";
+
+        const timeStr = fmtTime(entry.ts || Date.now());
+        const roleName = entry.role === "user" ? "You" : "Claude";
+        div.innerHTML =
+          `<div class="meta"><span class="role">${roleName}</span><span class="time">${timeStr}</span></div>` +
+          `<span class="entry-text">${escapeHtml(entry.text)}</span>`;
+
+        // Click-to-copy
+        div.addEventListener("click", () => {
+          navigator.clipboard.writeText(entry.text).then(() => {
+            const toast = document.createElement("span");
+            toast.className = "copied-toast";
+            toast.textContent = "Copied";
+            div.appendChild(toast);
+            setTimeout(() => toast.remove(), 800);
+          });
+        });
+
+        if (entry.role === "assistant") {
+          const wrap = document.createElement("div");
+          wrap.className = "msg-wrap";
+          const replayBtn = document.createElement("button");
+          replayBtn.className = "msg-replay";
+          replayBtn.textContent = "\u21bb";
+          replayBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send("replay:" + entry.id);
+          });
+          wrap.appendChild(div);
+          wrap.appendChild(replayBtn);
+          transcript.appendChild(wrap);
+        } else {
+          transcript.appendChild(div);
+        }
+      }
+
+      // Apply speakable/non-speakable class
+      if (!entry.speakable) {
+        div.classList.add("entry-nonspeakable");
+      } else {
+        div.classList.remove("entry-nonspeakable");
+      }
+
+      // Mark spoken entries
+      if (entry.spoken) {
+        div.classList.add("bubble-spoken");
+      }
+
+      // Partial opacity on last entry when streaming
+      if (partial && i === entries.length - 1 && entry.role === "assistant") {
+        div.style.opacity = "0.8";
+      } else {
+        div.style.opacity = "";
+      }
+    });
+
+    // Remove stale bubbles
+    existing.forEach(el => {
+      const wrap = el.closest(".msg-wrap");
+      if (wrap) wrap.remove();
+      else el.remove();
+    });
+
+    transcript.scrollTop = transcript.scrollHeight;
+
+    // Save to history when not partial
+    if (!partial && entries.length > 0) {
+      // Build text summary for localStorage history
+      const lastUser = entries.filter(e => e.role === "user").pop();
+      const assistantTexts = entries.filter(e => e.role === "assistant").map(e => e.text).join("\n\n");
+      if (lastUser) addToHistory("user", lastUser.text, lastUser.ts);
+      if (assistantTexts) addToHistory("assistant", assistantTexts, Date.now());
+    }
+  }
+
+  // Server-driven TTS highlight — replaces client-side startBubbleHighlight/advance
+  function highlightEntry(entryId) {
+    // Clear all active highlights, mark them as spoken
+    document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+      el.classList.remove("bubble-active");
+      el.classList.add("bubble-spoken");
+    });
+
+    if (entryId != null) {
+      const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
+      if (el) {
+        el.classList.add("bubble-active");
+        el.classList.remove("bubble-spoken");
+        el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
     }
   }
 
@@ -1749,7 +2302,23 @@
   // =============================================
   function handleVoiceStatus(state) {
     console.log(`[voice_status] ${state}`);
+    // Don't let server states override local recording/transcribing state
+    if (isRecording || talkBtn.classList.contains("recording")) {
+      rlog(`[voice_status] ${state} IGNORED — user is recording`);
+      // Still update header for context, but don't touch the talk button
+      if (state === "thinking") setHeaderState("thinking", "Claude is thinking...");
+      else if (state === "responding") setHeaderState("responding", "Claude is responding...");
+      return;
+    }
+    if (talkBtn.classList.contains("transcribing") && state !== "thinking" && state !== "sent") {
+      rlog(`[voice_status] ${state} IGNORED — transcribing in progress`);
+      return;
+    }
     if (state === "transcribing") {
+      // New cycle — reset spoken text accumulator
+      _spokenAccum = "";
+      _lastSpokenText = "";
+      document.querySelectorAll(".spoken-partial").forEach(el => el.remove());
       setTalkState("transcribing");
     } else if (state === "thinking") {
       setTalkState("thinking");
@@ -1891,6 +2460,11 @@
 
   function applyIdleState() {
     pendingIdle = false;
+    // Don't override recording/transcribing state with idle
+    if (isRecording || talkBtn.classList.contains("transcribing")) {
+      rlog(`[voice_status] idle SKIPPED — isRecording=${isRecording} transcribing=${talkBtn.classList.contains("transcribing")}`);
+      return;
+    }
     conversationHot = true;
     if (conversationHotTimer) clearTimeout(conversationHotTimer);
     conversationHotTimer = setTimeout(() => { conversationHot = false; }, 30000);
@@ -2395,6 +2969,15 @@
     }
   });
 
+  // Close panel button
+  document.getElementById("closeBtn").addEventListener("click", () => {
+    if (window.murmurElectron && window.murmurElectron.close) {
+      window.murmurElectron.close();
+    } else {
+      window.location.href = "https://murmur.happythakkar.com";
+    }
+  });
+
 
   // Chat transcript zoom controls
   let chatFontSize = parseFloat(localStorage.getItem("chat-font-size") || "12.5");
@@ -2411,6 +2994,32 @@
     transcript.style.setProperty("--chat-font-size", chatFontSize + "px");
     localStorage.setItem("chat-font-size", String(chatFontSize));
   });
+
+  // Help menu toggle
+  const helpBtn = document.getElementById("helpBtn");
+  const helpMenu = document.getElementById("helpMenu");
+  helpBtn.addEventListener("click", () => helpMenu.classList.toggle("open"));
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".help-wrap")) helpMenu.classList.remove("open");
+  });
+
+  // Debug panel: tab switching + Ctrl+Shift+D shortcut
+  document.querySelectorAll(".dbg-tabs button[data-tab]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".dbg-tabs button[data-tab]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      _dbgTab = btn.dataset.tab;
+      renderDbgTab();
+    });
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && e.key === "D") { e.preventDefault(); toggleDebugPanel(); }
+  });
+  // Restore debug panel state
+  if (localStorage.getItem("murmur-debug") === "1") {
+    document.getElementById("debugPanel").classList.add("open");
+    renderDbgTab();
+  }
 
   // Terminal zoom controls
   termZoomIn.addEventListener("click", (e) => {
@@ -2432,11 +3041,6 @@
   document.getElementById("termKeyEnter").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:enter"); });
   document.getElementById("termKeyEsc").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:escape"); });
   document.getElementById("termKeyTab").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:tab"); });
-
-  termClearBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    terminalOutput.innerHTML = "";
-  });
 
   function sendTerminalInput() {
     const text = terminalInput.value.trim();
@@ -2493,6 +3097,98 @@
       tip.classList.remove("visible");
     }
   }, true);
+
+  // --- Guided Tour ---
+  const TOUR_STEPS = [
+    { target: "#talkBtn", title: "Talk Button", text: "Tap to start recording, or press Right \u2318. Tap again to stop.", pos: "above" },
+    { target: "#modeBtn", title: "Interaction Mode", text: "Cycle between Talk (mic + speaker), Type (keyboard + speaker), and Read (mic only, no TTS).", pos: "above" },
+    { target: "#stopBtn", title: "Stop", text: "Interrupts Claude\u2019s response and stops TTS playback.", pos: "above" },
+    { target: "#muteBtn", title: "Mute Mic", text: "Temporarily mutes the microphone without changing modes.", pos: "above" },
+    { target: "#speedBtn", title: "Speed & Voice", text: "Adjust TTS playback speed. Use the voice button next to it to pick from 13 voices.", pos: "above" },
+    { target: "#textInput", title: "Text Input", text: "Type messages directly \u2014 works in any mode. Press Enter to send.", pos: "above" },
+    { target: "#cleanBtn", title: "Verbose / Clean", text: "Toggle between Clean (shows only final responses) and Verbose (shows Claude\u2019s full streaming output including tool calls and thinking).", pos: "below" },
+    { target: "#terminalHeader", title: "Terminal Panel", text: "Click to expand and watch Claude Code working in real-time with ANSI colors.", pos: "above" },
+    { target: "#restartBtn", title: "Restart Server", text: "Restarts the Murmur server process. Use this if something gets stuck or services disconnect.", pos: "below" },
+    { target: ".svc-indicators", title: "Service Status", text: "Green dots mean Whisper (speech-to-text) and Kokoro (text-to-speech) are running.", pos: "below" },
+  ];
+
+  let _tourOverlay, _tourSpotlight, _tourTip, _tourStep;
+
+  function startTour() {
+    // Remove existing tour elements if re-triggering
+    endTour(true);
+    _tourStep = 0;
+    _tourOverlay = document.createElement("div");
+    _tourOverlay.className = "tour-overlay";
+    _tourSpotlight = document.createElement("div");
+    _tourSpotlight.className = "tour-spotlight";
+    _tourTip = document.createElement("div");
+    _tourTip.className = "tour-tip";
+    document.body.append(_tourOverlay, _tourSpotlight, _tourTip);
+    // Click overlay to advance
+    _tourOverlay.addEventListener("click", advanceTour);
+    showTourStep();
+  }
+
+  function showTourStep() {
+    const s = TOUR_STEPS[_tourStep];
+    const el = document.querySelector(s.target);
+    if (!el) { advanceTour(); return; }
+    const rect = el.getBoundingClientRect();
+    const pad = 6;
+
+    _tourSpotlight.style.left = (rect.left - pad) + "px";
+    _tourSpotlight.style.top = (rect.top - pad) + "px";
+    _tourSpotlight.style.width = (rect.width + pad * 2) + "px";
+    _tourSpotlight.style.height = (rect.height + pad * 2) + "px";
+
+    const isLast = _tourStep === TOUR_STEPS.length - 1;
+    _tourTip.innerHTML =
+      '<h4>' + s.title + '</h4>' +
+      '<p>' + s.text + '</p>' +
+      '<div class="tour-footer">' +
+        '<span class="tour-step">' + (_tourStep + 1) + ' / ' + TOUR_STEPS.length + '</span>' +
+        '<div class="tour-btns">' +
+          '<button class="tour-skip" onclick="endTour()">Skip</button>' +
+          '<button class="tour-next" onclick="advanceTour()">' + (isLast ? "Done" : "Next") + '</button>' +
+        '</div>' +
+      '</div>';
+
+    _tourTip.classList.remove("visible");
+    requestAnimationFrame(() => {
+      const tipRect = _tourTip.getBoundingClientRect();
+      let top, left;
+      if (s.pos === "above") {
+        top = rect.top - tipRect.height - 12;
+        if (top < 8) top = rect.bottom + 12;
+      } else {
+        top = rect.bottom + 12;
+        if (top + tipRect.height > window.innerHeight - 8) top = rect.top - tipRect.height - 12;
+      }
+      left = Math.max(8, Math.min(rect.left, window.innerWidth - tipRect.width - 8));
+      _tourTip.style.top = top + "px";
+      _tourTip.style.left = left + "px";
+      _tourTip.classList.add("visible");
+    });
+  }
+
+  function advanceTour() {
+    _tourStep++;
+    if (_tourStep >= TOUR_STEPS.length) { endTour(); return; }
+    showTourStep();
+  }
+
+  function endTour(silent) {
+    if (_tourOverlay) { _tourOverlay.remove(); _tourOverlay = null; }
+    if (_tourSpotlight) { _tourSpotlight.remove(); _tourSpotlight = null; }
+    if (_tourTip) { _tourTip.remove(); _tourTip = null; }
+    if (!silent) localStorage.setItem("murmur-tour-done", "1");
+  }
+
+  // Auto-start on first visit (1.5s delay for UI to settle)
+  if (!localStorage.getItem("murmur-tour-done")) {
+    setTimeout(startTour, 1500);
+  }
 </script>
 </body>
 </html>

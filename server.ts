@@ -97,6 +97,72 @@ async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean }
 
 let serviceStatus = { whisper: false, kokoro: false };
 
+// --- Pipeline Instrumentation ---
+// Timestamped event log for debugging TTS/transcription timing issues.
+// Available via /debug/pipeline and broadcast as pipeline_trace on cycle end.
+
+interface PipelineEvent {
+  ts: number;
+  event: string;
+  detail?: string;
+}
+
+let pipelineLog: PipelineEvent[] = [];
+
+function plog(event: string, detail?: string) {
+  pipelineLog.push({ ts: Date.now(), event, detail });
+}
+
+function resetPipelineLog() {
+  pipelineLog = [];
+}
+
+function broadcastPipelineTrace() {
+  if (pipelineLog.length > 0) {
+    broadcast({ type: "pipeline_trace", events: pipelineLog });
+  }
+}
+
+// --- Structured Server Log ---
+// Ring buffer of structured events, available via /debug/log and SSE /debug/log/stream.
+
+interface ServerLogEntry {
+  ts: number;
+  cat: string;
+  event: string;
+  detail?: Record<string, unknown>;
+}
+
+const _serverLog: ServerLogEntry[] = [];
+const _sseClients = new Set<import("http").ServerResponse>();
+
+function slog(cat: string, event: string, detail?: Record<string, unknown>) {
+  const entry: ServerLogEntry = { ts: Date.now(), cat, event, detail };
+  _serverLog.push(entry);
+  if (_serverLog.length > 500) _serverLog.shift();
+  const line = `data: ${JSON.stringify(entry)}\n\n`;
+  for (const res of _sseClients) {
+    try { res.write(line); } catch { _sseClients.delete(res); }
+  }
+}
+
+// --- WebSocket Message Log ---
+// Ring buffer of WS messages (both directions), available via /debug/ws-log.
+
+interface WsLogEntry {
+  ts: number;
+  dir: "in" | "out";
+  type: string;
+  size?: number;
+}
+
+const _serverWsLog: WsLogEntry[] = [];
+
+function wslog(dir: "in" | "out", type: string, size?: number) {
+  _serverWsLog.push({ ts: Date.now(), dir, type, size });
+  if (_serverWsLog.length > 200) _serverWsLog.shift();
+}
+
 // VoiceMode log paths
 const VM_LOGS = join(HOME, ".voicemode", "logs");
 const VM_EVENTS_DIR = join(VM_LOGS, "events");
@@ -240,15 +306,23 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
   }
 
   try {
+    plog("transcribe_start");
+    const sttStart = Date.now();
+    slog("stt", "start", { bytes: audioData.length });
     const result = execSync(
       `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
         `-F "file=@${normalizedFile}" -F "model=whisper-1"`,
       { encoding: "utf-8", timeout: 10000 }
     );
     const json = JSON.parse(result);
-    return json.text?.trim() || "";
+    const text = json.text?.trim() || "";
+    plog("transcribe_done", text ? `"${text.slice(0, 100)}"` : "(empty)");
+    slog("stt", "done", { text: text.slice(0, 100), durationMs: Date.now() - sttStart });
+    return text;
   } catch (err) {
     console.error("Whisper transcription failed:", (err as Error).message);
+    plog("transcribe_error", (err as Error).message);
+    slog("stt", "error", { error: (err as Error).message });
     serviceStatus.whisper = false; // Mark as down so next call re-checks
     return "";
   }
@@ -324,6 +398,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     return;
   }
 
+  // Broadcast the spoken text so clean-mode clients can show it
+  broadcast({ type: "spoken_text", text: speakable, ts: Date.now() });
+
   const ttsText = speakable;
 
   const ttsFile = join(TEMP_DIR, `murmur-tts-${Date.now()}.mp3`);
@@ -345,6 +422,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     }
   }
 
+  plog("tts_request", `"${ttsText.slice(0, 100)}${ttsText.length > 100 ? "..." : ""}" (${ttsText.length} chars)`);
+  slog("tts", "request", { chars: ttsText.length, text: ttsText.slice(0, 80), voice });
+  const ttsStartTime = Date.now();
   console.log(`[tts] Requesting Kokoro TTS (${ttsText.length} chars, voice=${voice})...`);
 
   const curl = spawn("curl", [
@@ -393,6 +473,8 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     try { unlinkSync(ttsFile); } catch {}
 
     console.log(`[tts] Streaming ${audioData.length} bytes to ${clients.size} clients`);
+    plog("tts_audio_sent", `${audioData.length} bytes`);
+    slog("tts", "sent", { bytes: audioData.length, durationMs: Date.now() - ttsStartTime });
     ttsActiveGen = myGen;
     broadcastBinary(audioData);
     broadcast({ type: "voice_status", state: "speaking" });
@@ -425,6 +507,7 @@ function stopClientPlayback() {
 }
 
 function handleTtsDone() {
+  plog("tts_done_received");
   // Ignore stale tts_done if a newer TTS is already in progress
   if (ttsActiveGen !== ttsGeneration) {
     console.log(`[tts] Ignoring stale tts_done (active=${ttsActiveGen} current=${ttsGeneration})`);
@@ -441,6 +524,10 @@ function handleTtsDone() {
     return;
   }
 
+  // Clear TTS highlight when nothing left to speak
+  currentTtsEntryId = null;
+  broadcast({ type: "tts_highlight", entryId: null });
+
   // If stream is still active but nothing queued, broadcast idle so client can listen
   // The stream may produce more TTS later which will re-trigger speaking state
   if (streamState === "WAITING" || streamState === "THINKING" || streamState === "RESPONDING") {
@@ -451,6 +538,8 @@ function handleTtsDone() {
     console.log(`[tts] TTS chunk done, queue empty, stream ${streamState} — going idle (will re-speak if more comes)`);
   } else {
     console.log("[tts] TTS done — broadcasting idle");
+    plog("cycle_idle", "tts done, queue empty");
+    broadcastPipelineTrace();
   }
   broadcast({ type: "voice_status", state: "idle" });
 }
@@ -478,6 +567,7 @@ let streamFileOffset = 0;
 let lastStreamActivity = 0;
 let lastBroadcastText = "";
 let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let reEngageWatcher: ReturnType<typeof setInterval> | null = null;
 const STREAM_FILE = join(TEMP_DIR, `claude-voice-stream-${process.pid}.raw`);
 const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
 const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
@@ -656,133 +746,186 @@ function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput
   return newLines.slice(startIdx);
 }
 
-// Raw CLI output for app display — only strip tmux chrome, keep everything Claude outputs
-function extractRawOutput(preSnapshot: string, postSnapshot: string, userInput: string): string {
+
+// =============================================
+// Conversation entry model — single source of truth for display + TTS
+// =============================================
+
+interface ExtractedParagraph {
+  text: string;
+  speakable: boolean;
+}
+
+interface ConversationEntry {
+  id: number;
+  role: "user" | "assistant";
+  text: string;
+  speakable: boolean;
+  spoken: boolean;
+  ts: number;
+}
+
+let conversationEntries: ConversationEntry[] = [];
+let entryIdCounter = 0;
+let currentTtsEntryId: number | null = null;
+let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Add a user entry and broadcast the updated entry list
+function addUserEntry(text: string) {
+  const entry: ConversationEntry = {
+    id: ++entryIdCounter,
+    role: "user",
+    text,
+    speakable: false,
+    spoken: false,
+    ts: Date.now(),
+  };
+  conversationEntries.push(entry);
+  broadcast({ type: "entry", entries: conversationEntries, partial: false });
+  // Also broadcast old transcription message for backward compat during transition
+  broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
+}
+
+// Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
+function extractStructuredOutput(preSnapshot: string, postSnapshot: string, userInput: string): ExtractedParagraph[] {
   const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
-  const cleaned: string[] = [];
+  const result: ExtractedParagraph[] = [];
+  let currentLines: string[] = [];
+  let currentSpeakable = true;
+  let inToolBlock = false;
   let foundContent = false;
+
+  function flushParagraph() {
+    const text = reflowText(currentLines.join("\n").trim());
+    if (text) {
+      result.push({ text, speakable: currentSpeakable });
+    }
+    currentLines = [];
+    currentSpeakable = true;
+  }
 
   for (const line of lines) {
     const trimmed = line.trim();
+
+    // Skip blank lines before content
     if (!foundContent && !trimmed) continue;
 
-    // Only skip pure tmux/terminal chrome
+    // ── Shared chrome filters (from both extractRawOutput + extractSpeakableText) ──
     if (/^[─━═]{3,}/.test(trimmed)) continue;
-    if (/^❯/.test(trimmed)) continue; // Skip all prompt lines
+    if (/^❯/.test(trimmed)) continue;
     if (/bypass\s+permissions/i.test(trimmed)) continue;
     if (/^⏵/.test(trimmed)) continue;
     if (isSpinnerLine(trimmed)) continue;
-    // Skip context/compact status lines
     if (/context left until/i.test(trimmed)) continue;
     if (/auto-compact/i.test(trimmed)) continue;
 
-    // Strip ⏺ response markers from display text
+    // ── Non-speakable filters (from extractSpeakableText) ──
+    // These lines are kept for display (verbose mode) but marked non-speakable
+    const isNonSpeakable =
+      // Timing summaries
+      (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) ||
+      // Ctrl hints
+      /^(ctrl|⌃|esc to|press)/i.test(trimmed) ||
+      /\bctrl\+[a-z]\b/i.test(trimmed) ||
+      // Tool summaries
+      /^Read \d+ files?/i.test(trimmed) ||
+      /^Searched for \d+/i.test(trimmed) ||
+      /^Wrote \d+/i.test(trimmed) ||
+      /^Edited \d+/i.test(trimmed) ||
+      (/^Ran /i.test(trimmed) && trimmed.length < 60) ||
+      /Interrupted/.test(trimmed) ||
+      /Running…/.test(trimmed) ||
+      // Todo items
+      /^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed) ||
+      // Expand hints
+      /ctrl\+o/i.test(trimmed) ||
+      /^\+\d+ lines/.test(trimmed) ||
+      /^… \+\d+/.test(trimmed) ||
+      // File paths
+      (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100);
+
+    // ── Tool block tracking ──
+    if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
+      // Tool call start — flush any prose, start non-speakable block
+      if (currentLines.length > 0) flushParagraph();
+      inToolBlock = true;
+      currentSpeakable = false;
+      currentLines.push(line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, ""));
+      foundContent = true;
+      continue;
+    }
+    if (/^⎿/.test(trimmed)) {
+      // Tool output line
+      if (currentLines.length > 0 && currentSpeakable) flushParagraph();
+      inToolBlock = true;
+      currentSpeakable = false;
+      currentLines.push(line);
+      foundContent = true;
+      continue;
+    }
+    if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/.test(trimmed)) {
+      if (currentLines.length > 0 && currentSpeakable) flushParagraph();
+      inToolBlock = true;
+      currentSpeakable = false;
+      currentLines.push(line);
+      foundContent = true;
+      continue;
+    }
+
+    // ⏺ followed by prose = new prose paragraph, exit tool block
+    if (/^⏺\s+/.test(trimmed) && !/^⏺\s+\w+[\s(]?$/.test(trimmed)) {
+      if (currentLines.length > 0) flushParagraph();
+      inToolBlock = false;
+      currentSpeakable = true;
+    }
+
+    // Indented lines in tool block = still tool output
+    if (inToolBlock) {
+      if (/^\s{2,}/.test(line) || /^[^a-zA-Z⏺]/.test(trimmed)) {
+        currentLines.push(line);
+        foundContent = true;
+        continue;
+      }
+      // Non-indented prose = tool block ended
+      if (currentLines.length > 0) flushParagraph();
+      inToolBlock = false;
+      currentSpeakable = true;
+    }
+
+    // Strip ⏺ markers
     let clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
     const cleanTrimmed = clean.trim();
 
-    // Skip bare ⏺ lines (streaming indicator with no content)
     if (!cleanTrimmed) {
-      if (foundContent) cleaned.push("");
+      // Empty line = paragraph break
+      if (foundContent && currentLines.length > 0) {
+        flushParagraph();
+      }
       continue;
     }
 
     foundContent = true;
-    cleaned.push(clean);
+
+    // Mark non-speakable lines
+    if (isNonSpeakable) {
+      if (currentLines.length > 0 && currentSpeakable) flushParagraph();
+      currentSpeakable = false;
+      currentLines.push(clean);
+      continue;
+    }
+
+    // Normal prose line
+    if (!currentSpeakable && currentLines.length > 0) {
+      flushParagraph();
+      currentSpeakable = true;
+    }
+    currentLines.push(clean);
   }
 
-  while (cleaned.length > 0 && !cleaned[cleaned.length - 1].trim()) cleaned.pop();
-  return cleaned.join("\n").trim();
-}
+  // Flush remaining
+  if (currentLines.length > 0) flushParagraph();
 
-// Filtered text for TTS — strip chrome, tool calls, code, and non-prose content
-function extractSpeakableText(preSnapshot: string, postSnapshot: string, userInput: string): string {
-  const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
-  const cleaned: string[] = [];
-  let foundContent = false;
-  let inToolBlock = false; // Track when inside a tool call block
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!foundContent && !trimmed) continue;
-
-    // Skip tmux chrome
-    if (/^[─━═]{3,}/.test(trimmed)) continue;
-    if (/^❯/.test(trimmed)) continue; // Skip all prompt lines (bare or with suggested text)
-    if (/bypass\s+permissions/i.test(trimmed)) continue;
-    if (/^⏵/.test(trimmed)) continue;
-    // Skip context/compact status lines
-    if (/context left until/i.test(trimmed)) continue;
-    if (/auto-compact/i.test(trimmed)) continue;
-
-    // Skip spinners and timing summaries
-    if (isSpinnerLine(trimmed)) continue;
-    if (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) continue;
-
-    // Skip ctrl hints
-    if (/^(ctrl|⌃|esc to|press)/i.test(trimmed)) continue;
-    if (/\bctrl\+[a-z]\b/i.test(trimmed)) continue;
-
-    // Skip tool summaries
-    if (/^Read \d+ files?/i.test(trimmed)) continue;
-    if (/^Searched for \d+/i.test(trimmed)) continue;
-    if (/^Wrote \d+/i.test(trimmed)) continue;
-    if (/^Edited \d+/i.test(trimmed)) continue;
-    if (/^Ran /i.test(trimmed) && trimmed.length < 60) continue;
-    if (/Interrupted/.test(trimmed)) continue;
-    if (/Running…/.test(trimmed)) continue;
-
-    // Skip todo items
-    if (/^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed)) continue;
-
-    // Skip expand hints
-    if (/ctrl\+o/i.test(trimmed)) continue;
-    if (/^\+\d+ lines/.test(trimmed)) continue;
-    if (/^… \+\d+/.test(trimmed)) continue;
-
-    // Tool block tracking: ⏺ ToolName( starts a block, ⏺ prose ends it
-    if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
-      inToolBlock = true;
-      continue;
-    }
-    // ⎿ lines are tool output — stay in tool block
-    if (/^⎿/.test(trimmed)) {
-      inToolBlock = true;
-      continue;
-    }
-    // Bare tool calls
-    if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/.test(trimmed)) {
-      inToolBlock = true;
-      continue;
-    }
-
-    // ⏺ followed by prose (not a tool name) = new prose paragraph, exit tool block
-    if (/^⏺\s+/.test(trimmed) && !/^⏺\s+\w+[\s(]?$/.test(trimmed)) {
-      inToolBlock = false;
-    }
-    // A line that doesn't start with spaces/indent after a tool block = exiting tool block
-    if (inToolBlock) {
-      // Indented lines or lines starting with special chars are still tool output
-      if (/^\s{2,}/.test(line) || /^[^a-zA-Z⏺]/.test(trimmed)) continue;
-      // Non-indented prose line = tool block ended
-      inToolBlock = false;
-    }
-
-    // Lines that are clearly file paths or command output
-    if (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100) continue;
-
-    // Strip ⏺ markers from prose
-    let clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
-
-    if (clean.trim()) {
-      foundContent = true;
-      cleaned.push(clean);
-    } else if (foundContent) {
-      cleaned.push("");
-    }
-  }
-
-  while (cleaned.length > 0 && !cleaned[cleaned.length - 1].trim()) cleaned.pop();
-  return cleaned.join("\n").trim();
+  return result;
 }
 
 let lastUserInput = "";
@@ -855,59 +998,95 @@ function normalizeSpinners(text: string): string {
   return text.replace(/[✻✳✢✽✶·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "•");
 }
 
-// Track incremental TTS state
-let lastIncrementalSpeakable = "";
-let incrementalTtsTimer: ReturnType<typeof setTimeout> | null = null;
-const INCREMENTAL_TTS_DELAY_MS = 200; // Wait 200ms of stable text before speaking incrementally
+// Entry-based TTS: delay before speaking a new completed entry
+const ENTRY_TTS_DELAY_MS = 200;
 
-// Broadcast current response content to app for display (via capture-pane snapshot).
-// Also triggers incremental TTS when new speakable text accumulates during long responses.
+// Broadcast current response content to app via entry model.
+// Diffs extractStructuredOutput() against conversationEntries, creates/updates entries,
+// broadcasts { type: "entry" }, and triggers TTS for completed speakable entries.
 function broadcastCurrentOutput() {
   const pane = captureTmuxPane();
   if (!pane) return;
 
-  const raw = extractRawOutput(preInputSnapshot, pane, lastUserInput);
-  if (!raw) return;
-  const reflowed = reflowText(raw);
-  if (!reflowed) return;
+  const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
+  if (paragraphs.length === 0) return;
 
-  // Only broadcast if content actually changed
-  const normalized = normalizeSpinners(reflowed);
+  // Normalize for change detection
+  const normalized = normalizeSpinners(paragraphs.map(p => p.text).join("\n"));
   if (normalized === lastBroadcastText) return;
   lastBroadcastText = normalized;
 
+  // Diff paragraphs against current entries (assistant only)
+  const assistantEntries = conversationEntries.filter(e => e.role === "assistant");
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const para = paragraphs[i];
+    if (i < assistantEntries.length) {
+      // Existing entry — update text if changed
+      const existing = assistantEntries[i];
+      if (existing.text !== para.text) {
+        existing.text = para.text;
+        existing.speakable = para.speakable;
+      }
+    } else {
+      // New paragraph — create entry
+      const entry: ConversationEntry = {
+        id: ++entryIdCounter,
+        role: "assistant",
+        text: para.text,
+        speakable: para.speakable,
+        spoken: false,
+        ts: Date.now(),
+      };
+      conversationEntries.push(entry);
+    }
+  }
+
+  // Remove stale assistant entries if paragraphs shrunk (rare reparse)
+  if (paragraphs.length < assistantEntries.length) {
+    const staleIds = new Set(assistantEntries.slice(paragraphs.length).map(e => e.id));
+    conversationEntries = conversationEntries.filter(e => !staleIds.has(e.id));
+  }
+
+  // Broadcast all entries
   broadcast({
-    type: "transcription",
-    role: "assistant",
-    text: reflowed,
-    ts: Date.now(),
+    type: "entry",
+    entries: conversationEntries,
     partial: true,
   });
 
-  // Incremental TTS: check if speakable text has grown
-  const speakable = extractSpeakableText(preInputSnapshot, pane, lastUserInput);
-  if (speakable && speakable.length > lastIncrementalSpeakable.length + 20) {
-    // New speakable content — schedule TTS if not already scheduled
-    // Don't reset the timer on new content — let it fire and speak what's available
-    if (!incrementalTtsTimer) {
-      incrementalTtsTimer = setTimeout(() => {
-        incrementalTtsTimer = null;
-        // Re-extract to get latest stable text
-        const freshPane = captureTmuxPane();
-        if (!freshPane) return;
-        const freshSpeakable = extractSpeakableText(preInputSnapshot, freshPane, lastUserInput);
-        if (!freshSpeakable) return;
-
-        const unspoken = freshSpeakable.slice(lastIncrementalSpeakable.length).trim();
-        if (unspoken.length > 20) {
-          console.log(`[stream] Incremental TTS (${unspoken.length} chars): "${unspoken.slice(0, 100)}..."`);
-          lastIncrementalSpeakable = freshSpeakable;
-          lastSpokenText = freshSpeakable; // Keep handleStreamDone in sync
-          // Queue instead of interrupting — speakText handles queuing automatically
-          speakText(unspoken);
-        }
-      }, INCREMENTAL_TTS_DELAY_MS);
+  // Trigger TTS for completed speakable entries (not the last one, which may still be growing)
+  const currentAssistant = conversationEntries.filter(e => e.role === "assistant");
+  for (let i = 0; i < currentAssistant.length - 1; i++) {
+    const entry = currentAssistant[i];
+    if (entry.speakable && !entry.spoken) {
+      entry.spoken = true;
+      console.log(`[stream] Entry TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
+      plog("entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
+      currentTtsEntryId = entry.id;
+      broadcast({ type: "tts_highlight", entryId: entry.id });
+      speakText(entry.text);
     }
+  }
+
+  // Schedule TTS for the last entry if it's been stable (not growing)
+  const lastEntry = currentAssistant[currentAssistant.length - 1];
+  if (lastEntry && lastEntry.speakable && !lastEntry.spoken) {
+    if (entryTtsTimer) clearTimeout(entryTtsTimer);
+    entryTtsTimer = setTimeout(() => {
+      entryTtsTimer = null;
+      // Re-check — if still last and unchanged, speak it
+      const freshAssistant = conversationEntries.filter(e => e.role === "assistant");
+      const freshLast = freshAssistant[freshAssistant.length - 1];
+      if (freshLast && freshLast.id === lastEntry.id && !freshLast.spoken) {
+        freshLast.spoken = true;
+        console.log(`[stream] Entry TTS delayed (id=${freshLast.id}, ${freshLast.text.length} chars)`);
+        plog("entry_tts_delayed", `id=${freshLast.id} "${freshLast.text.slice(0, 80)}" (${freshLast.text.length} chars)`);
+        currentTtsEntryId = freshLast.id;
+        broadcast({ type: "tts_highlight", entryId: freshLast.id });
+        speakText(freshLast.text);
+      }
+    }, ENTRY_TTS_DELAY_MS);
   }
 }
 
@@ -948,17 +1127,20 @@ function checkPaneState() {
   // State transitions
   if (streamState === "WAITING") {
     if (spinner) {
+      slog("stream", "state", { from: "WAITING", to: "THINKING", elapsedMs: elapsed });
       streamState = "THINKING";
       console.log(`[stream] → THINKING (${(elapsed/1000).toFixed(1)}s)`);
       broadcast({ type: "voice_status", state: "thinking" });
     }
     if (response) {
+      slog("stream", "state", { from: "WAITING", to: "RESPONDING", elapsedMs: elapsed });
       streamState = "RESPONDING";
       console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
       broadcast({ type: "voice_status", state: "responding" });
     }
   } else if (streamState === "THINKING") {
     if (response) {
+      slog("stream", "state", { from: "THINKING", to: "RESPONDING", elapsedMs: elapsed });
       streamState = "RESPONDING";
       console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
       broadcast({ type: "voice_status", state: "responding" });
@@ -1001,15 +1183,20 @@ function startTmuxStreaming(userInput: string) {
   if (streamState !== "IDLE") {
     stopTmuxStreaming();
   }
+  plog("text_sent_to_terminal", `"${userInput.slice(0, 80)}"`);
+  plog("stream_poll_start");
+  slog("terminal", "send", { text: userInput.slice(0, 80) });
+  slog("stream", "state", { from: streamState, to: "WAITING" });
 
   lastUserInput = userInput;
   pollStartTime = Date.now();
   lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
-  lastSpokenText = "";
-  lastIncrementalSpeakable = "";
-  if (incrementalTtsTimer) { clearTimeout(incrementalTtsTimer); incrementalTtsTimer = null; }
+  conversationEntries = [];
+  entryIdCounter = 0;
+  currentTtsEntryId = null;
+  if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   streamFileOffset = 0;
   stopClientPlayback(); // Stop any current TTS before new input
 
@@ -1061,8 +1248,8 @@ function startTmuxStreaming(userInput: string) {
   streamTimeout = setTimeout(() => {
     console.log(`[stream] Timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
     const pane = captureTmuxPane();
-    const finalText = extractRawOutput(preInputSnapshot, pane, lastUserInput);
-    if (finalText) {
+    const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
+    if (paragraphs.length > 0) {
       handleStreamDone();
     } else {
       stopTmuxStreaming();
@@ -1076,63 +1263,160 @@ function startTmuxStreaming(userInput: string) {
 function handleStreamDone() {
   streamState = "DONE";
   const elapsed = Date.now() - pollStartTime;
+  slog("stream", "state", { from: "RESPONDING", to: "DONE", elapsedMs: elapsed });
   stopTmuxStreaming();
+  plog("stream_done", `${(elapsed / 1000).toFixed(1)}s`);
 
   console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s`);
 
-  // Take final snapshot for extraction
+  // Final extraction into entry model
   const pane = captureTmuxPane();
+  const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
 
-  // Extract both raw and speakable text from final snapshot
-  let rawOutput = extractRawOutput(preInputSnapshot, pane, lastUserInput);
-  if (rawOutput) rawOutput = reflowText(rawOutput);
-  const speakable = extractSpeakableText(preInputSnapshot, pane, lastUserInput);
-
-  // For transcript display: prefer speakable prose over raw tool output
-  const displayText = speakable ? reflowText(speakable) : rawOutput;
-  if (displayText) {
-    broadcast({
-      type: "transcription",
-      role: "assistant",
-      text: displayText,
-      ts: Date.now(),
-    });
-    console.log(`[stream] Display (${displayText.length} chars): "${displayText.slice(0, 100)}"`);
-  }
-
-  // TTS: speak only the portion not already spoken by incremental TTS
-  if (speakable) {
-    const unspoken = speakable.length > lastSpokenText.length
-      ? speakable.slice(lastSpokenText.length).trim()
-      : ""; // Already fully spoken by incremental TTS
-
-    if (unspoken) {
-      console.log(`[stream] Speaking (${unspoken.length} chars): "${unspoken.slice(0, 100)}..."`);
-      lastSpokenText = speakable; // Save for replay
-      // Queue the final text — don't interrupt if incremental TTS is still playing
-      speakText(unspoken);
+  // Update entries from final paragraphs
+  const assistantEntries = conversationEntries.filter(e => e.role === "assistant");
+  for (let i = 0; i < paragraphs.length; i++) {
+    const para = paragraphs[i];
+    if (i < assistantEntries.length) {
+      assistantEntries[i].text = para.text;
+      assistantEntries[i].speakable = para.speakable;
     } else {
-      console.log("[stream] Speakable found but nothing new to speak");
-      // Don't send idle if TTS is still synthesizing/playing — handleTtsDone will send it
-      if (!ttsInProgress && ttsQueue.length === 0) {
-        broadcast({ type: "voice_status", state: "idle" });
-      }
+      conversationEntries.push({
+        id: ++entryIdCounter,
+        role: "assistant",
+        text: para.text,
+        speakable: para.speakable,
+        spoken: false,
+        ts: Date.now(),
+      });
     }
-  } else if (!rawOutput) {
-    console.log("[stream] No output extracted — pane tail:");
-    const tail = pane.split("\n").slice(-15).map(l => `  |${l}`).join("\n");
-    console.log(tail);
-    if (!ttsInProgress && ttsQueue.length === 0) {
-      broadcast({ type: "voice_status", state: "idle" });
+  }
+
+  // Broadcast final entries
+  broadcast({
+    type: "entry",
+    entries: conversationEntries,
+    partial: false,
+  });
+
+  const totalEntries = conversationEntries.filter(e => e.role === "assistant").length;
+  console.log(`[stream] Final: ${totalEntries} assistant entries`);
+
+  // Speak any remaining unspoken speakable entries
+  let spokeAnything = false;
+  for (const entry of conversationEntries) {
+    if (entry.role === "assistant" && entry.speakable && !entry.spoken) {
+      entry.spoken = true;
+      console.log(`[stream] Final TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
+      plog("final_entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
+      currentTtsEntryId = entry.id;
+      broadcast({ type: "tts_highlight", entryId: entry.id });
+      speakText(entry.text);
+      spokeAnything = true;
     }
-  } else {
-    // Raw output exists but nothing speakable (e.g. just tool calls)
-    console.log(`[stream] Raw output but nothing speakable`);
-    console.log(`[stream] Raw output: "${rawOutput.slice(0, 200)}"`);
+  }
+
+  if (!spokeAnything) {
+    const hasSpeakable = conversationEntries.some(e => e.role === "assistant" && e.speakable);
+    if (hasSpeakable) {
+      console.log("[stream] All speakable entries already spoken");
+    } else {
+      console.log("[stream] No speakable entries found");
+    }
     if (!ttsInProgress && ttsQueue.length === 0) {
+      plog("cycle_idle", spokeAnything ? "all spoken" : "nothing speakable");
+      broadcastPipelineTrace();
       broadcast({ type: "voice_status", state: "idle" });
     }
   }
+
+  // Re-engagement: watch for Claude starting new work (tool calls, follow-ups)
+  startReEngageWatcher();
+}
+
+function startReEngageWatcher() {
+  if (reEngageWatcher) { clearInterval(reEngageWatcher); reEngageWatcher = null; }
+  const savedSnapshot = preInputSnapshot;
+  const savedInput = lastUserInput;
+  let checks = 0;
+  reEngageWatcher = setInterval(() => {
+    checks++;
+    if (checks > 20) { // 10 seconds (20 * 500ms)
+      clearInterval(reEngageWatcher!);
+      reEngageWatcher = null;
+      return;
+    }
+    const pane = captureTmuxPane();
+    if (!pane) return;
+    if (hasSpinnerChars(pane)) {
+      console.log(`[stream] Re-engaging — spinner detected after done (check #${checks})`);
+      clearInterval(reEngageWatcher!);
+      reEngageWatcher = null;
+      // Re-start streaming with same context so incremental TTS continues
+      reEngageStreaming(savedSnapshot, savedInput);
+    }
+  }, 500);
+}
+
+function reEngageStreaming(savedSnapshot: string, savedInput: string) {
+  if (streamState !== "IDLE" && streamState !== "DONE") return;
+
+  preInputSnapshot = savedSnapshot;
+  lastUserInput = savedInput;
+  pollStartTime = Date.now();
+  lastStreamActivity = Date.now();
+  sawActivity = true; // We know there's activity (spinner)
+  lastBroadcastText = "";
+  // Don't reset conversationEntries — we want to continue from where we left off for entry-based TTS
+  streamFileOffset = 0;
+
+  try { writeFileSync(STREAM_FILE, ""); } catch {}
+  terminal.startPipeStream(STREAM_FILE);
+
+  streamState = "THINKING";
+  broadcast({ type: "voice_status", state: "thinking" });
+
+  // Same watchers as startTmuxStreaming
+  streamWatcher = setInterval(() => {
+    try {
+      const stat = statSync(STREAM_FILE);
+      if (stat.size > streamFileOffset) {
+        streamFileOffset = stat.size;
+        onStreamActivity();
+      } else {
+        const quietMs = Date.now() - lastStreamActivity;
+        if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
+          scheduleDoneCheck();
+        }
+      }
+    } catch {}
+  }, 50);
+
+  promptCheckInterval = setInterval(() => {
+    if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
+    if (!sawActivity) return;
+    const pane = captureTmuxPane();
+    if (hasPromptReady(pane) && !hasSpinnerChars(pane)) {
+      console.log("[stream] Prompt-ready detected by re-engage checker");
+      handleStreamDone();
+    } else if (streamState === "RESPONDING") {
+      broadcastCurrentOutput();
+    }
+  }, 1000);
+
+  streamTimeout = setTimeout(() => {
+    console.log(`[stream] Re-engage timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
+    const pane = captureTmuxPane();
+    const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
+    if (paragraphs.length > 0) {
+      handleStreamDone();
+    } else {
+      stopTmuxStreaming();
+      broadcast({ type: "voice_status", state: "idle" });
+    }
+  }, STREAM_TIMEOUT_MS);
+
+  console.log("[stream] Re-engaged streaming for continuation");
 }
 
 function stopTmuxStreaming() {
@@ -1151,8 +1435,9 @@ function stopTmuxStreaming() {
     contentCheckTimer = null;
   }
   cancelDoneCheck();
-  if (incrementalTtsTimer) { clearTimeout(incrementalTtsTimer); incrementalTtsTimer = null; }
+  if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   if (promptCheckInterval) { clearInterval(promptCheckInterval); promptCheckInterval = null; }
+  if (reEngageWatcher) { clearInterval(reEngageWatcher); reEngageWatcher = null; }
   streamState = "IDLE";
 
   // Clean up stream file
@@ -1483,6 +1768,7 @@ initExchangesLog();
 const clients = new Set<WebSocket>();
 
 function broadcast(msg: Record<string, unknown>) {
+  wslog("out", (msg.type as string) || "unknown", JSON.stringify(msg).length);
   const data = JSON.stringify(msg);
   let sent = 0;
   for (const ws of clients) {
@@ -1510,13 +1796,20 @@ setInterval(() => {
 }, 10000);
 
 const MURMUR_EXIT = "The user has closed the Murmur voice panel. Resume normal text-based interaction. You can stop formatting for audio output.";
+let exitTimer: ReturnType<typeof setTimeout> | null = null;
+let exitSentAt = 0;
 
 function handleWsConnection(ws: WebSocket) {
   const wasEmpty = clients.size === 0;
   clients.add(ws);
+  slog("ws", "connect", { clients: clients.size });
 
-  // First client connecting — send context if not already sent this session
-  if (wasEmpty && terminal.isSessionAlive() && contextSentAt === 0) {
+  // Cancel pending exit — a client reconnected
+  if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
+
+  // First real (non-test) client connecting — send context (30s debounce built into sendMurmurContext)
+  // Test clients send "test:client" as their first message to skip context/exit
+  if (wasEmpty && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
     sendMurmurContext();
   }
 
@@ -1600,6 +1893,7 @@ function handleWsConnection(ws: WebSocket) {
   let pendingPreBuffer: Buffer | null = null;
 
   ws.on("message", async (raw, isBinary) => {
+    wslog("in", isBinary ? "binary" : (raw.toString().split(":")[0] || "unknown"), isBinary ? (raw as Buffer).length : raw.toString().length);
     // Binary message = audio data to transcribe
     if (isBinary) {
       const audioData = raw as Buffer;
@@ -1631,12 +1925,16 @@ function handleWsConnection(ws: WebSocket) {
       }
 
       console.log(`Received audio: ${finalAudio.length} bytes (wake_check=${isWakeCheck})`);
+      resetPipelineLog();
+      plog("audio_received", `${finalAudio.length} bytes`);
       broadcast({ type: "voice_status", state: "transcribing" });
 
       const text = await transcribeAudio(finalAudio);
 
       if (!text || text.length <= 1) {
         console.log("Blank transcription");
+        plog("blank_transcription");
+        broadcastPipelineTrace();
         broadcast({ type: "voice_status", state: isWakeCheck ? "wake_no_match" : "blank" });
         return;
       }
@@ -1659,15 +1957,26 @@ function handleWsConnection(ws: WebSocket) {
 
       console.log(`Transcription: "${text}"`);
 
+      // Test mode: transcribe only, don't send to terminal
+      if ((ws as any)._testTranscribeOnly) {
+        (ws as any)._testTranscribeOnly = false;
+        console.log(`[test] Transcribe-only mode — not sending to terminal`);
+        plog("test_transcribe_only", `"${text.slice(0, 80)}"`);
+        addUserEntry(text);
+        broadcast({ type: "voice_status", state: "idle" });
+        broadcastPipelineTrace();
+        return;
+      }
+
       if (isWakeCheck) {
         // Check for wake word
         const lower = text.toLowerCase();
         // Use word boundaries to avoid false positives (e.g. "claudication", "cloudy")
         if (/\bclaude\b/.test(lower) || /\bclyde\b/.test(lower) || /\bhey cloud\b/.test(lower)) {
           console.log("Wake word detected!");
-          broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
           // Snapshot BEFORE sending, then send, then start polling
           startTmuxStreaming(text);
+          addUserEntry(text); // After startTmuxStreaming which resets entries
           terminal.sendText(text);
         } else {
           console.log(`No wake word in: "${text}"`);
@@ -1675,9 +1984,9 @@ function handleWsConnection(ws: WebSocket) {
         }
       } else {
         // Direct send — no wake word check
-        broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
         // Snapshot BEFORE sending, then send, then polling starts after delay
         startTmuxStreaming(text);
+        addUserEntry(text); // After startTmuxStreaming which resets entries
         terminal.sendText(text);
       }
       return;
@@ -1823,13 +2132,40 @@ function handleWsConnection(ws: WebSocket) {
       return;
     }
 
-    // Replay last spoken text, or specific text via replay:TEXT
+    // Replay: replay specific entry by ID, or last spoken speakable entry
     if (msg === "replay" || msg.startsWith("replay:")) {
-      const replayText = msg.startsWith("replay:") ? msg.slice(7) : lastSpokenText;
+      let replayText = "";
+      let replayEntryId: number | null = null;
+      if (msg.startsWith("replay:")) {
+        const idStr = msg.slice(7);
+        const entryId = parseInt(idStr, 10);
+        const entry = conversationEntries.find(e => e.id === entryId);
+        if (entry) {
+          replayText = entry.text;
+          replayEntryId = entry.id;
+        } else {
+          // Fallback: treat as literal text
+          replayText = idStr;
+        }
+      } else {
+        // Find last spoken speakable assistant entry
+        const spoken = conversationEntries.filter(e => e.role === "assistant" && e.speakable && e.spoken);
+        if (spoken.length > 0) {
+          const last = spoken[spoken.length - 1];
+          replayText = last.text;
+          replayEntryId = last.id;
+        } else {
+          replayText = lastSpokenText; // Fallback to old var
+        }
+      }
       if (replayText) {
         console.log(`[replay] Speaking (${replayText.length} chars): "${replayText.slice(0, 80)}..."`);
         stopClientPlayback();
         broadcast({ type: "voice_status", state: "speaking" });
+        if (replayEntryId != null) {
+          currentTtsEntryId = replayEntryId;
+          broadcast({ type: "tts_highlight", entryId: replayEntryId });
+        }
         speakText(replayText);
       } else {
         console.log("[replay] No text to replay");
@@ -1842,21 +2178,113 @@ function handleWsConnection(ws: WebSocket) {
       const text = msg.slice(5);
       if (text) {
         console.log(`[terminal] Text input: "${text}"`);
-        broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
         startTmuxStreaming(text);
+        addUserEntry(text); // After startTmuxStreaming which resets entries
         terminal.sendText(text);
       }
+      return;
+    }
+
+    // --- Test Mode ---
+    // Simulates the full voice pipeline cycle without needing a live Claude session.
+    // Exercises: transcription broadcast timing, TTS delivery, multi-paragraph handling.
+
+    // test:cycle:RESPONSE_TEXT — simulate full cycle with canned response
+    // Broadcasts user transcript (from prior audio transcription), then simulates
+    // thinking → responding → assistant transcript → TTS, exactly like real flow.
+    if (msg.startsWith("test:cycle:")) {
+      const responseText = msg.slice(11);
+      console.log(`[test] Simulating pipeline cycle (${responseText.length} chars)`);
+      resetPipelineLog();
+      plog("test_cycle_start", `"${responseText.slice(0, 80)}"`);
+
+      // Simulate thinking phase
+      broadcast({ type: "voice_status", state: "thinking" });
+      plog("test_thinking");
+
+      setTimeout(() => {
+        // Simulate responding phase
+        broadcast({ type: "voice_status", state: "responding" });
+        plog("test_responding");
+
+        setTimeout(() => {
+          // Broadcast assistant transcription (final)
+          plog("final_transcription_broadcast", `${responseText.length} chars`);
+          broadcast({
+            type: "transcription",
+            role: "assistant",
+            text: responseText,
+            ts: Date.now(),
+          });
+
+          // TTS the response
+          plog("final_tts", `"${responseText.slice(0, 100)}" (${responseText.length} chars)`);
+          lastSpokenText = responseText;
+          speakText(responseText);
+        }, 500); // 500ms "response generation"
+      }, 300); // 300ms "thinking"
+
+      return;
+    }
+
+    // test:tts:TEXT — directly trigger speakText (tests TTS delivery only)
+    if (msg.startsWith("test:tts:")) {
+      const text = msg.slice(9);
+      console.log(`[test] Direct TTS (${text.length} chars)`);
+      resetPipelineLog();
+      plog("test_tts_direct", `"${text.slice(0, 80)}"`);
+      broadcast({ type: "voice_status", state: "speaking" });
+      lastSpokenText = text;
+      speakText(text);
+      return;
+    }
+
+    // test:audio:FILENAME — read WAV from tests/test-audio/, transcribe, return result
+    if (msg.startsWith("test:audio:")) {
+      const file = msg.slice(11);
+      const audioPath = join(__dirname, "tests", "test-audio", file + ".wav");
+      try {
+        const audio = readFileSync(audioPath);
+        console.log(`[test] Audio file: ${file}.wav (${audio.length} bytes)`);
+        const text = await transcribeAudio(audio);
+        ws.send(JSON.stringify({ type: "test_result", test: "audio", file, text: text || null }));
+      } catch (err) {
+        ws.send(JSON.stringify({ type: "test_result", test: "audio", file, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    // test:client — mark this connection as a test client (skip context/exit messages)
+    if (msg === "test:client") {
+      (ws as any)._isTestClient = true;
+      console.log("[test] Client marked as test — skipping context/exit");
+      return;
+    }
+
+    // test:transcribe — next binary audio will be transcribed but NOT sent to terminal
+    if (msg === "test:transcribe") {
+      (ws as any)._testTranscribeOnly = true;
+      console.log("[test] Next audio will be transcribed without terminal send");
       return;
     }
   });
 
   ws.on("close", () => {
     clients.delete(ws);
-    // Last client disconnected — tell Claude voice panel is closed
-    if (clients.size === 0 && terminal.isSessionAlive()) {
-      terminal.sendText(MURMUR_EXIT);
-      contextSentAt = 0; // Reset so next app open resends context
-      console.log("[context] Sent Murmur exit message to Claude");
+    slog("ws", "disconnect", { clients: clients.size });
+    // Last client disconnected — debounce exit message (5s) to avoid spam from rapid reconnects
+    if (clients.size === 0 && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
+      if (exitTimer) clearTimeout(exitTimer);
+      exitTimer = setTimeout(() => {
+        exitTimer = null;
+        // Only send if still no clients and not sent recently (30s debounce)
+        if (clients.size === 0 && Date.now() - exitSentAt > 30000) {
+          terminal.sendText(MURMUR_EXIT);
+          contextSentAt = 0; // Reset so next app open resends context
+          exitSentAt = Date.now();
+          console.log("[context] Sent Murmur exit message to Claude");
+        }
+      }, 5000);
     }
   });
 }
@@ -1876,8 +2304,19 @@ app.get("/manifest.json", (_req, res) => {
   res.sendFile(join(__dirname, "manifest.json"));
 });
 
+// Serve site assets (favicon, icons)
+app.get("/favicon.ico", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "favicon.ico"));
+});
+app.get("/icon-256.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "icon-256.png"));
+});
+app.get("/favicon-16.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "favicon-16.png"));
+});
+
 app.get("/version", (_req, res) => {
-  res.json({ version: 47 });
+  res.json({ version: 62 });
 });
 
 app.get("/debug", (_req, res) => {
@@ -1887,6 +2326,29 @@ app.get("/debug", (_req, res) => {
     ttsPlaying: ttsInProgress,
     vmState,
   });
+});
+
+app.get("/debug/pipeline", (_req, res) => {
+  res.json({ events: pipelineLog });
+});
+
+app.get("/debug/log", (_req, res) => {
+  res.json(_serverLog);
+});
+
+app.get("/debug/ws-log", (_req, res) => {
+  res.json(_serverWsLog);
+});
+
+app.get("/debug/log/stream", (_req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.write("data: {\"type\":\"connected\"}\n\n");
+  _sseClients.add(res);
+  _req.on("close", () => _sseClients.delete(res));
 });
 
 app.get("/info", (_req, res) => {
