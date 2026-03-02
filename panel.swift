@@ -4,6 +4,25 @@ import WebKit
 class PanelWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        // Forward Cmd+C/V/X/A to the responder chain so WKWebView handles clipboard
+        if event.modifierFlags.contains(.command) {
+            let ch = event.charactersIgnoringModifiers ?? ""
+            if "cvxa".contains(ch) {
+                if let responder = firstResponder {
+                    responder.doCommand(by: [
+                        "c": #selector(NSText.copy(_:)),
+                        "v": #selector(NSText.paste(_:)),
+                        "x": #selector(NSText.cut(_:)),
+                        "a": #selector(NSText.selectAll(_:)),
+                    ][ch]!)
+                    return
+                }
+            }
+        }
+        super.keyDown(with: event)
+    }
 }
 
 class DragHandle: NSView {
@@ -78,11 +97,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         ensureServer()
         let width: CGFloat = 320
-        let height: CGFloat = 500
         let handleHeight: CGFloat = 24
         let screen = NSScreen.main!.frame
+        let height = screen.height - 40
         let x = screen.maxX - width - 20
-        let y = screen.maxY - height - 40
+        let y: CGFloat = 20
 
         window = PanelWindow(
             contentRect: NSRect(x: x, y: y, width: width, height: height),
@@ -93,7 +112,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate {
 
         window.level = .floating
         window.isOpaque = false
-        window.backgroundColor = NSColor(red: 0.1, green: 0.1, blue: 0.18, alpha: 0.95)
+        window.backgroundColor = NSColor(red: 0.102, green: 0.102, blue: 0.118, alpha: 0.95)
         window.hasShadow = true
         window.collectionBehavior = [.canJoinAllSpaces, .stationary]
         window.minSize = NSSize(width: 240, height: 300)
@@ -109,7 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate {
             width: width, height: handleHeight
         ))
         handle.wantsLayer = true
-        handle.layer?.backgroundColor = NSColor(red: 0.086, green: 0.129, blue: 0.243, alpha: 1.0).cgColor
+        handle.layer?.backgroundColor = NSColor(red: 0.133, green: 0.133, blue: 0.149, alpha: 1.0).cgColor
         handle.autoresizingMask = [.width, .minYMargin]
 
         // Pill indicator

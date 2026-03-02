@@ -1,13 +1,14 @@
 /**
  * Murmur — voice interface for Claude Code
  *
- * Express + WebSocket bridge between the panel UI and Claude Code (in tmux).
+ * Express + WebSocket bridge between the panel UI and Claude Code.
+ * Uses TerminalManager abstraction (tmux on macOS, node-pty on Windows).
  * VoiceMode MCP handles all audio (TTS + STT). This server:
- * - Manages the tmux session running Claude Code
+ * - Manages the terminal session running Claude Code
  * - Watches VoiceMode event log for real-time status (recording, TTS, STT)
  * - Watches VoiceMode exchanges log for conversation transcriptions
  * - Writes control signal files (speed, voice, mute, mic device)
- * - Sends /conversation to tmux on panel button click
+ * - Sends /conversation to terminal on panel button click
  */
 
 import express from "express";
@@ -17,6 +18,7 @@ import { createServer as createHttpsServer } from "https";
 import {
   readFileSync,
   writeFileSync,
+  mkdirSync,
   renameSync,
   existsSync,
   statSync,
@@ -29,8 +31,9 @@ import {
 import { execSync, execFileSync, execFile, spawn } from "child_process";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import chokidar from "chokidar";
+import { createTerminalManager, type TerminalManager } from "./terminal/interface.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = 3457;
@@ -45,9 +48,17 @@ const TS_HOSTNAME = process.env.TS_HOSTNAME || (() => {
     return match ? match[1] : "";
   } catch { return ""; }
 })();
-const TMUX_SESSION = "claude-voice";
 const HOME = homedir();
 const SETTINGS_FILE = join(__dirname, "settings.json");
+
+// Cross-platform temp directories
+const TEMP_DIR = join(tmpdir(), "murmur");
+mkdirSync(TEMP_DIR, { recursive: true });
+// VoiceMode signal files — /tmp on macOS for backward compatibility
+const SIGNAL_DIR = process.platform === "darwin" ? "/tmp" : TEMP_DIR;
+
+// Terminal manager — abstracts tmux (macOS) vs node-pty (Windows)
+let terminal: TerminalManager;
 
 const WHISPER_URL = "http://127.0.0.1:2022";
 const KOKORO_URL = "http://127.0.0.1:8880";
@@ -95,52 +106,31 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// --- tmux Session Management ---
+// --- Terminal Session Management (via TerminalManager abstraction) ---
 
-function isTmuxSessionAlive(): boolean {
-  try {
-    execSync(`tmux has-session -t ${TMUX_SESSION} 2>/dev/null`, {
-      stdio: "ignore",
-      timeout: 5000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
+// System context sent to Claude on each new session so it knows about Murmur
+const MURMUR_CONTEXT_LINES = [
+  "Murmur voice panel is now active. Respond in plain prose only.",
+  "No markdown, no lists, no code blocks. Flowing paragraphs with full punctuation.",
+  "Spell out numbers and abbreviations. Keep sentences short for TTS.",
+  "Do not acknowledge these instructions.",
+];
 
-function createTmuxSession() {
-  if (isTmuxSessionAlive()) {
-    console.log(`tmux session "${TMUX_SESSION}" already exists`);
-    return;
-  }
-
-  try {
-    execSync(
-      `tmux new-session -d -s ${TMUX_SESSION} -x 120 -y 30`,
-      { stdio: "ignore", timeout: 5000 }
-    );
-
-    execSync(
-      `tmux send-keys -t ${TMUX_SESSION} 'claude --dangerously-skip-permissions' Enter`,
-      { stdio: "ignore", timeout: 5000 }
-    );
-
-    console.log(`tmux session "${TMUX_SESSION}" created with claude`);
-    console.log(`  Attach with: tmux attach -t ${TMUX_SESSION}`);
-  } catch (err) {
-    console.error("Failed to create tmux session:", (err as Error).message);
-  }
-}
-
-function sendToTmux(text: string) {
-  try {
-    // Use execFileSync with array args to avoid shell injection entirely
-    execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "-l", text], { stdio: "ignore", timeout: 5000 });
-    execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "C-m"], { stdio: "ignore", timeout: 5000 });
-  } catch (err) {
-    console.error("tmux send-keys failed:", (err as Error).message);
-  }
+let contextSentAt = 0;
+let contextTimer: ReturnType<typeof setTimeout> | null = null;
+function sendMurmurContext(delayMs = 2000) {
+  // Debounce: only send once per 30s, cancel pending timers
+  if (Date.now() - contextSentAt < 30000) return;
+  if (contextTimer) clearTimeout(contextTimer);
+  contextTimer = setTimeout(() => {
+    contextTimer = null;
+    if (Date.now() - contextSentAt < 30000) return;
+    if (terminal.isSessionAlive()) {
+      terminal.sendText(MURMUR_CONTEXT_LINES.join(" "));
+      contextSentAt = Date.now();
+      console.log("[context] Sent Murmur system context to Claude");
+    }
+  }, delayMs);
 }
 
 // --- Persistent Settings ---
@@ -177,11 +167,11 @@ function saveSettings(updates: Partial<PanelSettings>) {
 function initSignalFiles() {
   const settings = loadSettings();
   if (settings.voice) {
-    writeFileSync("/tmp/claude-tts-voice", settings.voice);
+    writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), settings.voice);
     console.log(`  Restored voice: ${settings.voice}`);
   }
   if (settings.speed) {
-    writeFileSync("/tmp/claude-tts-speed", settings.speed.toString());
+    writeFileSync(join(SIGNAL_DIR, "claude-tts-speed"), settings.speed.toString());
     console.log(`  Restored speed: ${settings.speed}`);
   }
 }
@@ -190,18 +180,19 @@ function initSignalFiles() {
 
 function stopTts() {
   stopClientPlayback();
-  try {
-    execSync("pkill -x afplay 2>/dev/null; pkill -x say 2>/dev/null", { stdio: "ignore", timeout: 3000 });
-  } catch {}
+  if (process.platform !== "win32") {
+    try {
+      execSync("pkill -x afplay 2>/dev/null; pkill -x say 2>/dev/null", { stdio: "ignore", timeout: 3000 });
+    } catch {}
+  }
 }
 
 // --- Audio Pre-Buffer Combination ---
 
 function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
-  // Write both files to tmp
-  const preFile = "/tmp/murmur-prebuf.wav";
-  const mainFile = "/tmp/murmur-main.webm";
-  const outFile = "/tmp/murmur-combined.webm";
+  const preFile = join(TEMP_DIR, "murmur-prebuf.wav");
+  const mainFile = join(TEMP_DIR, "murmur-main.webm");
+  const outFile = join(TEMP_DIR, "murmur-combined.webm");
   writeFileSync(preFile, preBuffer);
   writeFileSync(mainFile, mainAudio);
 
@@ -230,8 +221,8 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     }
   }
 
-  const tmpFile = "/tmp/murmur-audio.webm";
-  const normalizedFile = "/tmp/murmur-audio-norm.wav";
+  const tmpFile = join(TEMP_DIR, "murmur-audio.webm");
+  const normalizedFile = join(TEMP_DIR, "murmur-audio-norm.wav");
   writeFileSync(tmpFile, audioData);
 
   // Normalize audio volume with ffmpeg before transcription
@@ -335,7 +326,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
   const ttsText = speakable;
 
-  const ttsFile = `/tmp/murmur-tts-${Date.now()}.mp3`;
+  const ttsFile = join(TEMP_DIR, `murmur-tts-${Date.now()}.mp3`);
   const payload = JSON.stringify({
     model: "kokoro",
     input: ttsText,
@@ -450,7 +441,17 @@ function handleTtsDone() {
     return;
   }
 
-  console.log("[tts] TTS done — broadcasting idle");
+  // If stream is still active but nothing queued, broadcast idle so client can listen
+  // The stream may produce more TTS later which will re-trigger speaking state
+  if (streamState === "WAITING" || streamState === "THINKING" || streamState === "RESPONDING") {
+    if (ttsQueue.length > 0) {
+      console.log(`[tts] TTS chunk done, ${ttsQueue.length} queued — staying in speaking state`);
+      return;
+    }
+    console.log(`[tts] TTS chunk done, queue empty, stream ${streamState} — going idle (will re-speak if more comes)`);
+  } else {
+    console.log("[tts] TTS done — broadcasting idle");
+  }
   broadcast({ type: "voice_status", state: "idle" });
 }
 
@@ -477,7 +478,7 @@ let streamFileOffset = 0;
 let lastStreamActivity = 0;
 let lastBroadcastText = "";
 let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
-const STREAM_FILE = `/tmp/claude-voice-stream-${process.pid}.raw`;
+const STREAM_FILE = join(TEMP_DIR, `claude-voice-stream-${process.pid}.raw`);
 const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
 const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
@@ -485,41 +486,10 @@ let preInputSnapshot: string = "";
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
-// Capture visible pane only (what you'd see on screen) — for display
-function captureVisiblePane(): string {
-  try {
-    return execSync(
-      `tmux capture-pane -t ${TMUX_SESSION} -p`,
-      { encoding: "utf-8", timeout: 2000 }
-    );
-  } catch {
-    return "";
-  }
-}
-
-// Capture visible pane with ANSI escape codes — for terminal panel rendering
-function captureTerminalPane(): string {
-  try {
-    return execSync(
-      `tmux capture-pane -t ${TMUX_SESSION} -e -p`,
-      { encoding: "utf-8", timeout: 2000 }
-    );
-  } catch {
-    return "";
-  }
-}
-
-// Capture with scrollback (200 lines) — for polling/extraction logic
-function captureTmuxPane(): string {
-  try {
-    return execSync(
-      `tmux capture-pane -t ${TMUX_SESSION} -p -S -2000`,
-      { encoding: "utf-8", timeout: 2000 }
-    );
-  } catch {
-    return "";
-  }
-}
+// Delegate pane capture to terminal manager
+function captureVisiblePane(): string { return terminal.capturePane(); }
+function captureTerminalPane(): string { return terminal.capturePaneAnsi(); }
+function captureTmuxPane(): string { return terminal.capturePaneScrollback(); }
 
 // Pattern-based spinner detection: Claude Code spinners look like "✶ Roosting…" or "· Shimmying… (3s · ↓ 85 tokens)"
 // Pattern: <symbol> <SingleWord>… [optional timing info]
@@ -584,6 +554,32 @@ function findUserInputLine(lines: string[], userInput: string): number {
   return -1;
 }
 
+// Detect interactive prompts (plan approval, permission requests) and notify client
+let interactivePromptActive = false;
+function detectInteractivePrompt(pane: string): boolean {
+  const lines = pane.split("\n");
+  const tail = lines.slice(-15).join("\n");
+
+  // Plan approval: "❯ 1. Yes" style numbered menus
+  // Permission prompts, confirmation dialogs
+  const hasNumberedMenu = /❯\s+\d+\.\s+/i.test(tail);
+  const hasQuestion = /(Would you like to proceed|Do you want to)/i.test(tail);
+
+  if (hasNumberedMenu || hasQuestion) {
+    if (!interactivePromptActive) {
+      interactivePromptActive = true;
+      console.log("[interactive] Prompt detected — notifying client to open terminal");
+      broadcast({ type: "interactive_prompt", active: true });
+    }
+    return true;
+  }
+  if (interactivePromptActive) {
+    interactivePromptActive = false;
+    broadcast({ type: "interactive_prompt", active: false });
+  }
+  return false;
+}
+
 function hasPromptReady(pane: string): boolean {
   // Claude Code TUI always shows ❯ at the bottom (it's the input field).
   // "Prompt ready" means: ❯ is visible AND no spinner in the content area.
@@ -635,13 +631,26 @@ function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput
   }
 
   // Skip user's input lines (which may wrap across many tmux lines)
-  const inputLower = userInput.trim().toLowerCase();
+  const inputNorm = userInput.trim().toLowerCase().replace(/\s+/g, " ");
   let startIdx = 0;
+  let consumedLen = 0;
   for (let i = 0; i < newLines.length; i++) {
     const t = newLines[i].trim();
     if (!t) continue;
     if (t.startsWith("❯")) { startIdx = i + 1; continue; }
-    if (t.length >= 5 && inputLower.includes(t.toLowerCase())) { startIdx = i + 1; continue; }
+    const tNorm = t.toLowerCase().replace(/\s+/g, " ");
+    // Try matching as sequential continuation of consumed input
+    const remaining = inputNorm.slice(consumedLen).trimStart();
+    if (remaining.startsWith(tNorm)) {
+      consumedLen += inputNorm.slice(consumedLen).indexOf(tNorm) + tNorm.length;
+      startIdx = i + 1;
+      continue;
+    }
+    // Fallback: line is a substring of user input
+    if (tNorm.length >= 5 && inputNorm.includes(tNorm)) {
+      startIdx = i + 1;
+      continue;
+    }
     break;
   }
   return newLines.slice(startIdx);
@@ -849,7 +858,7 @@ function normalizeSpinners(text: string): string {
 // Track incremental TTS state
 let lastIncrementalSpeakable = "";
 let incrementalTtsTimer: ReturnType<typeof setTimeout> | null = null;
-const INCREMENTAL_TTS_DELAY_MS = 500; // Wait 500ms of stable text before speaking incrementally
+const INCREMENTAL_TTS_DELAY_MS = 200; // Wait 200ms of stable text before speaking incrementally
 
 // Broadcast current response content to app for display (via capture-pane snapshot).
 // Also triggers incremental TTS when new speakable text accumulates during long responses.
@@ -928,6 +937,9 @@ function checkPaneState() {
   const pane = captureTmuxPane();
   if (!pane) return;
 
+  // Auto-accept interactive prompts (plan approval, permission dialogs)
+  if (detectInteractivePrompt(pane)) return;
+
   const elapsed = Date.now() - pollStartTime;
   const spinner = hasSpinnerChars(pane);
   const response = hasResponseMarkers(pane);
@@ -1001,16 +1013,13 @@ function startTmuxStreaming(userInput: string) {
   streamFileOffset = 0;
   stopClientPlayback(); // Stop any current TTS before new input
 
-  // Take snapshot BEFORE sendToTmux is called — captures the clean prompt state
+  // Take snapshot BEFORE terminal.sendText is called — captures the clean prompt state
   preInputSnapshot = captureTmuxPane();
   console.log(`[stream] Pre-snapshot: ${(preInputSnapshot.match(/^❯/gm) || []).length} prompts`);
 
-  // Truncate stream file and set up pipe-pane
+  // Truncate stream file and set up pipe streaming
   try { writeFileSync(STREAM_FILE, ""); } catch {}
-  try { execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, { stdio: "ignore", timeout: 2000 }); } catch {} // close existing
-  try { execSync(`tmux pipe-pane -O -t ${TMUX_SESSION} 'cat >> ${STREAM_FILE}'`, { stdio: "ignore", timeout: 2000 }); } catch (e) {
-    console.error("[stream] Failed to start pipe-pane:", e);
-  }
+  terminal.startPipeStream(STREAM_FILE);
 
   streamState = "WAITING";
   broadcast({ type: "voice_status", state: "thinking" });
@@ -1103,25 +1112,31 @@ function handleStreamDone() {
       // Queue the final text — don't interrupt if incremental TTS is still playing
       speakText(unspoken);
     } else {
-      console.log("[stream] Speakable found but nothing new to speak — broadcasting idle");
-      broadcast({ type: "voice_status", state: "idle" });
+      console.log("[stream] Speakable found but nothing new to speak");
+      // Don't send idle if TTS is still synthesizing/playing — handleTtsDone will send it
+      if (!ttsInProgress && ttsQueue.length === 0) {
+        broadcast({ type: "voice_status", state: "idle" });
+      }
     }
   } else if (!rawOutput) {
     console.log("[stream] No output extracted — pane tail:");
     const tail = pane.split("\n").slice(-15).map(l => `  |${l}`).join("\n");
     console.log(tail);
-    broadcast({ type: "voice_status", state: "idle" });
+    if (!ttsInProgress && ttsQueue.length === 0) {
+      broadcast({ type: "voice_status", state: "idle" });
+    }
   } else {
     // Raw output exists but nothing speakable (e.g. just tool calls)
-    console.log(`[stream] Raw output but nothing speakable — broadcasting idle`);
+    console.log(`[stream] Raw output but nothing speakable`);
     console.log(`[stream] Raw output: "${rawOutput.slice(0, 200)}"`);
-    broadcast({ type: "voice_status", state: "idle" });
+    if (!ttsInProgress && ttsQueue.length === 0) {
+      broadcast({ type: "voice_status", state: "idle" });
+    }
   }
 }
 
 function stopTmuxStreaming() {
-  // Close pipe-pane
-  try { execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, { stdio: "ignore", timeout: 2000 }); } catch {}
+  terminal.stopPipeStream();
 
   if (streamWatcher) {
     clearInterval(streamWatcher);
@@ -1436,7 +1451,7 @@ const watcher = chokidar.watch(watchPaths, {
 });
 
 watcher.on("change", (filePath: string) => {
-  const name = filePath.split("/").pop()!;
+  const name = filePath.replace(/^.*[/\\]/, "");
   if (name.startsWith("voicemode_events_")) {
     readNewEvents();
   } else if (name.startsWith("exchanges_")) {
@@ -1446,7 +1461,7 @@ watcher.on("change", (filePath: string) => {
 
 // Also watch for new files (day rollover)
 watcher.on("add", (filePath: string) => {
-  const name = filePath.split("/").pop()!;
+  const name = filePath.replace(/^.*[/\\]/, "");
   if (name.startsWith("voicemode_events_")) {
     currentEventsFile = filePath;
     eventsLogSize = 0;
@@ -1494,8 +1509,16 @@ setInterval(() => {
   }
 }, 10000);
 
+const MURMUR_EXIT = "The user has closed the Murmur voice panel. Resume normal text-based interaction. You can stop formatting for audio output.";
+
 function handleWsConnection(ws: WebSocket) {
+  const wasEmpty = clients.size === 0;
   clients.add(ws);
+
+  // First client connecting — send context if not already sent this session
+  if (wasEmpty && terminal.isSessionAlive() && contextSentAt === 0) {
+    sendMurmurContext();
+  }
 
   // Send current state
   ws.send(JSON.stringify({ type: "status", ...vmState }));
@@ -1506,12 +1529,12 @@ function handleWsConnection(ws: WebSocket) {
     : streamState.toLowerCase();
   ws.send(JSON.stringify({ type: "voice_status", state: currentVoiceState }));
 
-  // Send tmux session info
+  // Send terminal session info
   ws.send(
     JSON.stringify({
       type: "tmux",
-      session: TMUX_SESSION,
-      alive: isTmuxSessionAlive(),
+      session: "claude-voice",
+      alive: terminal.isSessionAlive(),
     })
   );
 
@@ -1523,10 +1546,10 @@ function handleWsConnection(ws: WebSocket) {
     const persisted = loadSettings();
     const settings: Record<string, string> = {};
     if (persisted.speed) settings.speed = persisted.speed.toString();
-    else { try { const v = readFileSync("/tmp/claude-tts-speed", "utf-8").trim(); if (v) settings.speed = v; } catch {} }
+    else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-speed"), "utf-8").trim(); if (v) settings.speed = v; } catch {} }
     if (persisted.voice) settings.voice = persisted.voice;
-    else { try { const v = readFileSync("/tmp/claude-tts-voice", "utf-8").trim(); if (v) settings.voice = v; } catch {} }
-    try { const v = readFileSync("/tmp/claude-mic-mute", "utf-8").trim(); settings.muted = v === "1" ? "1" : "0"; } catch {}
+    else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-voice"), "utf-8").trim(); if (v) settings.voice = v; } catch {} }
+    try { const v = readFileSync(join(SIGNAL_DIR, "claude-mic-mute"), "utf-8").trim(); settings.muted = v === "1" ? "1" : "0"; } catch {}
     ws.send(JSON.stringify({ type: "settings", ...settings }));
   }
 
@@ -1645,7 +1668,7 @@ function handleWsConnection(ws: WebSocket) {
           broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
           // Snapshot BEFORE sending, then send, then start polling
           startTmuxStreaming(text);
-          sendToTmux(text);
+          terminal.sendText(text);
         } else {
           console.log(`No wake word in: "${text}"`);
           broadcast({ type: "voice_status", state: "wake_no_match" });
@@ -1655,7 +1678,7 @@ function handleWsConnection(ws: WebSocket) {
         broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
         // Snapshot BEFORE sending, then send, then polling starts after delay
         startTmuxStreaming(text);
-        sendToTmux(text);
+        terminal.sendText(text);
       }
       return;
     }
@@ -1677,10 +1700,11 @@ function handleWsConnection(ws: WebSocket) {
 
     // Start conversation — interrupt any current operation, then send /conversation
     if (msg === "conversation:start") {
-      if (!isTmuxSessionAlive()) {
-        createTmuxSession();
+      if (!terminal.isSessionAlive()) {
+        terminal.createSession();
+        sendMurmurContext(5000);
         setTimeout(() => {
-          sendToTmux("/conversation");
+          terminal.sendText("/conversation");
           vmState.conversationActive = true;
           broadcast({ type: "status", ...vmState });
           broadcast({ type: "conversation", state: "starting" });
@@ -1688,16 +1712,11 @@ function handleWsConnection(ws: WebSocket) {
         return;
       }
       // Interrupt any current operation, clear input line, then send
-      try {
-        execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 });
-      } catch {}
+      terminal.sendKey("Escape");
       setTimeout(() => {
-        try {
-          // Clear any text in the input line
-          execSync(`tmux send-keys -t ${TMUX_SESSION} C-u`, { stdio: "ignore", timeout: 5000 });
-        } catch {}
+        terminal.sendKey("C-u");
         setTimeout(() => {
-          sendToTmux("/conversation");
+          terminal.sendText("/conversation");
           vmState.conversationActive = true;
           broadcast({ type: "status", ...vmState });
           broadcast({ type: "conversation", state: "starting" });
@@ -1706,16 +1725,16 @@ function handleWsConnection(ws: WebSocket) {
       return;
     }
 
-    // Stop conversation — send Escape to tmux to interrupt
+    // Stop conversation — send Escape to interrupt
     if (msg === "conversation:stop") {
       cancelIdleReset();
-      try {
-        execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 });
-      } catch {}
+      terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();
-      // Also try to kill any active recording
-      try { execSync("pkill -f 'rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      // Also try to kill any active recording (Unix only)
+      if (process.platform !== "win32") {
+        try { execSync("pkill -f 'rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      }
       vmState = { ttsPlaying: false, micActive: false, conversationActive: false, phase: "idle" };
       broadcast({ type: "status", ...vmState });
       broadcast({ type: "voice_status", state: "idle" });
@@ -1724,13 +1743,21 @@ function handleWsConnection(ws: WebSocket) {
     }
 
     // Stop — interrupt Claude + kill TTS + stop polling
+    // Terminal navigation keys for interactive prompts
+    if (msg === "key:up") { terminal.sendKey("Up"); return; }
+    if (msg === "key:down") { terminal.sendKey("Down"); return; }
+    if (msg === "key:enter") { terminal.sendKey("Enter"); return; }
+    if (msg === "key:escape") { terminal.sendKey("Escape"); return; }
+    if (msg === "key:tab") { terminal.sendKey("Tab"); return; }
+
     if (msg === "stop") {
-      // Send Escape to tmux to interrupt current tool call (converse)
-      try { execSync(`tmux send-keys -t ${TMUX_SESSION} Escape`, { stdio: "ignore", timeout: 5000 }); } catch {}
+      terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();
-      // Also kill VoiceMode's sounddevice playback and any recording
-      try { execSync("pkill -f 'sounddevice\\|rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      // Also kill VoiceMode's sounddevice playback and any recording (Unix only)
+      if (process.platform !== "win32") {
+        try { execSync("pkill -f 'sounddevice\\|rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      }
       vmState.ttsPlaying = false;
       vmState.micActive = false;
       broadcast({ type: "status", ...vmState });
@@ -1750,7 +1777,7 @@ function handleWsConnection(ws: WebSocket) {
     if (msg.startsWith("speed:")) {
       const speed = parseFloat(msg.slice(6));
       if (!isNaN(speed) && speed >= 0.5 && speed <= 3.0) {
-        writeFileSync("/tmp/claude-tts-speed", speed.toString());
+        writeFileSync(join(SIGNAL_DIR, "claude-tts-speed"), speed.toString());
         saveSettings({ speed });
       }
       return;
@@ -1760,7 +1787,7 @@ function handleWsConnection(ws: WebSocket) {
     if (msg.startsWith("voice:")) {
       const voice = msg.slice(6).trim();
       if (voice && VALID_VOICES.has(voice)) {
-        writeFileSync("/tmp/claude-tts-voice", voice);
+        writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), voice);
         saveSettings({ voice });
       } else if (voice) {
         console.warn(`[voice] Rejected invalid voice name: "${voice}"`);
@@ -1771,14 +1798,22 @@ function handleWsConnection(ws: WebSocket) {
     // Mic device
     if (msg.startsWith("mic:")) {
       const deviceId = msg.slice(4).trim();
-      writeFileSync("/tmp/claude-mic-device", deviceId);
+      writeFileSync(join(SIGNAL_DIR, "claude-mic-device"), deviceId);
       return;
     }
 
     // Mute
     if (msg.startsWith("mute:")) {
       const muted = msg.slice(5) === "1";
-      writeFileSync("/tmp/claude-mic-mute", muted ? "1" : "0");
+      writeFileSync(join(SIGNAL_DIR, "claude-mic-mute"), muted ? "1" : "0");
+      return;
+    }
+
+    // Restart server
+    if (msg === "restart") {
+      console.log("[restart] Restart requested from UI");
+      broadcast({ type: "restarting" });
+      setTimeout(() => process.exit(0), 500);
       return;
     }
 
@@ -1788,14 +1823,16 @@ function handleWsConnection(ws: WebSocket) {
       return;
     }
 
-    // Replay last spoken text
-    if (msg === "replay") {
-      if (lastSpokenText) {
-        console.log(`[replay] Re-speaking (${lastSpokenText.length} chars): "${lastSpokenText.slice(0, 80)}..."`);
+    // Replay last spoken text, or specific text via replay:TEXT
+    if (msg === "replay" || msg.startsWith("replay:")) {
+      const replayText = msg.startsWith("replay:") ? msg.slice(7) : lastSpokenText;
+      if (replayText) {
+        console.log(`[replay] Speaking (${replayText.length} chars): "${replayText.slice(0, 80)}..."`);
         stopClientPlayback();
-        speakText(lastSpokenText);
+        broadcast({ type: "voice_status", state: "speaking" });
+        speakText(replayText);
       } else {
-        console.log("[replay] No previous text to replay");
+        console.log("[replay] No text to replay");
       }
       return;
     }
@@ -1807,13 +1844,21 @@ function handleWsConnection(ws: WebSocket) {
         console.log(`[terminal] Text input: "${text}"`);
         broadcast({ type: "transcription", role: "user", text, ts: Date.now() });
         startTmuxStreaming(text);
-        sendToTmux(text);
+        terminal.sendText(text);
       }
       return;
     }
   });
 
-  ws.on("close", () => clients.delete(ws));
+  ws.on("close", () => {
+    clients.delete(ws);
+    // Last client disconnected — tell Claude voice panel is closed
+    if (clients.size === 0 && terminal.isSessionAlive()) {
+      terminal.sendText(MURMUR_EXIT);
+      contextSentAt = 0; // Reset so next app open resends context
+      console.log("[context] Sent Murmur exit message to Claude");
+    }
+  });
 }
 
 wss.on("connection", handleWsConnection);
@@ -1827,8 +1872,12 @@ app.get("/", (_req, res) => {
   res.sendFile(join(__dirname, "index.html"));
 });
 
+app.get("/manifest.json", (_req, res) => {
+  res.sendFile(join(__dirname, "manifest.json"));
+});
+
 app.get("/version", (_req, res) => {
-  res.json({ version: 15 });
+  res.json({ version: 47 });
 });
 
 app.get("/debug", (_req, res) => {
@@ -1845,8 +1894,8 @@ app.get("/info", (_req, res) => {
     pid: null as number | null,
     cwd: null as string | null,
     version: null as string | null,
-    tmuxSession: TMUX_SESSION,
-    tmuxAlive: isTmuxSessionAlive(),
+    tmuxSession: "claude-voice",
+    tmuxAlive: terminal.isSessionAlive(),
   };
   try {
     const ps = execSync(
@@ -1879,15 +1928,18 @@ app.get("/info", (_req, res) => {
 
 // --- Start ---
 
-createTmuxSession();
+// Initialize terminal manager (async — tmux on macOS, node-pty on Windows)
+terminal = await createTerminalManager();
+terminal.createSession();
+sendMurmurContext(5000);
 initSignalFiles();
 
 // Clean up orphaned TTS temp files from previous/crashed sessions
 try {
-  const tmpFiles = readdirSync("/tmp").filter(f => f.startsWith("murmur-tts-") && f.endsWith(".mp3"));
+  const tmpFiles = readdirSync(TEMP_DIR).filter(f => f.startsWith("murmur-tts-") && f.endsWith(".mp3"));
   if (tmpFiles.length > 0) {
     for (const f of tmpFiles) {
-      try { unlinkSync(join("/tmp", f)); } catch {}
+      try { unlinkSync(join(TEMP_DIR, f)); } catch {}
     }
     console.log(`Cleaned up ${tmpFiles.length} orphaned TTS temp file(s)`);
   }
@@ -1924,8 +1976,7 @@ setInterval(() => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Murmur: http://localhost:${PORT}`);
-  console.log(`tmux session: ${TMUX_SESSION}`);
-  console.log(`  Attach: tmux attach -t ${TMUX_SESSION}`);
+  console.log(`  Terminal backend: ${terminal.constructor.name}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);
   console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
 });

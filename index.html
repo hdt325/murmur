@@ -3,14 +3,18 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#1a1a1e">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.json">
 <title>Murmur</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro", "Helvetica Neue", sans-serif;
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: #1a1a1e;
+    color: #e0ddd8;
     height: 100vh;
     display: flex;
     flex-direction: column;
@@ -21,7 +25,7 @@
   /* --- Tooltip --- */
   .tooltip {
     position: fixed;
-    background: #0d1b36;
+    background: #222226;
     color: #aaa;
     font-size: 10px;
     padding: 3px 8px;
@@ -29,7 +33,7 @@
     white-space: nowrap;
     pointer-events: none;
     z-index: 100;
-    border: 1px solid #0f3460;
+    border: 1px solid #333338;
     opacity: 0;
     transition: opacity 0.12s;
   }
@@ -41,11 +45,13 @@
     align-items: center;
     gap: 8px;
     padding: 6px 14px;
-    background: #16213e;
-    border-bottom: 1px solid #0f3460;
+    background: #222226;
+    border-bottom: 1px solid #333338;
     height: 28px;
     flex-shrink: 0;
+    -webkit-app-region: drag; /* Electron: makes header a drag handle */
   }
+  .header * { -webkit-app-region: no-drag; /* Allow clicks on child elements */ }
 
   .header .status-dot {
     width: 8px;
@@ -58,8 +64,9 @@
 
   .header .status-dot.green { background: #2ecc71; }
   .header .status-dot.red { background: #e74c3c; animation: pulse-dot 1s ease-in-out infinite; }
+  .header .status-dot.orange { background: #f39c12; animation: pulse-dot 1.2s ease-in-out infinite; }
   .header .status-dot.yellow { background: #f1c40f; animation: pulse-dot 1.5s ease-in-out infinite; }
-  .header .status-dot.blue { background: #5dade2; }
+  .header .status-dot.gold { background: #c9b07c; }
   .header .status-dot.gray { background: #555; }
 
   @keyframes pulse-dot {
@@ -99,10 +106,24 @@
     letter-spacing: 0.3px;
   }
 
-  /* --- Mic Meter --- */
+  .svc-restart {
+    background: none;
+    border: none;
+    color: #666;
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+    transition: color 0.2s;
+  }
+  .svc-restart:hover { color: #e0d8d5; }
+  .svc-restart.spinning { animation: spin 0.8s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  /* --- Mic Meter (hidden, folded into talk button) --- */
   .mic-meter {
-    height: 6px;
-    background: #111827;
+    height: 0;
+    overflow: hidden;
     position: relative;
     flex-shrink: 0;
   }
@@ -112,25 +133,56 @@
     height: 100%;
     display: block;
   }
+  .mic-meter.muted canvas { opacity: 0; }
 
   /* --- Transcript --- */
   .transcript {
     flex: 1;
     min-height: 20vh;
     overflow-y: auto;
-    padding: 10px 12px;
+    padding: 0 12px 10px;
     display: flex;
     flex-direction: column;
     gap: 6px;
   }
 
   .transcript::-webkit-scrollbar { width: 3px; }
-  .transcript::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 2px; }
+  .transcript::-webkit-scrollbar-thumb { background: #2c2c32; border-radius: 2px; }
+
+  .conv-toolbar {
+    position: sticky;
+    top: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    z-index: 10;
+    padding: 4px 6px;
+    background: rgba(26, 26, 30, 0.85);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-bottom: 1px solid #2c2c32;
+    margin: 0 -12px 4px;
+  }
+  .conv-toolbar button {
+    background: #2c2c32;
+    border: 1px solid #3e4451;
+    border-radius: 4px;
+    color: #abb2bf;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 2px 8px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .conv-toolbar button:hover { color: #e5e5e5; border-color: #4b5263; background: #3e4451; }
+  .conv-toolbar button.active { color: #e0d8d5; }
+  .conv-toolbar-spacer { flex: 1; }
 
   .msg {
     padding: 7px 10px;
     border-radius: 10px;
-    font-size: 12.5px;
+    font-size: var(--chat-font-size, 12.5px);
     line-height: 1.4;
     max-width: 88%;
     word-wrap: break-word;
@@ -163,17 +215,47 @@
   }
 
   .msg.user {
-    background: #1a3a6a;
+    background: #2c2c32;
     align-self: flex-end;
     border-bottom-right-radius: 3px;
   }
 
   .msg.assistant {
-    background: #1a1a40;
-    border: 1px solid #2a2a5a;
+    background: #222226;
+    border: 1px solid #333338;
     align-self: flex-start;
     border-bottom-left-radius: 3px;
   }
+
+  .msg.user.bubble-active {
+    border: 1.5px solid #e74c3c;
+    transition: border-color 0.3s;
+  }
+  .msg.assistant.bubble-active {
+    border-color: #c9b07c;
+    transition: border-color 0.3s;
+  }
+
+  .msg-wrap {
+    position: relative;
+    align-self: flex-start;
+    max-width: 88%;
+  }
+  .msg-wrap .msg { max-width: 100%; }
+  .msg-replay {
+    position: absolute;
+    top: 2px;
+    right: -28px;
+    background: none;
+    border: 1px solid #333338;
+    border-radius: 4px;
+    color: #9a9aa0;
+    font-size: 10px;
+    padding: 1px 5px;
+    cursor: pointer;
+    opacity: 0.5;
+  }
+  .msg-replay:hover { opacity: 1; color: #e8636b; border-color: #e8636b88; }
 
   .msg .meta {
     display: flex;
@@ -190,8 +272,8 @@
     font-weight: 600;
   }
 
-  .msg.user .role { color: #5dade2; }
-  .msg.assistant .role { color: #2ecc71; }
+  .msg.user .role { color: #e74c3c; }
+  .msg.assistant .role { color: #c9b07c; }
 
   .msg .time {
     font-size: 9px;
@@ -211,8 +293,8 @@
 
   /* Thinking placeholder */
   .msg.thinking {
-    background: #1a1a40;
-    border: 1px solid #2a2a5a;
+    background: #222226;
+    border: 1px solid #333338;
     align-self: flex-start;
     border-bottom-left-radius: 3px;
     color: #888;
@@ -243,17 +325,17 @@
   /* --- Talk Button --- */
   .talk-bar {
     padding: 8px 12px;
-    background: #16213e;
-    border-top: 1px solid #0f3460;
+    background: #222226;
+    border-top: 1px solid #333338;
     flex-shrink: 0;
   }
 
   .talk-bar button {
     width: 100%;
     padding: 16px 0;
-    border: 2px solid #0f3460;
+    border: 2px solid #333338;
     border-radius: 14px;
-    background: #1a1a2e;
+    background: #1a1a1e;
     color: #888;
     font-size: 13px;
     font-weight: 500;
@@ -265,15 +347,75 @@
     justify-content: center;
     gap: 6px;
     height: 52px;
+    position: relative;
+    overflow: hidden;
   }
 
-  .talk-bar button:hover { background: #0f3460; color: #e0e0e0; }
-  .talk-bar button:active { transform: scale(0.97); }
+  #talkWaveCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: none;
+    pointer-events: none;
+  }
 
-  .talk-bar button .mic-icon {
-    font-size: 14px;
+  .talk-wave-label {
+    position: relative;
+    z-index: 1;
+    font-size: 12px;
+    font-weight: 600;
+    background: rgba(26, 26, 30, 0.85);
+    padding: 4px 14px;
+    border-radius: 8px;
+    pointer-events: none;
+  }
+  .talk-bar button.recording .talk-wave-label { color: #e74c3c; }
+  .talk-bar button.speaking .talk-wave-label { color: #c9b07c; }
+
+  .talk-bar button.idle-state {
+    flex-direction: column;
+    gap: 1px;
+    padding: 4px 0;
+  }
+  .talk-bar button.idle-state .murmur-icon {
+    width: 64px;
+    height: 22px;
+  }
+  .talk-bar button.idle-state.mode-read {
+    border-color: #3a7ca5;
+    background: #3a7ca512;
+  }
+  .talk-bar button.idle-state.mode-read .murmur-icon { color: #3a7ca5; }
+  .talk-bar button.idle-state.mode-read .talk-idle-hint { color: #3a7ca5; }
+
+  .talk-bar button.idle-state.mode-type {
+    border-color: #555;
+    background: #1a1a1e;
     opacity: 0.5;
   }
+  .talk-bar button.idle-state.mode-type .talk-idle-hint { color: #888; }
+
+  .talk-idle-hint {
+    font-size: 9px;
+    color: #666;
+    letter-spacing: 0.3px;
+  }
+
+  .talk-bar button:hover { background: #2a2a30; border-color: #55555a; color: #e0d8d5; }
+  .talk-bar button:active { transform: scale(0.97); }
+
+  .talk-bar button .murmur-icon {
+    width: 56px;
+    height: 24px;
+    color: #e8636b;
+    opacity: 0.6;
+    flex-shrink: 0;
+  }
+  .talk-bar button.recording .murmur-icon { opacity: 1; color: #e74c3c; }
+  .talk-bar button.ready-to-listen .murmur-icon { opacity: 0.8; color: #2ecc71; }
+  .talk-bar button.speaking .murmur-icon { opacity: 0.8; color: #c9b07c; }
 
   .talk-bar button.recording {
     border-color: #e74c3c;
@@ -306,9 +448,9 @@
   }
 
   .talk-bar button.speaking {
-    border-color: #5dade2;
-    background: #5dade218;
-    color: #5dade2;
+    border-color: #c9b07c;
+    background: #c9b07c18;
+    color: #c9b07c;
     cursor: pointer;
   }
 
@@ -337,69 +479,117 @@
   /* --- Controls Row --- */
   .controls {
     display: flex;
-    gap: 4px;
-    padding: 6px 12px 8px;
-    background: #16213e;
+    gap: 3px;
+    padding: 6px 8px 0;
+    background: #222226;
     flex-shrink: 0;
-    height: 36px;
+    height: 30px;
+    flex-wrap: nowrap;
+    justify-content: center;
   }
 
   .controls button {
-    flex: 1;
     padding: 0;
-    border: 1px solid #0f3460;
-    border-radius: 6px;
-    background: #1a1a2e;
-    color: #e0e0e0;
-    font-size: 11px;
-    font-weight: 500;
+    border: 1px solid #333338;
+    border-radius: 5px;
+    background: #1a1a1e;
+    color: #e0d8d5;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
     cursor: pointer;
     transition: all 0.12s;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 3px;
+    width: 28px;
+    flex-shrink: 0;
   }
 
-  .controls button:hover { background: #0f3460; }
+  .controls button:hover { background: #2a2a30; }
   .controls button:active { transform: scale(0.96); }
 
-  .controls button.stop { border-color: #c0392b; color: #e74c3c; }
-  .controls button.stop:hover { background: #e74c3c22; }
+  .controls button.stop { border-color: #333338; color: #e74c3c; font-size: 9px; }
+  .controls button.stop:hover { background: #e74c3c22; border-color: #e74c3c88; }
 
-  .controls button.mute { border-color: #e67e22; color: #e67e22; }
-  .controls button.mute:hover { background: #e67e2222; }
-  .controls button.mute.muted { background: #e67e2233; color: #f39c12; border-color: #f39c12; }
+  .controls button.mute-btn { color: #e74c3c; width: 28px; padding: 0; }
+  .controls button.mute-btn svg { display: block; }
+  .controls button.mute-btn.active { color: #555; opacity: 0.5; }
+
+  .controls button.mode-btn {
+    width: auto;
+    padding: 0 5px;
+    color: #e8636b;
+    border-color: #e8636b66;
+  }
+  .controls button.mode-btn:hover { background: #ffffff08; }
+  .controls button.mode-btn.active { color: #2ecc71; border-color: #2ecc7166; }
 
   .controls button.speed {
-    border-color: #5dade2;
-    color: #5dade2;
+    border-color: #333338;
+    color: #9a9aa0;
     font-variant-numeric: tabular-nums;
-    flex: 0.7;
+    width: auto;
+    padding: 0 5px;
   }
-  .controls button.speed:hover { background: #5dade222; }
+  .controls button.speed:hover { background: #2a2a30; }
 
   .controls button.voice-btn {
-    border-color: #0f3460;
+    border-color: #333338;
     color: #888;
-    flex: 1.3;
-    font-size: 10px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    padding: 0 6px;
+    padding: 0 5px;
+    width: auto;
   }
-  .controls button.voice-btn:hover { background: #0f3460; color: #e0e0e0; }
+  .controls button.voice-btn:hover { background: #2a2a30; color: #e0d8d5; }
+
+  /* Text input bar (between controls and terminal) */
+  .input-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px calc(6px + env(safe-area-inset-bottom, 0px));
+    background: #222226;
+    flex-shrink: 0;
+  }
+  .input-bar input {
+    flex: 1;
+    background: #1a1a1e;
+    border: 1px solid #333338;
+    border-radius: 6px;
+    color: #e0d8d5;
+    font-size: 12px;
+    padding: 6px 10px;
+    outline: none;
+    font-family: inherit;
+  }
+  .input-bar input { user-select: text; -webkit-user-select: text; }
+  .input-bar input:focus { border-color: #e8636b88; }
+  .input-bar button {
+    background: #e8636b;
+    border: none;
+    border-radius: 6px;
+    color: #fff;
+    font-size: 12px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .input-bar button:hover { background: #d4545c; }
 
   /* Voice select popover */
   .voice-popover {
     display: none;
     position: fixed;
-    bottom: 50px;
+    bottom: 80px;
     left: 12px;
     right: 12px;
-    background: #16213e;
-    border: 1px solid #0f3460;
+    background: #222226;
+    border: 1px solid #333338;
     border-radius: 8px;
     padding: 8px;
     z-index: 50;
@@ -411,14 +601,14 @@
 
   .voice-popover .voice-option {
     padding: 5px 8px;
-    font-size: 11px;
+    font-size: 12px;
     color: #aaa;
     cursor: pointer;
     border-radius: 4px;
   }
 
-  .voice-popover .voice-option:hover { background: #0f3460; color: #e0e0e0; }
-  .voice-popover .voice-option.selected { color: #5dade2; font-weight: 600; }
+  .voice-popover .voice-option:hover { background: #2c2c32; color: #e0d8d5; }
+  .voice-popover .voice-option.selected { color: #b0b0b8; font-weight: 600; }
 
   .voice-popover .voice-group {
     font-size: 9px;
@@ -430,11 +620,10 @@
   }
 
   .voice-popover::-webkit-scrollbar { width: 3px; }
-  .voice-popover::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 2px; }
+  .voice-popover::-webkit-scrollbar-thumb { background: #2c2c32; border-radius: 2px; }
 
   /* --- Terminal Panel --- */
   .terminal-panel {
-    height: 0;
     overflow: hidden;
     transition: height 0.3s ease;
     flex-shrink: 0;
@@ -442,6 +631,7 @@
     border-top: 1px solid #3e4451;
     display: flex;
     flex-direction: column;
+    height: 25px;
   }
   .terminal-panel.open {
     height: 35vh;
@@ -458,7 +648,7 @@
   }
   .terminal-header span {
     font-size: 11px;
-    color: #61afef;
+    color: #888;
     font-weight: 600;
   }
   .terminal-header .term-controls button {
@@ -486,60 +676,12 @@
   }
   .terminal-output::-webkit-scrollbar { width: 3px; }
   .terminal-output::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-  .terminal-input-row {
-    display: flex;
-    align-items: center;
-    padding: 4px 8px calc(6px + env(safe-area-inset-bottom, 4px));
-    gap: 6px;
-    background: #21252b;
-    border-top: 1px solid #3e4451;
-    flex-shrink: 0;
-  }
-  .terminal-input-row span {
-    color: #c678dd;
-    font-family: "SF Mono", "Menlo", "Consolas", monospace;
-    font-size: 11px;
-  }
-  .terminal-input-row input {
-    flex: 1;
-    background: #282c34;
-    border: 1px solid #3e4451;
-    border-radius: 4px;
-    color: #abb2bf;
-    font-family: "SF Mono", "Menlo", "Consolas", monospace;
-    font-size: 11px;
-    padding: 4px 8px;
-    outline: none;
-  }
-  .terminal-input-row input:focus { border-color: #61afef; }
-  .terminal-input-row button {
-    background: #98c379;
-    border: none;
-    border-radius: 4px;
-    color: #282c34;
-    font-size: 11px;
-    padding: 4px 10px;
-    cursor: pointer;
-    font-weight: 600;
-  }
-  .terminal-input-row button:hover { background: #7cb668; }
 
-  .controls button.term-btn {
-    border-color: #27ae60;
-    color: #27ae60;
-    flex: 0.6;
-  }
-  .controls button.term-btn:hover { background: #27ae6022; }
-  .controls button.term-btn.active { background: #27ae6033; color: #2ecc71; border-color: #2ecc71; }
   .controls button.replay-btn {
-    border-color: #9b59b6;
-    color: #9b59b6;
-    flex: 0.6;
+    border-color: #333338;
+    color: #9a9aa0;
   }
-  .controls button.replay-btn:hover { background: #9b59b622; }
-  .controls button.voiced-btn { border-color: #f39c12; color: #f39c12; flex: 0.7; }
-  .controls button.voiced-btn:hover { background: #f39c1222; }
-  .controls button.voiced-btn.active { background: #f39c1233; color: #f1c40f; border-color: #f1c40f; }
+  .controls button.replay-btn:hover { background: #2a2a30; }
   .term-controls { display: flex; gap: 4px; align-items: center; }
   .term-controls button {
     background: #2c313a;
@@ -553,6 +695,35 @@
     text-align: center;
   }
   .term-controls button:hover { color: #e5e5e5; border-color: #4b5263; background: #3e4451; }
+
+  .term-nav {
+    display: none;
+    gap: 4px;
+    padding: 4px 10px;
+    background: #21252b;
+    border-bottom: 1px solid #3e4451;
+    flex-shrink: 0;
+  }
+  .term-nav.show { display: flex; }
+  .term-nav button {
+    background: #2c313a;
+    border: 1px solid #3e4451;
+    border-radius: 4px;
+    color: #abb2bf;
+    font-size: 12px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .term-nav button:hover { color: #e5e5e5; border-color: #4b5263; background: #3e4451; }
+  .term-nav button:active { transform: scale(0.95); }
+  .term-nav button.term-nav-enter {
+    background: #e8636b;
+    border-color: #e8636b;
+    color: #fff;
+    flex: 1;
+  }
+  .term-nav button.term-nav-enter:hover { background: #d4545c; }
 </style>
 </head>
 <body>
@@ -564,6 +735,7 @@
   <div class="svc-indicators">
     <span class="svc-label">STT</span><div class="svc-dot" id="svcWhisper" data-tip="Whisper STT"></div>
     <span class="svc-label">TTS</span><div class="svc-dot" id="svcKokoro" data-tip="Kokoro TTS"></div>
+    <button class="svc-restart" id="restartBtn" data-tip="Restart Murmur server">⟳</button>
   </div>
 </div>
 
@@ -574,65 +746,90 @@
 
 <!-- Section 3: Transcript -->
 <div class="transcript" id="transcript">
+  <div class="conv-toolbar" id="convToolbar">
+    <button id="cleanBtn" class="active" data-tip="Toggle verbose streaming output">Clean</button>
+    <span class="conv-toolbar-spacer"></span>
+    <button id="chatZoomOut" data-tip="Decrease font size">−</button>
+    <button id="chatZoomIn" data-tip="Increase font size">+</button>
+  </div>
   <div class="empty-state" id="emptyState">Press Right ⌘ or tap to talk</div>
 </div>
 
 <!-- Section 4: Talk button -->
 <div class="talk-bar">
-  <button id="talkBtn"><span class="mic-icon">🎙</span> Press Right ⌘ or tap to talk</button>
+  <button id="talkBtn" data-tip="Auto-listens when it detects your voice"><canvas id="talkWaveCanvas"></canvas><svg viewBox="0 0 80 24" class="murmur-icon"><polyline points="2.0,12.0 2.6,12.2 3.3,12.2 3.9,11.8 4.5,11.6 5.2,11.6 5.8,12.0 6.4,12.6 7.1,13.5 7.7,11.1 8.3,10.2 9.0,12.3 9.6,12.7 10.2,13.3 10.9,12.1 11.5,11.5 12.1,10.5 12.8,10.7 13.4,13.8 14.0,15.2 14.7,10.5 15.3,10.0 15.9,11.2 16.6,12.0 17.2,14.1 17.8,13.1 18.5,13.0 19.1,8.7 19.7,8.9 20.4,14.8 21.0,15.7 21.6,11.3 22.3,11.0 22.9,9.5 23.5,10.9 24.2,13.4 24.8,15.0 25.4,15.2 26.1,6.6 26.7,8.3 27.3,14.2 28.0,14.8 28.6,13.4 29.2,12.5 29.9,8.8 30.5,9.1 31.1,11.2 31.8,17.7 32.4,16.5 33.0,6.0 33.7,9.3 34.3,11.4 34.9,13.6 35.6,15.4 36.2,14.5 36.8,9.9 37.5,6.2 38.1,9.1 38.7,19.7 39.4,16.1 40.0,8.4 40.6,10.7 41.3,7.9 41.9,12.2 42.5,15.2 43.2,17.0 43.8,11.7 44.4,4.8 45.1,9.2 45.7,17.3 46.3,14.1 47.0,12.8 47.6,11.8 48.2,7.2 48.9,10.5 49.5,13.3 50.1,18.3 50.8,12.4 51.4,6.4 52.0,10.3 52.7,13.4 53.3,12.9 53.9,15.2 54.6,12.6 55.2,8.6 55.8,9.0 56.5,12.2 57.1,17.8 57.7,12.1 58.4,9.7 59.0,10.9 59.6,10.6 60.3,12.4 60.9,15.1 61.5,13.4 62.2,10.2 62.8,8.6 63.4,12.0 64.1,15.4 64.7,12.0 65.3,12.4 66.0,11.0 66.6,10.0 67.2,11.8 67.9,13.9 68.5,13.8 69.1,11.2 69.8,9.8 70.4,12.0 71.0,12.8 71.7,12.2 72.3,13.1 72.9,11.5 73.6,11.0 74.2,11.5 74.8,12.6 75.5,12.8 76.1,11.8 76.7,11.7 77.4,12.0 78.0,12.0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Press Right ⌘ or tap to talk</button>
 </div>
 
-<!-- Section 5: Controls -->
+<!-- Section 5: Controls + Input -->
 <div class="controls">
-  <button class="stop" id="stopBtn" data-tip="Stop Claude + TTS">Stop</button>
-  <button class="mute" id="muteBtn" data-tip="Mute mic">Mute</button>
+  <button class="stop" id="stopBtn" data-tip="Stop Claude + TTS">■</button>
+  <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+  <button class="mode-btn" id="modeBtn" data-tip="Voice ↔ Voice">Voice</button>
+  <button class="replay-btn" id="replayBtn" data-tip="Replay last">↻</button>
   <button class="speed" id="speedBtn" data-tip="TTS speed">1x</button>
   <button class="voice-btn" id="voiceBtn" data-tip="Change voice">...</button>
-  <button class="replay-btn" id="replayBtn" data-tip="Replay last response">Replay</button>
-  <button class="voiced-btn" id="voicedBtn" data-tip="Show only voiced output">Voiced</button>
-  <button class="term-btn" id="termBtn" data-tip="Terminal">Term</button>
+</div>
+<div class="input-bar">
+  <input type="text" id="textInput" placeholder="Type a message..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+  <button id="textSendBtn">Send</button>
 </div>
 
 <!-- Section 6: Terminal Panel -->
 <div class="terminal-panel" id="terminalPanel">
   <div class="terminal-header" id="terminalHeader">
-    <span>▼ Terminal</span>
+    <span id="termToggleLabel">▶ Terminal</span>
     <div class="term-controls">
       <button id="termZoomOut">−</button>
       <button id="termZoomIn">+</button>
       <button id="termClearBtn" style="color:#e06c75">Clear</button>
     </div>
   </div>
-  <pre class="terminal-output" id="terminalOutput"></pre>
-  <div class="terminal-input-row">
-    <span>&gt;</span>
-    <input type="text" id="terminalInput" placeholder="type a message..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-    <button id="termSendBtn">Send</button>
+  <div class="term-nav" id="termNav">
+    <button id="termKeyUp">▲</button>
+    <button id="termKeyDown">▼</button>
+    <button id="termKeyEnter" class="term-nav-enter">Enter</button>
+    <button id="termKeyEsc">Esc</button>
+    <button id="termKeyTab">Tab</button>
   </div>
+  <pre class="terminal-output" id="terminalOutput"></pre>
 </div>
 
 <!-- Voice selection popover -->
 <div class="voice-popover" id="voicePopover">
   <div class="voice-group">American English</div>
-  <div class="voice-option" data-voice="af_sky">af_sky</div>
-  <div class="voice-option" data-voice="af_heart">af_heart</div>
-  <div class="voice-option" data-voice="af_nova">af_nova</div>
-  <div class="voice-option" data-voice="am_adam">am_adam</div>
-  <div class="voice-option" data-voice="am_echo">am_echo</div>
+  <div class="voice-option" data-voice="af_sky">Sky ♀</div>
+  <div class="voice-option" data-voice="af_heart">Heart ♀</div>
+  <div class="voice-option" data-voice="af_nova">Nova ♀</div>
+  <div class="voice-option" data-voice="am_adam">Adam ♂</div>
+  <div class="voice-option" data-voice="am_echo">Echo ♂</div>
   <div class="voice-group">British English</div>
-  <div class="voice-option" data-voice="bf_emma">bf_emma</div>
-  <div class="voice-option" data-voice="bf_alice">bf_alice</div>
-  <div class="voice-option" data-voice="bm_george">bm_george</div>
-  <div class="voice-option" data-voice="bm_daniel">bm_daniel</div>
+  <div class="voice-option" data-voice="bf_emma">Emma ♀</div>
+  <div class="voice-option" data-voice="bf_alice">Alice ♀</div>
+  <div class="voice-option" data-voice="bm_george">George ♂</div>
+  <div class="voice-option" data-voice="bm_daniel">Daniel ♂</div>
   <div class="voice-group">Other</div>
-  <div class="voice-option" data-voice="ff_siwis">ff_siwis (French)</div>
-  <div class="voice-option" data-voice="ef_dora">ef_dora (Spanish)</div>
-  <div class="voice-option" data-voice="jf_alpha">jf_alpha (Japanese)</div>
-  <div class="voice-option" data-voice="zf_xiaoxiao">zf_xiaoxiao (Chinese)</div>
+  <div class="voice-option" data-voice="ff_siwis">Siwis (FR)</div>
+  <div class="voice-option" data-voice="ef_dora">Dora (ES)</div>
+  <div class="voice-option" data-voice="jf_alpha">Alpha (JP)</div>
+  <div class="voice-option" data-voice="zf_xiaoxiao">Xiaoxiao (ZH)</div>
 </div>
 
 <script>
-  const PAGE_VERSION = 15; // Bump this when making changes that require reload
+  const PAGE_VERSION = 47; // Bump this when making changes that require reload
+
+  // Friendly voice name lookup
+  const VOICE_NAMES = {
+    af_sky: "Sky", af_heart: "Heart", af_nova: "Nova",
+    am_adam: "Adam", am_echo: "Echo",
+    bf_emma: "Emma", bf_alice: "Alice",
+    bm_george: "George", bm_daniel: "Daniel",
+    ff_siwis: "Siwis (FR)", ef_dora: "Dora (ES)",
+    jf_alpha: "Alpha (JP)", zf_xiaoxiao: "Xiaoxiao (ZH)"
+  };
+  function friendlyVoice(raw) { return VOICE_NAMES[raw] || raw; }
+
+  // Inline murmur waveform SVG for talk button
+  const MURMUR_SVG = '<svg viewBox="0 0 80 24" class="murmur-icon"><polyline points="2.0,12.0 2.6,12.2 3.3,12.2 3.9,11.8 4.5,11.6 5.2,11.6 5.8,12.0 6.4,12.6 7.1,13.5 7.7,11.1 8.3,10.2 9.0,12.3 9.6,12.7 10.2,13.3 10.9,12.1 11.5,11.5 12.1,10.5 12.8,10.7 13.4,13.8 14.0,15.2 14.7,10.5 15.3,10.0 15.9,11.2 16.6,12.0 17.2,14.1 17.8,13.1 18.5,13.0 19.1,8.7 19.7,8.9 20.4,14.8 21.0,15.7 21.6,11.3 22.3,11.0 22.9,9.5 23.5,10.9 24.2,13.4 24.8,15.0 25.4,15.2 26.1,6.6 26.7,8.3 27.3,14.2 28.0,14.8 28.6,13.4 29.2,12.5 29.9,8.8 30.5,9.1 31.1,11.2 31.8,17.7 32.4,16.5 33.0,6.0 33.7,9.3 34.3,11.4 34.9,13.6 35.6,15.4 36.2,14.5 36.8,9.9 37.5,6.2 38.1,9.1 38.7,19.7 39.4,16.1 40.0,8.4 40.6,10.7 41.3,7.9 41.9,12.2 42.5,15.2 43.2,17.0 43.8,11.7 44.4,4.8 45.1,9.2 45.7,17.3 46.3,14.1 47.0,12.8 47.6,11.8 48.2,7.2 48.9,10.5 49.5,13.3 50.1,18.3 50.8,12.4 51.4,6.4 52.0,10.3 52.7,13.4 53.3,12.9 53.9,15.2 54.6,12.6 55.2,8.6 55.8,9.0 56.5,12.2 57.1,17.8 57.7,12.1 58.4,9.7 59.0,10.9 59.6,10.6 60.3,12.4 60.9,15.1 61.5,13.4 62.2,10.2 62.8,8.6 63.4,12.0 64.1,15.4 64.7,12.0 65.3,12.4 66.0,11.0 66.6,10.0 67.2,11.8 67.9,13.9 68.5,13.8 69.1,11.2 69.8,9.8 70.4,12.0 71.0,12.8 71.7,12.2 72.3,13.1 72.9,11.5 73.6,11.0 74.2,11.5 74.8,12.6 75.5,12.8 76.1,11.8 76.7,11.7 77.4,12.0 78.0,12.0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
   // Remote logging — send key client events to server for debugging
   function rlog(msg) {
@@ -649,25 +846,43 @@
   const voiceBtn = document.getElementById("voiceBtn");
   const voicePopover = document.getElementById("voicePopover");
   const talkBtn = document.getElementById("talkBtn");
-  const termBtn = document.getElementById("termBtn");
   const terminalPanel = document.getElementById("terminalPanel");
   const terminalOutput = document.getElementById("terminalOutput");
-  const terminalInput = document.getElementById("terminalInput");
-  const termSendBtn = document.getElementById("termSendBtn");
+  const terminalInput = document.getElementById("textInput");
+  const termSendBtn = document.getElementById("textSendBtn");
   const termClearBtn = document.getElementById("termClearBtn");
   const termZoomIn = document.getElementById("termZoomIn");
   const termZoomOut = document.getElementById("termZoomOut");
   const terminalHeader = document.getElementById("terminalHeader");
-  const voicedBtn = document.getElementById("voicedBtn");
-  let terminalOpen = localStorage.getItem("term-open") !== "0";
+  const modeBtn = document.getElementById("modeBtn");
+  const cleanBtn = document.getElementById("cleanBtn");
+
+  // Steal focus from macOS window chrome (close button) on launch
+  document.body.setAttribute("tabindex", "-1");
+  document.body.focus();
+
+  // Interaction modes: voice↔voice, text→voice, voice→text
+  const MODES = [
+    { id: "full",   label: "Voice", tip: "Voice mode: speak to Claude, hear responses aloud",  micOn: true,  ttsOn: true  },
+    { id: "type",   label: "Type",  tip: "Type mode: type input, hear responses aloud",         micOn: false, ttsOn: true  },
+    { id: "listen", label: "Read",  tip: "Read mode: speak to Claude, read responses as text",  micOn: true,  ttsOn: false },
+  ];
+  let modeIdx = parseInt(localStorage.getItem("murmur-mode") || "1") % MODES.length;
+
+  let terminalOpen = localStorage.getItem("term-open") === "1";
   let termAutoScroll = true;
-  let voicedOnly = localStorage.getItem("voiced-only") === "1";
+  let voicedOnly = localStorage.getItem("voiced-only") !== "0";
+  function applyCleanMode() {
+    cleanBtn.textContent = voicedOnly ? "Clean" : "Verbose";
+    cleanBtn.classList.toggle("active", voicedOnly);
+  }
+  applyCleanMode();
   let termFontSize = parseInt(localStorage.getItem("term-font-size") || "10");
 
   // Restore terminal state on load
   if (terminalOpen) {
     terminalPanel.classList.add("open");
-    termBtn.classList.add("active");
+    document.getElementById("termToggleLabel").textContent = "▼ Terminal";
   }
   // Cached terminal output — rendered after ansiToHtml is defined below
   const cachedTerminal = localStorage.getItem("term-output");
@@ -717,11 +932,39 @@
 
   restoreHistory();
 
-  // Voiced-only toggle init
-  if (voicedOnly) {
-    voicedBtn.classList.add("active");
-    voicedBtn.textContent = "Voiced \u2713";
+  // Global state
+  let ws;
+  let reconnectTimer;
+  let muted = false;
+  let _statusDebounceTimer = null;
+  let ttsMuted = false;
+  let currentVoice = "";
+  let thinkingBubble = null;
+
+  // Apply saved interaction mode
+  let _modeReady = false;
+  function applyMode() {
+    const m = MODES[modeIdx];
+    modeBtn.textContent = m.label;
+    modeBtn.setAttribute("data-tip", m.tip);
+    muted = !m.micOn;
+    ttsMuted = !m.ttsOn;
+    document.getElementById("micMeter").classList.toggle("muted", muted);
+    talkBtn.style.opacity = m.micOn ? "1" : "0.4";
+    talkBtn.style.pointerEvents = m.micOn ? "auto" : "none";
+    // Sync mute button visual
+    muteBtn.classList.toggle("active", muted);
+    if (ws?.readyState === WebSocket.OPEN) ws.send("mute:" + (muted ? "1" : "0"));
+    if (_modeReady && muted && isRecording) stopRecording();
+    localStorage.setItem("murmur-mode", String(modeIdx));
+    // Refresh idle button to show mode-specific styling
+    if (_modeReady && !isRecording && !talkBtn.classList.contains("speaking") &&
+        !talkBtn.classList.contains("thinking") && !talkBtn.classList.contains("responding") &&
+        !talkBtn.classList.contains("transcribing") && !talkBtn.classList.contains("recording")) {
+      setTalkState("idle");
+    }
   }
+  applyMode();
 
   // Terminal font size init
   terminalOutput.style.fontSize = termFontSize + "px";
@@ -842,12 +1085,6 @@
     return out;
   }
 
-  let ws;
-  let reconnectTimer;
-  let muted = false;
-  let currentVoice = "";
-  let thinkingBubble = null;
-
   // =============================================
   // Status dot + text state management
   // =============================================
@@ -864,12 +1101,14 @@
         statusDot.classList.add("red");
         break;
       case "transcribing":
+        statusDot.classList.add("orange");
+        break;
       case "thinking":
       case "responding":
         statusDot.classList.add("yellow");
         break;
       case "speaking":
-        statusDot.classList.add("blue");
+        statusDot.classList.add("gold");
         break;
       case "disconnected":
         statusDot.classList.add("gray");
@@ -913,6 +1152,9 @@
   let micAnimFrame = null;
   let micSmoothLevel = 0;
   let micPeakDecay = 0;
+  let talkWaveFrame = null;
+  const talkWaveCanvas = document.getElementById("talkWaveCanvas");
+  const talkWaveCtx = talkWaveCanvas.getContext("2d");
 
   let ttsAudioCtx = null; // Shared AudioContext for TTS playback (unlocked via mic permission)
 
@@ -925,10 +1167,13 @@
       const audioCtx = new AudioContext();
       ttsAudioCtx = audioCtx; // Share for TTS playback
       const source = audioCtx.createMediaStreamSource(stream);
+      const micGain = audioCtx.createGain();
+      micGain.gain.value = 3.0; // Boost mic signal for analyser
       micAnalyser = audioCtx.createAnalyser();
       micAnalyser.fftSize = 256;
       micAnalyser.smoothingTimeConstant = 0.4;
-      source.connect(micAnalyser);
+      source.connect(micGain);
+      micGain.connect(micAnalyser);
       micDataArray = new Float32Array(micAnalyser.fftSize);
 
       // Rolling audio buffer: captures last ~400ms of mic audio continuously
@@ -998,7 +1243,7 @@
       const barH = H - 1;
       const barY = 0;
 
-      micCtx.fillStyle = "#0a0f1f";
+      micCtx.fillStyle = "#151518";
       micCtx.fillRect(pad, barY, barMaxW, barH);
 
       const barW = micSmoothLevel * barMaxW;
@@ -1020,6 +1265,75 @@
     }
 
     micAnimFrame = requestAnimationFrame(drawMicMeter);
+  }
+
+  let talkWaveColor = "#e74c3c";
+  let talkWaveAnalyserRef = null;
+  let talkWaveDataRef = null;
+
+  function drawTalkWaveform() {
+    const analyser = talkWaveAnalyserRef;
+    const dataArray = talkWaveDataRef;
+    if (!analyser || !dataArray) { talkWaveFrame = null; return; }
+    const canvas = talkWaveCanvas;
+    const ctx = talkWaveCtx;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0) { talkWaveFrame = null; return; }
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const W = rect.width;
+    const H = rect.height;
+
+    analyser.getFloatTimeDomainData(dataArray);
+    ctx.clearRect(0, 0, W, H);
+
+    // Compact centered waveform — similar style to the Murmur icon
+    const NUM_BARS = 40;
+    const barGap = 2;
+    const barWidth = 2;
+    const totalWidth = NUM_BARS * (barWidth + barGap) - barGap;
+    const startX = (W - totalWidth) / 2;
+    const midY = H / 2;
+    const maxAmp = H * 0.4;
+    const samplesPerBar = Math.floor(dataArray.length / NUM_BARS);
+
+    ctx.fillStyle = talkWaveColor;
+    ctx.lineCap = "round";
+
+    for (let i = 0; i < NUM_BARS; i++) {
+      let sum = 0;
+      const offset = i * samplesPerBar;
+      for (let j = 0; j < samplesPerBar; j++) {
+        const v = dataArray[offset + j];
+        sum += v * v;
+      }
+      let rms = Math.sqrt(sum / samplesPerBar);
+      let barH = Math.max(2, rms * maxAmp * 8);
+      const x = startX + i * (barWidth + barGap);
+      const y = midY - barH / 2;
+      ctx.beginPath();
+      ctx.roundRect(x, y, barWidth, barH, 1);
+      ctx.fill();
+    }
+
+    talkWaveFrame = requestAnimationFrame(drawTalkWaveform);
+  }
+
+  function startTalkWaveform(color, analyser, dataArray) {
+    talkWaveColor = color || "#e74c3c";
+    talkWaveAnalyserRef = analyser || micAnalyser;
+    talkWaveDataRef = dataArray || micDataArray;
+    talkWaveCanvas.style.display = "block";
+    if (!talkWaveFrame) talkWaveFrame = requestAnimationFrame(drawTalkWaveform);
+  }
+
+  function stopTalkWaveform() {
+    talkWaveCanvas.style.display = "none";
+    if (talkWaveFrame) { cancelAnimationFrame(talkWaveFrame); talkWaveFrame = null; }
+    talkWaveAnalyserRef = null;
+    talkWaveDataRef = null;
   }
 
   // Auto-init mic on load, click mic meter or talk button as fallback
@@ -1056,6 +1370,7 @@
   // WebSocket
   // =============================================
   function connect() {
+    if (!location.host) { console.warn("[ws] No host, skipping connect"); return; }
     const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${wsProto}//${location.host}`);
 
@@ -1089,26 +1404,37 @@
       if (msg.type === "status") {
         const phase = msg.phase || "idle";
 
-        if (muted && msg.micActive) {
-          setHeaderState("idle", "Muted");
-        } else if (phase === "speaking") {
-          setHeaderState("speaking", "Speaking");
-          setTalkState("speaking");
-        } else if (phase === "recording") {
-          setHeaderState("recording", "Recording");
-        } else if (phase === "transcribing") {
-          setHeaderState("transcribing", "Transcribing...");
-        } else if (phase === "thinking") {
-          setHeaderState("thinking", "Claude is thinking...");
-          setTalkState("thinking");
-        } else if (phase === "responding") {
-          setHeaderState("responding", "Claude is responding...");
-        } else if (phase === "standby") {
-          setHeaderState("ready", 'Say "Hey Claude"');
-        } else if (phase === "listening") {
-          setHeaderState("ready", "Listening");
+        // Debounce rapid phase transitions — skip transient states
+        // that would only flash for <300ms (listening→recording→transcribing)
+        if (_statusDebounceTimer) clearTimeout(_statusDebounceTimer);
+        const applyStatus = () => {
+          if (muted && msg.micActive) {
+            setHeaderState("idle", "Muted");
+          } else if (phase === "speaking") {
+            setHeaderState("speaking", "Speaking");
+            setTalkState("speaking");
+          } else if (phase === "recording") {
+            setHeaderState("recording", "Recording");
+          } else if (phase === "transcribing") {
+            setHeaderState("transcribing", "Transcribing...");
+          } else if (phase === "thinking") {
+            setHeaderState("thinking", "Claude is thinking...");
+            setTalkState("thinking");
+          } else if (phase === "responding") {
+            setHeaderState("responding", "Claude is responding...");
+          } else if (phase === "standby") {
+            setHeaderState("ready", 'Say "Hey Claude"');
+          } else if (phase === "listening") {
+            setHeaderState("ready", "Listening");
+          } else {
+            setHeaderState("ready", "Ready");
+          }
+        };
+        // High-priority states apply immediately; transient ones debounce
+        if (["speaking", "thinking", "responding", "transcribing"].includes(phase)) {
+          applyStatus();
         } else {
-          setHeaderState("ready", "Ready");
+          _statusDebounceTimer = setTimeout(applyStatus, 300);
         }
       }
 
@@ -1123,43 +1449,29 @@
         }
         if (msg.voice) {
           currentVoice = msg.voice;
-          voiceBtn.textContent = msg.voice;
+          voiceBtn.textContent = friendlyVoice(msg.voice);
           updateVoiceSelection();
         }
-        if (msg.muted === "1") {
-          muted = true;
-          muteBtn.classList.add("muted");
-          muteBtn.textContent = "Unmute";
+        if (msg.muted === "1" && !muted) {
+          // Server says muted — sync only if we're in a voice-input mode
+          modeIdx = 1; // Switch to type mode
+          applyMode();
         }
       }
 
       if (msg.type === "transcription") {
         // Skip historic messages from server if we already restored from localStorage
         if (msg.historic && historyLoaded) return;
-        // Voiced-only mode: skip partial assistant messages (only show final voiced text)
-        if (voicedOnly && msg.partial && msg.role === "assistant") return;
+        // Always show partial messages for real-time feedback
         removeThinkingBubble();
         emptyState.style.display = "none";
         if (msg.partial && msg.role === "assistant") {
-          // Update existing partial bubble or create one
-          updatePartialMessage(msg.text, msg.ts);
+          // In clean mode, skip verbose streaming output
+          if (!voicedOnly) updatePartialMessage(msg.text, msg.ts);
         } else {
-          // Final message — convert partial bubble in-place to permanent, or add new
-          const partial = document.getElementById("partialMsg");
-          if (partial && msg.role === "assistant") {
-            // Finalize: upgrade partial to permanent bubble (no flicker)
-            partial.removeAttribute("id");
-            partial.style.opacity = "1";
-            const timeStr = fmtTime(msg.ts || Date.now());
-            partial.innerHTML = `<div class="meta"><span class="role">Claude</span><span class="time">${timeStr}</span></div>${escapeHtml(msg.text)}`;
-            partial.addEventListener("click", () => {
-              navigator.clipboard.writeText(msg.text).catch(() => {});
-            });
-            addToHistory(msg.role, msg.text, msg.ts);
-          } else {
-            removePartialMessage();
-            addMessage(msg.role, msg.text, msg.ts);
-          }
+          // Final message — remove partials and add permanent bubbles
+          removePartialMessage();
+          addMessage(msg.role, msg.text, msg.ts);
         }
       }
 
@@ -1188,6 +1500,18 @@
         stopTtsPlayback();
       }
 
+      if (msg.type === "interactive_prompt") {
+        const termNav = document.getElementById("termNav");
+        if (msg.active) {
+          // Open terminal and show nav buttons
+          if (!terminalOpen) { terminalOpen = true; terminalPanel.classList.add("open"); document.getElementById("termToggleLabel").textContent = "▼ Terminal"; localStorage.setItem("term-open", "1"); }
+          termNav.classList.add("show");
+          terminalOutput.scrollTop = terminalOutput.scrollHeight;
+        } else {
+          termNav.classList.remove("show");
+        }
+      }
+
       if (msg.type === "terminal") {
         const prevScroll = terminalOutput.scrollTop;
         terminalOutput.innerHTML = ansiToHtml(msg.text);
@@ -1203,25 +1527,53 @@
 
   function addMessage(role, text, ts, fromRestore) {
     console.log(`[transcript] Adding ${role} message: "${text.slice(0, 60)}"`);
-    const div = document.createElement("div");
-    div.className = `msg ${role}`;
-    const timeStr = fmtTime(ts || Date.now());
-    div.innerHTML = `<div class="meta"><span class="role">${role === "user" ? "You" : "Claude"}</span><span class="time">${timeStr}</span></div>${escapeHtml(text)}`;
 
-    div.addEventListener("click", () => {
-      navigator.clipboard.writeText(text).then(() => {
-        const toast = document.createElement("span");
-        toast.className = "copied-toast";
-        toast.textContent = "Copied";
-        div.appendChild(toast);
-        setTimeout(() => toast.remove(), 800);
+    // Split assistant messages into paragraph bubbles
+    const paragraphs = (role === "assistant")
+      ? text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 0)
+      : [text];
+
+    const timeStr = fmtTime(ts || Date.now());
+
+    paragraphs.forEach((para, i) => {
+      const div = document.createElement("div");
+      div.className = `msg ${role}`;
+      const metaHtml = i === 0
+        ? `<div class="meta"><span class="role">${role === "user" ? "You" : "Claude"}</span><span class="time">${timeStr}</span></div>`
+        : "";
+      div.innerHTML = metaHtml + escapeHtml(para);
+
+      div.addEventListener("click", () => {
+        navigator.clipboard.writeText(para).then(() => {
+          const toast = document.createElement("span");
+          toast.className = "copied-toast";
+          toast.textContent = "Copied";
+          div.appendChild(toast);
+          setTimeout(() => toast.remove(), 800);
+        });
       });
+
+      if (role === "assistant") {
+        const wrap = document.createElement("div");
+        wrap.className = "msg-wrap";
+        const replayBtn = document.createElement("button");
+        replayBtn.className = "msg-replay";
+        replayBtn.textContent = "↻";
+        replayBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send("replay:" + para);
+        });
+        wrap.appendChild(div);
+        wrap.appendChild(replayBtn);
+        transcript.appendChild(wrap);
+      } else {
+        transcript.appendChild(div);
+      }
     });
 
-    transcript.appendChild(div);
     transcript.scrollTop = transcript.scrollHeight;
 
-    while (transcript.querySelectorAll(".msg").length > 50) {
+    while (transcript.querySelectorAll(".msg").length > 80) {
       transcript.querySelector(".msg").remove();
     }
 
@@ -1230,27 +1582,27 @@
   }
 
   function updatePartialMessage(text, ts) {
-    let partial = document.getElementById("partialMsg");
-    if (partial) {
-      // Update existing partial bubble
-      const timeStr = fmtTime(ts || Date.now());
-      partial.innerHTML = `<div class="meta"><span class="role">Claude</span><span class="time">${timeStr}</span></div>${escapeHtml(text)}`;
-    } else {
-      // Create new partial bubble
-      partial = document.createElement("div");
-      partial.className = "msg assistant";
-      partial.id = "partialMsg";
-      partial.style.opacity = "0.8";
-      const timeStr = fmtTime(ts || Date.now());
-      partial.innerHTML = `<div class="meta"><span class="role">Claude</span><span class="time">${timeStr}</span></div>${escapeHtml(text)}`;
-      transcript.appendChild(partial);
-    }
+    // Remove old partial bubbles
+    document.querySelectorAll(".partial-msg").forEach(el => el.remove());
+
+    const paragraphs = text.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 0);
+    const timeStr = fmtTime(ts || Date.now());
+
+    paragraphs.forEach((para, i) => {
+      const div = document.createElement("div");
+      div.className = "msg assistant partial-msg";
+      div.style.opacity = "0.8";
+      const metaHtml = i === 0
+        ? `<div class="meta"><span class="role">Claude</span><span class="time">${timeStr}</span></div>`
+        : "";
+      div.innerHTML = metaHtml + escapeHtml(para);
+      transcript.appendChild(div);
+    });
     transcript.scrollTop = transcript.scrollHeight;
   }
 
   function removePartialMessage() {
-    const partial = document.getElementById("partialMsg");
-    if (partial) partial.remove();
+    document.querySelectorAll(".partial-msg").forEach(el => el.remove());
   }
 
   function escapeHtml(str) {
@@ -1259,45 +1611,136 @@
     return d.innerHTML;
   }
 
+  let activeSpeakBubbles = [];
+  let activeSpeakIdx = 0;
+
+  function clearBubbleHighlights() {
+    document.querySelectorAll(".msg.bubble-active").forEach(el => el.classList.remove("bubble-active"));
+    activeSpeakBubbles = [];
+    activeSpeakIdx = 0;
+  }
+
+  function startBubbleHighlight() {
+    clearBubbleHighlights();
+    // Collect all consecutive assistant bubbles from the end
+    const all = Array.from(document.querySelectorAll(".msg"));
+    const bubbles = [];
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (all[i].classList.contains("assistant")) bubbles.unshift(all[i]);
+      else break;
+    }
+    activeSpeakBubbles = bubbles;
+    activeSpeakIdx = 0;
+    if (bubbles.length > 0) {
+      bubbles[0].classList.add("bubble-active");
+      bubbles[0].scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  function advanceBubbleHighlight() {
+    if (activeSpeakBubbles.length === 0) return;
+    // Remove current highlight
+    if (activeSpeakIdx < activeSpeakBubbles.length) {
+      activeSpeakBubbles[activeSpeakIdx].classList.remove("bubble-active");
+    }
+    activeSpeakIdx++;
+    // Highlight next bubble if available
+    if (activeSpeakIdx < activeSpeakBubbles.length) {
+      activeSpeakBubbles[activeSpeakIdx].classList.add("bubble-active");
+      activeSpeakBubbles[activeSpeakIdx].scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
   // =============================================
   // Talk button state management
   // =============================================
   function setTalkState(state) {
     talkBtn.className = "";
+    stopTalkWaveform();
+    clearBubbleHighlights();
 
     switch (state) {
-      case "idle":
-        talkBtn.innerHTML = '<span class="mic-icon">🎙</span> Press Right ⌘ or tap to talk';
-        talkBtn.className = "";
-        setHeaderState("ready", "Ready");
+      case "idle": {
+        talkBtn.innerHTML = '';
+        talkBtn.appendChild(talkWaveCanvas);
+        talkBtn.insertAdjacentHTML('beforeend', MURMUR_SVG);
+        const hint = document.createElement("span");
+        hint.className = "talk-idle-hint";
+        const mode = MODES[modeIdx];
+        if (mode.id === "type") {
+          hint.textContent = "Type mode — mic off";
+        } else if (mode.id === "listen") {
+          hint.textContent = "Read mode — voice in, text out";
+        } else {
+          hint.textContent = "Tap or press Right ⌘ to talk";
+        }
+        talkBtn.appendChild(hint);
+        talkBtn.className = "idle-state";
+        if (mode.id === "listen") talkBtn.classList.add("mode-read");
+        if (mode.id === "type") talkBtn.classList.add("mode-type");
+        talkBtn.setAttribute("data-tip", mode.tip);
+        setHeaderState("ready", mode.id === "type" ? "Type mode" : "Ready");
+        // Show subtle mic level on idle button (red palette, low opacity)
+        if (mode.micOn && micAnalyser && micDataArray) {
+          startTalkWaveform("#e74c3c44", micAnalyser, micDataArray);
+        }
         break;
+      }
       case "recording":
-        talkBtn.textContent = "Listening...";
+        talkBtn.innerHTML = '';
+        talkBtn.appendChild(talkWaveCanvas);
+        const label = document.createElement("span");
+        label.className = "talk-wave-label";
+        label.textContent = "Listening...";
+        talkBtn.appendChild(label);
         talkBtn.className = "recording";
+        startTalkWaveform("#e74c3c", micAnalyser, micDataArray);
         setHeaderState("recording", "Recording");
         break;
       case "transcribing":
-        talkBtn.textContent = "Transcribing...";
+        talkBtn.textContent = "";
+        talkBtn.appendChild(talkWaveCanvas);
+        talkBtn.insertAdjacentText('beforeend', "Transcribing...");
         talkBtn.className = "transcribing";
         setHeaderState("transcribing", "Transcribing...");
         break;
       case "thinking":
-        talkBtn.textContent = "Claude is thinking...";
+        talkBtn.textContent = "";
+        talkBtn.appendChild(talkWaveCanvas);
+        talkBtn.insertAdjacentText('beforeend', "Claude is thinking... (tap to stop)");
         talkBtn.className = "thinking";
         setHeaderState("thinking", "Claude is thinking...");
         showThinkingBubble();
         break;
       case "responding":
-        talkBtn.textContent = "Claude is responding...";
+        talkBtn.textContent = "";
+        talkBtn.appendChild(talkWaveCanvas);
+        talkBtn.insertAdjacentText('beforeend', "Claude is responding... (tap to stop)");
         talkBtn.className = "responding";
         setHeaderState("responding", "Claude is responding...");
         break;
-      case "speaking":
-        talkBtn.textContent = "Claude is speaking... (tap to stop)";
+      case "speaking": {
+        talkBtn.innerHTML = '';
+        talkBtn.appendChild(talkWaveCanvas);
+        const spkLabel = document.createElement("span");
+        spkLabel.className = "talk-wave-label";
+        spkLabel.textContent = "Speaking... (tap to stop)";
+        talkBtn.appendChild(spkLabel);
         talkBtn.className = "speaking";
+        // TTS analyser may not exist yet — retry briefly until it's created
+        const tryStartTtsWave = (attempts) => {
+          if (ttsAnalyser && ttsDataArray) {
+            startTalkWaveform("#c9b07c", ttsAnalyser, ttsDataArray);
+          } else if (attempts > 0 && talkBtn.classList.contains("speaking")) {
+            setTimeout(() => tryStartTtsWave(attempts - 1), 50);
+          }
+        };
+        tryStartTtsWave(20);
+        startBubbleHighlight();
         setHeaderState("speaking", "Speaking");
         removeThinkingBubble();
         break;
+      }
     }
   }
 
@@ -1314,38 +1757,20 @@
       setTalkState("responding");
     } else if (state === "speaking") {
       ttsStartedAt = Date.now();
-      idleFromTtsCompletion = false; // Reset — will be set true by onended callback
+      idleFromTtsCompletion = false;
+      pendingIdle = false; // New audio coming, cancel deferred idle
       setTalkState("speaking");
     } else if (state === "idle") {
-      // After Claude finishes speaking, next speech goes direct for 30s
-      conversationHot = true;
-      // Don't reset ttsEndedAt here — it's already set by the client-side onended
-      // callback. Resetting it here would restart the echo cooldown after network round trip.
-      if (conversationHotTimer) clearTimeout(conversationHotTimer);
-      conversationHotTimer = setTimeout(() => { conversationHot = false; }, 30000);
-      rlog(`[voice_status] idle — ttsPlaying=${ttsPlaying} ttsEndedAt=${Date.now()-ttsEndedAt}ms ago idleFromTts=${idleFromTtsCompletion} micAnalyser=${!!micAnalyser} autoListen=${!!autoListenInterval} isRec=${isRecording}`);
-      // Show "your turn" prompt only after successful TTS completion (not after stop/error/blank)
-      if (idleFromTtsCompletion && !isRecording && !muted) {
-        idleFromTtsCompletion = false; // Consume the flag
-        talkBtn.innerHTML = '<span class="mic-icon" style="animation: pulse-dot 0.8s ease-in-out infinite">🎙</span> Tap to respond';
-        talkBtn.className = "ready-to-listen";
-        setHeaderState("ready", "Your turn — tap to talk");
-        // Play a short beep to signal it's the user's turn
-        if (ttsAudioCtx && ttsAudioCtx.state === "running") {
-          const osc = ttsAudioCtx.createOscillator();
-          const gain = ttsAudioCtx.createGain();
-          osc.connect(gain);
-          gain.connect(ttsAudioCtx.destination);
-          osc.frequency.value = 880;
-          gain.gain.value = 0.08;
-          gain.gain.exponentialRampToValueAtTime(0.001, ttsAudioCtx.currentTime + 0.15);
-          osc.start();
-          osc.stop(ttsAudioCtx.currentTime + 0.15);
-        }
-      } else {
-        idleFromTtsCompletion = false; // Consume the flag
-        setTalkState("idle");
+      // If TTS is still playing or just finished (server may be synthesizing next chunk), defer idle
+      const recentTts = Date.now() - ttsEndedAt < 800;
+      if (ttsPlaying || (recentTts && talkBtn.classList.contains("speaking"))) {
+        rlog(`[voice_status] idle deferred — ttsPlaying=${ttsPlaying} recentTts=${recentTts}`);
+        pendingIdle = true;
+        // Safety: if no new speaking arrives within 2s, go idle anyway
+        setTimeout(() => { if (pendingIdle && !ttsPlaying) applyIdleState(); }, 2000);
+        return;
       }
+      applyIdleState();
     } else if (state === "sent") {
       setTalkState("thinking");
     } else if (state === "blank") {
@@ -1373,21 +1798,31 @@
 
   muteBtn.addEventListener("click", () => {
     muted = !muted;
-    muteBtn.classList.toggle("muted", muted);
-    muteBtn.textContent = muted ? "Unmute" : "Mute";
+    muteBtn.classList.toggle("active", muted);
+    document.getElementById("micMeter").classList.toggle("muted", muted);
+    talkBtn.style.opacity = muted ? "0.4" : "1";
+    talkBtn.style.pointerEvents = muted ? "none" : "auto";
     if (ws?.readyState === WebSocket.OPEN) ws.send("mute:" + (muted ? "1" : "0"));
-    if (muted) {
-      if (isRecording) stopRecording();
-      setHeaderState("idle", "Muted");
-    } else {
-      setHeaderState("idle", "Ready");
-    }
+    if (muted && _modeReady && isRecording) stopRecording();
+  });
+
+  modeBtn.addEventListener("click", () => {
+    modeIdx = (modeIdx + 1) % MODES.length;
+    applyMode();
+    const m = MODES[modeIdx];
+    setHeaderState("idle", m.micOn ? "Ready" : "Type mode");
   });
 
   speedBtn.addEventListener("click", () => {
     speedIdx = (speedIdx + 1) % SPEEDS.length;
     speedBtn.textContent = SPEEDS[speedIdx] + "x";
     if (ws?.readyState === WebSocket.OPEN) ws.send("speed:" + SPEEDS[speedIdx]);
+  });
+
+  cleanBtn.addEventListener("click", () => {
+    voicedOnly = !voicedOnly;
+    localStorage.setItem("voiced-only", voicedOnly ? "1" : "0");
+    applyCleanMode();
   });
 
   // Voice selection
@@ -1407,15 +1842,24 @@
     if (!option) return;
     const voice = option.dataset.voice;
     currentVoice = voice;
-    voiceBtn.textContent = voice;
+    voiceBtn.textContent = friendlyVoice(voice);
     voicePopover.classList.remove("show");
     updateVoiceSelection();
     if (ws?.readyState === WebSocket.OPEN) ws.send("voice:" + voice);
   });
 
+  // Store original popover labels (set from HTML)
+  const voiceLabels = {};
+  voicePopover.querySelectorAll(".voice-option").forEach(el => {
+    voiceLabels[el.dataset.voice] = el.textContent;
+  });
+
   function updateVoiceSelection() {
     voicePopover.querySelectorAll(".voice-option").forEach(el => {
-      el.classList.toggle("selected", el.dataset.voice === currentVoice);
+      const v = el.dataset.voice;
+      const isSel = v === currentVoice;
+      el.classList.toggle("selected", isSel);
+      el.textContent = (isSel ? "✓ " : "") + (voiceLabels[v] || v);
     });
   }
 
@@ -1425,6 +1869,7 @@
   let mediaRecorder = null;
   let audioChunks = [];
   let isRecording = false;
+  _modeReady = true;
   let silenceTimer = null;
   let silenceStart = 0;
   const SILENCE_THRESHOLD = 0.015;
@@ -1442,7 +1887,31 @@
   let ttsStartedAt = 0;
   let ttsEndedAt = 0;
   let idleFromTtsCompletion = false; // Track whether idle came from successful TTS completion
-  const TTS_ECHO_COOLDOWN = 400;   // 400ms cooldown after TTS ends (echoCancellation handles the rest)
+  let pendingIdle = false; // Deferred idle — waiting for TTS to finish
+
+  function applyIdleState() {
+    pendingIdle = false;
+    conversationHot = true;
+    if (conversationHotTimer) clearTimeout(conversationHotTimer);
+    conversationHotTimer = setTimeout(() => { conversationHot = false; }, 30000);
+    rlog(`[voice_status] idle — ttsPlaying=${ttsPlaying} ttsEndedAt=${Date.now()-ttsEndedAt}ms ago idleFromTts=${idleFromTtsCompletion} micAnalyser=${!!micAnalyser} autoListen=${!!autoListenInterval} isRec=${isRecording}`);
+    if (idleFromTtsCompletion && !isRecording && !muted) {
+      if (ttsAudioCtx && ttsAudioCtx.state === "running") {
+        const osc = ttsAudioCtx.createOscillator();
+        const gain = ttsAudioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(ttsAudioCtx.destination);
+        osc.frequency.value = 880;
+        gain.gain.value = 0.08;
+        gain.gain.exponentialRampToValueAtTime(0.001, ttsAudioCtx.currentTime + 0.15);
+        osc.start();
+        osc.stop(ttsAudioCtx.currentTime + 0.15);
+      }
+    }
+    idleFromTtsCompletion = false;
+    setTalkState("idle");
+  }
+  const TTS_ECHO_COOLDOWN = 150;   // 150ms cooldown after TTS ends (echoCancellation handles the rest)
 
   async function ensureMicStream() {
     if (micStream) return micStream;
@@ -1632,8 +2101,17 @@
   let ttsCurrentSource = null; // Web Audio BufferSourceNode
   let ttsPlaybackTimer = null;
   let ttsPlaying = false;
+  let ttsAnalyser = null;
+  let ttsDataArray = null;
+  let ttsGainNode = null;
 
   function playTtsAudio(blob) {
+    // In text-out mode, skip TTS playback entirely
+    if (ttsMuted) {
+      rlog(`[tts] Skipping TTS (${blob.size} bytes) — text-out mode`);
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send("tts_done");
+      return;
+    }
     // If user is currently recording, skip TTS — don't interrupt them
     // Their new input will trigger a fresh response anyway
     if (isRecording) {
@@ -1665,7 +2143,17 @@
           if (ttsCurrentSource === "cancelled") { console.log("[tts] Cancelled during decode"); ttsCurrentSource = null; return; }
           const source = ttsAudioCtx.createBufferSource();
           source.buffer = audioBuffer;
-          source.connect(ttsAudioCtx.destination);
+          if (!ttsAnalyser) {
+            ttsGainNode = ttsAudioCtx.createGain();
+            ttsGainNode.gain.value = 2.0;
+            ttsAnalyser = ttsAudioCtx.createAnalyser();
+            ttsAnalyser.fftSize = 256;
+            ttsAnalyser.smoothingTimeConstant = 0.3;
+            ttsDataArray = new Float32Array(ttsAnalyser.fftSize);
+            ttsGainNode.connect(ttsAnalyser);
+            ttsAnalyser.connect(ttsAudioCtx.destination);
+          }
+          source.connect(ttsGainNode);
           ttsCurrentSource = source;
           ttsPlaying = true;
 
@@ -1676,7 +2164,9 @@
             if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
             ttsEndedAt = Date.now();
             idleFromTtsCompletion = true;
+            advanceBubbleHighlight();
             if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+            if (pendingIdle) applyIdleState();
           };
 
           // Safety timeout
@@ -1706,7 +2196,9 @@
         if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
         ttsEndedAt = Date.now();
         idleFromTtsCompletion = true;
+        advanceBubbleHighlight();
         if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        if (pendingIdle) applyIdleState();
       }
       audio.onended = done;
       audio.onerror = done;
@@ -1737,11 +2229,12 @@
 
   // Talk button click
   talkBtn.addEventListener("click", () => {
-    // If Claude is speaking, stop TTS
-    if (talkBtn.classList.contains("speaking")) {
+    // If Claude is speaking/thinking/responding, stop everything
+    if (talkBtn.classList.contains("speaking") || talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
       stopTtsPlayback();
       if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
       setTalkState("idle");
+      removeThinkingBubble();
       return;
     }
 
@@ -1839,7 +2332,7 @@
   }
   setTimeout(tryStartAutoListen, 1500);
 
-  connect();
+  try { connect(); } catch(e) { console.warn("[ws] connect() error:", e); }
 
   // =============================================
   // iOS app-switch: re-acquire mic + resume AudioContext
@@ -1865,7 +2358,7 @@
     // Reconnect WebSocket if it dropped during background
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.log("[visibility] WebSocket not open, reconnecting...");
-      connect();
+      try { connect(); } catch(e) { console.warn("[ws] reconnect error:", e); }
     }
   });
 
@@ -1875,7 +2368,7 @@
   function toggleTerminal() {
     terminalOpen = !terminalOpen;
     terminalPanel.classList.toggle("open", terminalOpen);
-    termBtn.classList.toggle("active", terminalOpen);
+    document.getElementById("termToggleLabel").textContent = (terminalOpen ? "▼" : "▶") + " Terminal";
     localStorage.setItem("term-open", terminalOpen ? "1" : "0");
     if (terminalOpen) {
       termAutoScroll = true;
@@ -1883,7 +2376,6 @@
     }
   }
 
-  termBtn.addEventListener("click", toggleTerminal);
   terminalHeader.addEventListener("click", toggleTerminal);
 
   // Replay button
@@ -1894,12 +2386,30 @@
     }
   });
 
-  // Voiced-only toggle
-  voicedBtn.addEventListener("click", () => {
-    voicedOnly = !voicedOnly;
-    localStorage.setItem("voiced-only", voicedOnly ? "1" : "0");
-    voicedBtn.classList.toggle("active", voicedOnly);
-    voicedBtn.textContent = voicedOnly ? "Voiced \u2713" : "Voiced";
+  // Restart server button
+  document.getElementById("restartBtn").addEventListener("click", () => {
+    if (confirm("Restart Murmur server?")) {
+      const btn = document.getElementById("restartBtn");
+      btn.classList.add("spinning");
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send("restart");
+    }
+  });
+
+
+  // Chat transcript zoom controls
+  let chatFontSize = parseFloat(localStorage.getItem("chat-font-size") || "12.5");
+  transcript.style.setProperty("--chat-font-size", chatFontSize + "px");
+  const chatZoomIn = document.getElementById("chatZoomIn");
+  const chatZoomOut = document.getElementById("chatZoomOut");
+  chatZoomIn.addEventListener("click", () => {
+    chatFontSize = Math.min(22, chatFontSize + 1);
+    transcript.style.setProperty("--chat-font-size", chatFontSize + "px");
+    localStorage.setItem("chat-font-size", String(chatFontSize));
+  });
+  chatZoomOut.addEventListener("click", () => {
+    chatFontSize = Math.max(8, chatFontSize - 1);
+    transcript.style.setProperty("--chat-font-size", chatFontSize + "px");
+    localStorage.setItem("chat-font-size", String(chatFontSize));
   });
 
   // Terminal zoom controls
@@ -1915,6 +2425,13 @@
     terminalOutput.style.fontSize = termFontSize + "px";
     localStorage.setItem("term-font-size", String(termFontSize));
   });
+
+  // Terminal nav buttons for interactive prompts
+  document.getElementById("termKeyUp").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:up"); });
+  document.getElementById("termKeyDown").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:down"); });
+  document.getElementById("termKeyEnter").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:enter"); });
+  document.getElementById("termKeyEsc").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:escape"); });
+  document.getElementById("termKeyTab").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:tab"); });
 
   termClearBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1951,6 +2468,7 @@
 
   let tipTimer;
   document.addEventListener("pointerenter", (e) => {
+    if (!e.target || !e.target.closest) return;
     const el = e.target.closest("[data-tip]");
     if (!el) return;
     clearTimeout(tipTimer);
@@ -1970,7 +2488,7 @@
   }, true);
 
   document.addEventListener("pointerleave", (e) => {
-    if (e.target.closest("[data-tip]")) {
+    if (e.target && e.target.closest && e.target.closest("[data-tip]")) {
       clearTimeout(tipTimer);
       tip.classList.remove("visible");
     }

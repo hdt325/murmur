@@ -1,0 +1,56 @@
+{
+  "name": "murmur",
+  "version": "1.0.0",
+  "description": "Voice interface for Claude Code",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.murmur.app",
+    "productName": "Murmur",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "icons/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "icons/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "icons/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../",
+        "to": "murmur",
+        "filter": [
+          "server.ts",
+          "index.html",
+          "manifest.json",
+          "settings.json",
+          "package.json",
+          "package-lock.json",
+          "terminal/**/*",
+          "tsconfig.json"
+        ]
+      }
+    ]
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

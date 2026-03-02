@@ -71,7 +71,7 @@ bld.line([(x0 - 60, cy), (x0, cy)], fill=(*color[:3], 50), width=3)
 bld.line([(x0 + trace_w, cy), (x0 + trace_w + 60, cy)], fill=(*color[:3], 50), width=3)
 img = Image.alpha_composite(img, bl)
 
-# Save as iconset
+# Save as iconset (macOS .icns)
 iconset_dir = "Murmur.app/Contents/Resources/AppIcon.iconset"
 os.makedirs(iconset_dir, exist_ok=True)
 
@@ -83,11 +83,34 @@ for s in sizes:
         resized2x = img.resize((s * 2, s * 2), Image.LANCZOS)
         resized2x.save(f"{iconset_dir}/icon_{s}x{s}@2x.png")
 
-# Convert to icns
-subprocess.run(["iconutil", "-c", "icns", iconset_dir, "-o",
-                "Murmur.app/Contents/Resources/AppIcon.icns"], check=True)
+# Convert to icns (macOS only)
+import platform
+if platform.system() == "Darwin":
+    subprocess.run(["iconutil", "-c", "icns", iconset_dir, "-o",
+                    "Murmur.app/Contents/Resources/AppIcon.icns"], check=True)
+    print("Icon created: Murmur.app/Contents/Resources/AppIcon.icns")
+
+# Also save Electron icons
+electron_icons = "electron/icons"
+os.makedirs(electron_icons, exist_ok=True)
+
+# Save a 16x16 PNG for macOS tray (template image)
+img.resize((16, 16), Image.LANCZOS).save(f"{electron_icons}/icon_16x16.png")
+
+# Save 256x256 PNG for Electron window icon
+img.resize((256, 256), Image.LANCZOS).save(f"{electron_icons}/icon.png")
+
+# Save .ico for Windows (multiple sizes embedded)
+ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+ico_images = [img.resize(s, Image.LANCZOS) for s in ico_sizes]
+ico_images[0].save(f"{electron_icons}/icon.ico", format="ICO",
+                   sizes=ico_sizes, append_images=ico_images[1:])
+print(f"Electron icons created: {electron_icons}/icon.ico, icon.png, icon_16x16.png")
+
+# Copy .icns for Electron macOS build
+if platform.system() == "Darwin" and os.path.exists("Murmur.app/Contents/Resources/AppIcon.icns"):
+    shutil.copy("Murmur.app/Contents/Resources/AppIcon.icns", f"{electron_icons}/icon.icns")
+    print(f"Copied: {electron_icons}/icon.icns")
 
 # Clean up iconset
 shutil.rmtree(iconset_dir)
-
-print("Icon created: Murmur.app/Contents/Resources/AppIcon.icns")
