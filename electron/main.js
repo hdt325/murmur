@@ -10,9 +10,29 @@ const { spawn, execSync } = require("child_process");
 const net = require("net");
 const http = require("http");
 const { autoUpdater } = require("electron-updater");
+const https = require("https");
+const crypto = require("crypto");
 
 const SERVER_PORT = 3457;
 const SERVER_URL = `http://localhost:${SERVER_PORT}`;
+
+// GitHub content update config
+const GH_OWNER = "hdt325";
+const GH_REPO = "murmur";
+const GH_BRANCH = "main";
+const GH_RAW_BASE = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}`;
+// Files to auto-update from GitHub (relative to repo root → relative to murmurDir)
+const CONTENT_FILES = [
+  "server.ts",
+  "index.html",
+  "manifest.json",
+  "settings.json",
+  "package.json",
+  "tsconfig.json",
+  "terminal/interface.ts",
+  "terminal/tmux-backend.ts",
+  "terminal/pty-backend.ts",
+];
 
 // macOS GUI apps don't inherit shell PATH — add common tool locations
 if (process.platform === "darwin") {
@@ -208,6 +228,128 @@ async function ensureServer() {
   return false;
 }
 
+// =============================================
+// Content auto-update from GitHub
+// =============================================
+
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { "User-Agent": "Murmur-Electron" } }, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return httpsGet(res.headers.location).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+function fileHash(filePath) {
+  try {
+    const content = fs.readFileSync(filePath);
+    return crypto.createHash("sha256").update(content).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+async function checkContentUpdates(murmurDir) {
+  const updatedFiles = [];
+
+  for (const file of CONTENT_FILES) {
+    try {
+      const localPath = path.join(murmurDir, file);
+      const localHash = fileHash(localPath);
+      const remoteContent = await httpsGet(`${GH_RAW_BASE}/${file}`);
+      const remoteHash = crypto.createHash("sha256").update(remoteContent).digest("hex");
+
+      if (localHash !== remoteHash) {
+        updatedFiles.push({ file, localPath, content: remoteContent });
+      }
+    } catch (err) {
+      console.log(`[update] Skip ${file}: ${err.message}`);
+    }
+  }
+
+  return updatedFiles;
+}
+
+async function applyContentUpdates(updates) {
+  for (const { file, localPath, content } of updates) {
+    // Ensure directory exists
+    const dir = path.dirname(localPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(localPath, content);
+    console.log(`[update] Updated ${file}`);
+  }
+}
+
+async function contentUpdateCheck(murmurDir) {
+  try {
+    sendStatus("Checking for updates...", "info", { check: "update", checkStatus: "pending" });
+    const updates = await checkContentUpdates(murmurDir);
+
+    if (updates.length === 0) {
+      sendStatus("Content up to date", "info", { check: "update", checkStatus: "ok" });
+      return false;
+    }
+
+    const fileList = updates.map(u => u.file).join(", ");
+    console.log(`[update] ${updates.length} files changed: ${fileList}`);
+
+    // Prompt user
+    const response = dialog.showMessageBoxSync(win, {
+      type: "info",
+      title: "Murmur Update Available",
+      message: `${updates.length} file${updates.length > 1 ? "s" : ""} updated on GitHub.`,
+      detail: `Changed: ${fileList}\n\nApply update and restart server?`,
+      buttons: ["Update Now", "Skip"],
+      defaultId: 0,
+    });
+
+    if (response === 0) {
+      sendStatus("Applying updates...", "info", { check: "update", checkStatus: "pending" });
+      applyContentUpdates(updates);
+      sendStatus(`Updated ${updates.length} files`, "success", { check: "update", checkStatus: "ok" });
+
+      // If package.json changed, reinstall deps
+      if (updates.some(u => u.file === "package.json")) {
+        sendStatus("Updating dependencies...", "info", { check: "deps", checkStatus: "pending" });
+        try {
+          execSync("npm install", { cwd: murmurDir, timeout: 120000 });
+          sendStatus("Dependencies updated", "info", { check: "deps", checkStatus: "ok" });
+        } catch (err) {
+          sendStatus(`npm install failed: ${err.message}`, "warn", { check: "deps", checkStatus: "warn" });
+        }
+      }
+
+      // Kill server if running so it restarts with new files
+      if (serverProcess) {
+        serverProcess.kill();
+        serverProcess = null;
+        // Wait for it to die
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      return true;
+    } else {
+      sendStatus("Update skipped", "info", { check: "update", checkStatus: "ok" });
+      return false;
+    }
+  } catch (err) {
+    console.log(`[update] Content update check failed: ${err.message}`);
+    sendStatus("Update check failed (non-fatal)", "warn", { check: "update", checkStatus: "warn" });
+    return false;
+  }
+}
+
 // Full startup sequence
 async function startup() {
   startupComplete = false;
@@ -218,6 +360,14 @@ async function startup() {
   if (hasBlocker) {
     sendStatus("Fix the issues above, then click Retry", "fatal");
     return;
+  }
+
+  // Check for content updates from GitHub
+  const murmurDir = app.isPackaged
+    ? path.join(process.resourcesPath, "murmur")
+    : path.resolve(__dirname, "..");
+  if (app.isPackaged) {
+    await contentUpdateCheck(murmurDir);
   }
 
   // Start server
