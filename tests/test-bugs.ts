@@ -34,6 +34,13 @@ async function setup() {
   // Wait for WebSocket connection
   await page.waitForFunction(() => (window as any).__wsConnected !== undefined || document.querySelector(".status-dot.green") !== null, { timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1500); // Let UI settle
+  // Dismiss tour overlay if present (prevents pointer interception)
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  const tourOverlay = page.locator(".tour-overlay");
+  if (await tourOverlay.isVisible({ timeout: 500 }).catch(() => false)) {
+    await page.locator(".tour-skip").click().catch(() => {});
+    await page.waitForTimeout(300);
+  }
 }
 
 async function teardown() {
@@ -135,7 +142,7 @@ async function testBug6_ttsTimeout() {
   // Simpler: read the source file directly via the test runner's fs access.
   const { readFileSync } = await import("fs");
   const serverSrc = readFileSync(
-    new URL("./server.ts", import.meta.url).pathname,
+    new URL("../server.ts", import.meta.url).pathname,
     "utf-8"
   );
 
@@ -155,7 +162,7 @@ async function testBug10_broadcastScope() {
 
   const { readFileSync } = await import("fs");
   const serverSrc = readFileSync(
-    new URL("./server.ts", import.meta.url).pathname,
+    new URL("../server.ts", import.meta.url).pathname,
     "utf-8"
   );
 
@@ -224,7 +231,7 @@ async function testBug2_deadCodeRemoved() {
 
   const { readFileSync } = await import("fs");
   const serverSrc = readFileSync(
-    new URL("./server.ts", import.meta.url).pathname,
+    new URL("../server.ts", import.meta.url).pathname,
     "utf-8"
   );
 

@@ -26,12 +26,12 @@ const CONTENT_FILES = [
   "server.ts",
   "index.html",
   "manifest.json",
-  "settings.json",
   "package.json",
   "tsconfig.json",
   "terminal/interface.ts",
   "terminal/tmux-backend.ts",
   "terminal/pty-backend.ts",
+  // NOTE: settings.json excluded — it's per-user preferences
 ];
 
 // macOS GUI apps don't inherit shell PATH — add common tool locations
