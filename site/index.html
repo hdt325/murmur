@@ -37,6 +37,9 @@
       --accent: #f04b5a;
       --accent-glow: rgba(240, 75, 90, 0.25);
       --green: #4ade80;
+      --purple: #a78bfa;
+      --blue: #60a5fa;
+      --amber: #fbbf24;
       --text: #e4e4e7;
       --text-muted: #a1a1aa;
       --border: #2e2e34;
@@ -89,7 +92,6 @@
       animation: pulse 1.4s ease-in-out infinite;
     }
 
-    /* Crescendo-decrescendo: short edges, tall center (heartbeat murmur shape) */
     .waveform .bar:nth-child(1) { height: 12px; animation-delay: 0s; }
     .waveform .bar:nth-child(2) { height: 24px; animation-delay: 0.1s; }
     .waveform .bar:nth-child(3) { height: 42px; animation-delay: 0.2s; }
@@ -195,6 +197,8 @@
     .feature-icon.speaker { background: rgba(74, 222, 128, 0.15); color: var(--green); }
     .feature-icon.terminal { background: rgba(96, 165, 250, 0.15); color: #60a5fa; }
     .feature-icon.globe  { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+    .feature-icon.modes  { background: rgba(167, 139, 250, 0.15); color: var(--purple); }
+    .feature-icon.update { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
 
     .feature-card h3 {
       font-size: 1.15rem;
@@ -207,6 +211,203 @@
       color: var(--text-muted);
       font-size: 0.95rem;
       line-height: 1.55;
+    }
+
+    /* ── How To ────────────────────────────────────── */
+
+    .howto {
+      padding: 64px 24px 80px;
+    }
+
+    .howto h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+    }
+
+    .howto .subtitle {
+      text-align: center;
+      color: var(--text-muted);
+      margin-bottom: 48px;
+      max-width: 600px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .steps {
+      max-width: 700px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .step {
+      display: flex;
+      gap: 20px;
+      padding: 24px 0;
+      position: relative;
+    }
+
+    .step + .step {
+      border-top: 1px solid var(--border);
+    }
+
+    .step-num {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.9rem;
+      flex-shrink: 0;
+    }
+
+    .step-body h3 {
+      font-size: 1.05rem;
+      font-weight: 650;
+      color: #fff;
+      margin-bottom: 6px;
+    }
+
+    .step-body p {
+      color: var(--text-muted);
+      font-size: 0.93rem;
+      line-height: 1.55;
+    }
+
+    .step-body code {
+      background: var(--bg-code);
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      font-family: "SF Mono", "Fira Code", Consolas, monospace;
+      color: var(--green);
+    }
+
+    .step-body .kbd {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 5px;
+      font-size: 0.8rem;
+      font-family: "SF Mono", "Fira Code", Consolas, monospace;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    /* ── Modes ─────────────────────────────────────── */
+
+    .modes {
+      padding: 0 24px 80px;
+    }
+
+    .modes h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+    }
+
+    .modes .subtitle {
+      text-align: center;
+      color: var(--text-muted);
+      margin-bottom: 40px;
+    }
+
+    .mode-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    .mode-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px 16px;
+      text-align: center;
+    }
+
+    .mode-card .mode-name {
+      font-weight: 700;
+      font-size: 1rem;
+      margin-bottom: 6px;
+    }
+
+    .mode-card.talk .mode-name { color: var(--accent); }
+    .mode-card.type .mode-name { color: var(--purple); }
+    .mode-card.read .mode-name { color: var(--green); }
+    .mode-card.text .mode-name { color: var(--blue); }
+
+    .mode-card .mode-desc {
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .mode-card .mode-io {
+      margin-top: 10px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      opacity: 0.7;
+    }
+
+    /* ── Shortcuts ─────────────────────────────────── */
+
+    .shortcuts {
+      padding: 0 24px 80px;
+    }
+
+    .shortcuts h2 {
+      text-align: center;
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 40px;
+      color: #fff;
+    }
+
+    .shortcut-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      max-width: 700px;
+      margin: 0 auto;
+    }
+
+    .shortcut-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .shortcut-row .sc-label {
+      font-size: 0.9rem;
+      color: var(--text);
+    }
+
+    .shortcut-row .sc-key {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      border-radius: 5px;
+      font-size: 0.8rem;
+      font-family: "SF Mono", "Fira Code", Consolas, monospace;
+      color: var(--text-muted);
+      white-space: nowrap;
     }
 
     /* ── Download ──────────────────────────────────── */
@@ -467,6 +668,14 @@
         grid-template-columns: 1fr;
       }
 
+      .mode-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .shortcut-grid {
+        grid-template-columns: 1fr;
+      }
+
       .hero {
         min-height: auto;
         padding: 60px 20px 48px;
@@ -532,7 +741,7 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
           </div>
           <h3>Voice Input</h3>
-          <p>Speak naturally -- local Whisper STT transcribes on-device with zero cloud latency.</p>
+          <p>Speak naturally -- local Whisper STT transcribes on-device with zero cloud latency. Auto-listen detects speech and starts recording hands-free.</p>
         </div>
 
         <div class="feature-card">
@@ -540,7 +749,7 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
           </div>
           <h3>Voice Output</h3>
-          <p>Responses read aloud via local Kokoro TTS with selectable voices and adjustable speed.</p>
+          <p>Responses read aloud via local Kokoro TTS. 60+ voices, adjustable speed (0.5x--3x), paragraph-level highlighting as Claude speaks.</p>
         </div>
 
         <div class="feature-card">
@@ -548,17 +757,151 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
           </div>
           <h3>Live Terminal</h3>
-          <p>See Claude Code working in real-time with full ANSI color support and scrollback.</p>
+          <p>Watch Claude Code working in real-time. Full ANSI color, scrollback, arrow key navigation, and interactive prompt detection.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon modes">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/></svg>
+          </div>
+          <h3>4 Interaction Modes</h3>
+          <p>Talk (full voice), Type (type in, hear back), Read (speak in, read response), and Text (keyboard only). Switch with one tap.</p>
         </div>
 
         <div class="feature-card">
           <div class="feature-icon globe">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
           </div>
-          <h3>Cross-Platform</h3>
-          <p>Works on macOS and Windows with a single Electron codebase. One app, every desktop.</p>
+          <h3>Cross-Platform Desktop</h3>
+          <p>macOS and Windows via Electron. Floats above all windows, draggable header, visible on all workspaces. Auto-updates from GitHub.</p>
         </div>
 
+        <div class="feature-card">
+          <div class="feature-icon update">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+          </div>
+          <h3>Auto-Updating</h3>
+          <p>Content updates (UI, server logic) pulled from GitHub on every launch. Shell updates via GitHub Releases. Always current, zero effort.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- How To -->
+  <section class="howto" id="howto">
+    <div class="container">
+      <h2>Getting Started</h2>
+      <p class="subtitle">Up and running in 5 minutes. Murmur connects to your existing Claude Code CLI session.</p>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <h3>Install Prerequisites</h3>
+            <p>You need <strong>Node.js 18+</strong>, <strong>Claude Code CLI</strong> (<code>npm i -g @anthropic-ai/claude-code</code>), and <strong>VoiceMode</strong> for local STT/TTS (<code>uv tool install voicemode</code>). On macOS, also install <code>tmux</code> via Homebrew.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <h3>Start Voice Services</h3>
+            <p>Launch Whisper (speech-to-text) and Kokoro (text-to-speech) locally:<br>
+              <code>voicemode service whisper start</code><br>
+              <code>voicemode service kokoro start</code><br>
+              These run in the background and Murmur auto-detects them on startup.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <h3>Launch Murmur</h3>
+            <p>Download the desktop app or run from source. Murmur opens as a floating panel, starts a Claude Code session in a terminal, and connects automatically. A guided tour walks you through all controls on first launch.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <h3>Talk or Type</h3>
+            <p>Tap the talk button or press <span class="kbd">Right Cmd</span> to start recording. Speak your request, release to send. Claude's response appears as conversation bubbles and is read aloud. Type in the text input for keyboard-based interaction.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-num">5</div>
+          <div class="step-body">
+            <h3>Choose Your Mode</h3>
+            <p>Tap the mode button to cycle between Talk, Type, Read, and Text. Each mode adjusts mic and speaker behavior. Use the terminal panel to see Claude's full output and navigate with arrow keys.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Modes -->
+  <section class="modes">
+    <div class="container">
+      <h2>Interaction Modes</h2>
+      <p class="subtitle">Switch modes with a single tap on the mode button.</p>
+
+      <div class="mode-grid">
+        <div class="mode-card talk">
+          <div class="mode-name">Talk</div>
+          <div class="mode-desc">Full voice conversation. Speak in, hear back.</div>
+          <div class="mode-io">Mic on + Speaker on</div>
+        </div>
+        <div class="mode-card type">
+          <div class="mode-name">Type</div>
+          <div class="mode-desc">Type your input, hear Claude respond aloud.</div>
+          <div class="mode-io">Mic off + Speaker on</div>
+        </div>
+        <div class="mode-card read">
+          <div class="mode-name">Read</div>
+          <div class="mode-desc">Speak your input, read Claude's response.</div>
+          <div class="mode-io">Mic on + Speaker off</div>
+        </div>
+        <div class="mode-card text">
+          <div class="mode-name">Text</div>
+          <div class="mode-desc">Keyboard only. No audio input or output.</div>
+          <div class="mode-io">Mic off + Speaker off</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Keyboard Shortcuts -->
+  <section class="shortcuts" id="shortcuts">
+    <div class="container">
+      <h2>Keyboard Shortcuts</h2>
+
+      <div class="shortcut-grid">
+        <div class="shortcut-row">
+          <span class="sc-label">Push to talk</span>
+          <span class="sc-key">Right Cmd</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="sc-label">Stop TTS / cancel</span>
+          <span class="sc-key">Escape</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="sc-label">Send text input</span>
+          <span class="sc-key">Enter</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="sc-label">Terminal: previous command</span>
+          <span class="sc-key">Up / Down</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="sc-label">Debug panel</span>
+          <span class="sc-key">Ctrl + Shift + D</span>
+        </div>
+        <div class="shortcut-row">
+          <span class="sc-label">Chat font zoom</span>
+          <span class="sc-key">+ / -</span>
+        </div>
       </div>
     </div>
   </section>
@@ -619,7 +962,7 @@ npm run electron</code></pre>
           <code>uv tool install voicemode</code>
         </li>
         <li>
-          <strong>tmux</strong> <span class="platform-tag">macOS only</span> — Windows uses node-pty automatically, no extra install needed
+          <strong>tmux</strong> <span class="platform-tag">macOS only</span> -- Windows uses node-pty automatically, no extra install needed
         </li>
       </ul>
     </details>
