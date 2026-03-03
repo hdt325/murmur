@@ -13,4 +13,6 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   close: () => ipcRenderer.send("close-panel"),
   // One-click prerequisite installs
   installPrereq: (name) => ipcRenderer.invoke("install-prereq", name),
+  // App updates
+  checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
 });

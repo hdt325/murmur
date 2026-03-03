@@ -548,6 +548,17 @@ function setupAutoUpdater() {
   autoUpdater.checkForUpdatesAndNotify().catch(() => {});
 }
 
+// Manual update check from UI
+ipcMain.handle("check-for-updates", async () => {
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    if (!result || !result.updateInfo) return { status: "up-to-date" };
+    return { status: "available", version: result.updateInfo.version };
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
+});
+
 // Handle retry from loading page
 ipcMain.on("retry-startup", () => {
   startup();

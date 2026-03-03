@@ -968,6 +968,7 @@
       <div class="help-menu" id="helpMenu">
         <button onclick="startTour(); document.getElementById('helpMenu').classList.remove('open')">Take Guided Tour</button>
         <button onclick="toggleDebugPanel(); document.getElementById('helpMenu').classList.remove('open')">Debug Panel</button>
+        <button onclick="checkForAppUpdate(); document.getElementById('helpMenu').classList.remove('open')">Check for Updates</button>
         <div class="help-sep"></div>
         <a href="https://murmur.happythakkar.com" target="_blank">Murmur Homepage</a>
         <a href="https://github.com/hdt325/murmur" target="_blank">GitHub</a>
@@ -1066,6 +1067,21 @@
   function dbgTime(ts) {
     const d = new Date(ts);
     return d.toLocaleTimeString("en-US", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+  }
+
+  async function checkForAppUpdate() {
+    if (!window.murmurElectron?.checkForUpdates) {
+      alert("Update check is only available in the desktop app.");
+      return;
+    }
+    const result = await window.murmurElectron.checkForUpdates();
+    if (result.status === "available") {
+      // update-downloaded handler in main.js will show the install dialog
+    } else if (result.status === "up-to-date") {
+      alert("You're on the latest version.");
+    } else {
+      alert("Update check failed: " + (result.message || "unknown error"));
+    }
   }
 
   function toggleDebugPanel() {
