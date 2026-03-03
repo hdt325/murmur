@@ -96,6 +96,7 @@ async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean }
 }
 
 let serviceStatus = { whisper: false, kokoro: false };
+let lastServiceCheckAt = 0;
 
 // --- Pipeline Instrumentation ---
 // Timestamped event log for debugging TTS/transcription timing issues.
@@ -200,6 +201,7 @@ function sendMurmurContext(delayMs = 2000) {
       terminal.sendText(MURMUR_CONTEXT_LINES.join(" "));
       contextSentAt = Date.now();
       console.log("[context] Sent Murmur system context to Claude (suppressed from UI)");
+      broadcast({ type: "context_sent" });
     }
   }, delayMs);
 }
@@ -2057,8 +2059,15 @@ function handleWsConnection(ws: WebSocket) {
     })
   );
 
-  // Send service status
+  // Send service status — re-check if last check was > 30s ago to ensure accuracy for new clients
   ws.send(JSON.stringify({ type: "services", ...serviceStatus }));
+  const timeSinceLastServiceCheck = Date.now() - lastServiceCheckAt;
+  if (timeSinceLastServiceCheck > 30000) {
+    checkAllServices().then(status => {
+      serviceStatus = status;
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "services", ...status }));
+    });
+  }
 
   // Send conversation entries so reconnecting clients see the full history
   if (conversationEntries.length > 0) {
@@ -2857,18 +2866,20 @@ try {
 // Check services on startup
 checkAllServices().then(status => {
   serviceStatus = status;
+  lastServiceCheckAt = Date.now();
   broadcast({ type: "services", ...status });
 });
 
-// Re-check services periodically (every 60s)
+// Re-check services periodically (every 30s)
 setInterval(async () => {
   const prev = { ...serviceStatus };
   serviceStatus.whisper = await checkService("Whisper STT", WHISPER_URL);
   serviceStatus.kokoro = await checkService("Kokoro TTS", KOKORO_URL);
+  lastServiceCheckAt = Date.now();
   if (prev.whisper !== serviceStatus.whisper || prev.kokoro !== serviceStatus.kokoro) {
     broadcast({ type: "services", ...serviceStatus });
   }
-}, 60000);
+}, 30000);
 
 // Broadcast tmux pane content with ANSI colors for the terminal panel (every 500ms)
 let lastTerminalText = "";

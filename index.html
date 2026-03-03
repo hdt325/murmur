@@ -1659,7 +1659,8 @@
     navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).then((stream) => {
       console.log("[mic] Mic access granted");
       micStream = stream;
-      const audioCtx = new AudioContext();
+      // Reuse pre-unlocked AudioContext if available (iOS: unlocked on first gesture)
+      const audioCtx = ttsAudioCtx || new AudioContext();
       ttsAudioCtx = audioCtx; // Share for TTS playback
       const source = audioCtx.createMediaStreamSource(stream);
       const micGain = audioCtx.createGain();
@@ -1830,6 +1831,26 @@
     talkWaveAnalyserRef = null;
     talkWaveDataRef = null;
   }
+
+  // iOS audio unlock: create AudioContext on first user gesture so TTS works before mic is granted.
+  // iOS requires a user gesture to start audio — this pre-unlocks it on the first tap/click.
+  (function() {
+    function unlockAudio() {
+      document.removeEventListener("click", unlockAudio);
+      document.removeEventListener("touchstart", unlockAudio);
+      if (!ttsAudioCtx) {
+        try {
+          ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          if (ttsAudioCtx.state === "suspended") ttsAudioCtx.resume();
+          console.log("[audio] AudioContext pre-unlocked on first gesture");
+        } catch (e) { console.warn("[audio] AudioContext create failed:", e); }
+      } else if (ttsAudioCtx.state === "suspended") {
+        ttsAudioCtx.resume();
+      }
+    }
+    document.addEventListener("click", unlockAudio);
+    document.addEventListener("touchstart", unlockAudio, { passive: true });
+  })();
 
   // Auto-init mic on load, click mic meter or talk button as fallback
   setTimeout(initMicMeter, 500);
@@ -2050,6 +2071,13 @@
         svcKokoro.className = "svc-dot " + (msg.kokoro ? "up" : "down");
         svcWhisper.dataset.tip = msg.whisper ? "Whisper STT: running" : "Whisper STT: offline";
         svcKokoro.dataset.tip = msg.kokoro ? "Kokoro TTS: running" : "Kokoro TTS: offline";
+      }
+
+      if (msg.type === "context_sent") {
+        // Brief indicator that Murmur system context was injected into Claude session
+        const prev = statusText.textContent;
+        statusText.textContent = "Context active";
+        setTimeout(() => { if (statusText.textContent === "Context active") statusText.textContent = prev; }, 3000);
       }
 
       if (msg.type === "signal") {
@@ -3398,6 +3426,18 @@
   document.getElementById("termKeyEnter").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:enter"); });
   document.getElementById("termKeyEsc").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:escape"); });
   document.getElementById("termKeyTab").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:tab"); });
+
+  // Terminal keyboard persistence: capture arrow/special keys when terminal is open
+  document.addEventListener("keydown", (e) => {
+    if (!terminalOpen) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Don't capture when typing in a text input
+    const tag = document.activeElement?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    const keyMap = { ArrowUp: "key:up", ArrowDown: "key:down", Escape: "key:escape", Tab: "key:tab", Enter: "key:enter" };
+    const cmd = keyMap[e.key];
+    if (cmd) { e.preventDefault(); ws.send(cmd); }
+  });
 
   function sendTerminalInput() {
     const text = terminalInput.value.trim();
