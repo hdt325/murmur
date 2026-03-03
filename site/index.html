@@ -729,20 +729,38 @@
       </a>
     </div>
     <p style="font-size:0.82rem;color:var(--text-muted);margin-top:14px" id="launchHint">Launch App opens the web UI — requires the desktop app running in the background.</p>
-    <!-- Remote access hint shown on non-desktop devices -->
-    <div id="remoteHint" style="display:none;margin-top:12px;padding:12px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;font-size:0.85rem;color:var(--text-muted);max-width:420px;margin-left:auto;margin-right:auto">
-      <strong style="color:var(--text)">On a phone or remote device?</strong><br>
-      Use your Mac's Tailscale IP instead:<br>
-      <code style="color:var(--accent);font-size:0.9rem">https://&lt;tailscale-ip&gt;:3458</code><br>
-      <span style="font-size:0.78rem">Find it on your Mac: <code>tailscale ip</code></span>
-    </div>
     <script>
-      // Show remote hint when not on localhost
       (function() {
         var h = window.location.hostname;
-        if (h !== 'localhost' && h !== '127.0.0.1' && h !== '') {
-          document.getElementById('remoteHint').style.display = 'block';
+        var isRemote = h !== 'localhost' && h !== '127.0.0.1' && h !== '';
+        if (!isRemote) return;
+
+        var btn = document.getElementById('launchBtn');
+        var LS_KEY = 'murmur-tailscale-ip';
+
+        function buildUrl(ip) {
+          return 'https://' + ip + ':3458';
         }
+
+        // If we have a saved IP, update the button href immediately
+        var saved = localStorage.getItem(LS_KEY);
+        if (saved) btn.href = buildUrl(saved);
+
+        btn.addEventListener('click', function(e) {
+          e.preventDefault();
+          var current = localStorage.getItem(LS_KEY) || '';
+          var ip = window.prompt("Enter your Mac's Tailscale IP\n(run 'tailscale ip' on your Mac to find it):", current);
+          if (!ip) return;
+          ip = ip.trim();
+          localStorage.setItem(LS_KEY, ip);
+          btn.href = buildUrl(ip);
+          window.location.href = buildUrl(ip);
+        });
+
+        // Update hint text
+        document.getElementById('launchHint').textContent = saved
+          ? 'Saved IP: ' + saved + ' — click Launch App to connect, or click again to change.'
+          : "On a remote device? Click Launch App and enter your Mac's Tailscale IP (https://<ip>:3458).";
       })();
     </script>
   </section>
