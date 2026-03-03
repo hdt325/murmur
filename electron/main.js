@@ -521,9 +521,13 @@ function setupAutoUpdater() {
     console.log("Update available:", info.version);
   });
 
-  autoUpdater.on("update-downloaded", (info) => {
-    // Notify user that an update is ready
-    const response = dialog.showMessageBoxSync(win, {
+  autoUpdater.on("update-downloaded", async (info) => {
+    // Bring window to front so the dialog is visible
+    if (win && !win.isDestroyed()) {
+      win.show();
+      win.focus();
+    }
+    const { response } = await dialog.showMessageBox(win && !win.isDestroyed() ? win : null, {
       type: "info",
       title: "Update Ready",
       message: `Murmur ${info.version} is ready to install.`,
