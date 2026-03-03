@@ -3,7 +3,7 @@
  * Replaces panel.swift (macOS-only) with Electron (macOS + Windows).
  */
 
-const { app, BrowserWindow, globalShortcut, Tray, Menu, screen, session, nativeImage, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, globalShortcut, Tray, Menu, screen, session, nativeImage, ipcMain, dialog, systemPreferences } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { spawn, execSync } = require("child_process");
@@ -616,6 +616,11 @@ app.whenReady().then(async () => {
     if (fs.existsSync(iconPath)) {
       app.dock.setIcon(nativeImage.createFromPath(iconPath));
     }
+  }
+
+  // Request microphone permission once at startup (macOS)
+  if (process.platform === "darwin") {
+    systemPreferences.askForMediaAccess("microphone").catch(() => {});
   }
 
   createWindow();
