@@ -1131,9 +1131,11 @@
     }
     const result = await window.murmurElectron.checkForUpdates();
     if (result.status === "available") {
-      // update-downloaded handler in main.js will show the install dialog
+      alert(`Murmur ${result.version} is available — downloading in the background.\nYou'll see a banner at the top when it's ready to install.`);
     } else if (result.status === "up-to-date") {
-      alert("You're on the latest version.");
+      alert(`You're on the latest version (${result.version || "current"}).`);
+    } else if (result.status === "dev") {
+      alert("Running from source — updates are managed via git pull.");
     } else {
       alert("Update check failed: " + (result.message || "unknown error"));
     }

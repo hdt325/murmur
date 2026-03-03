@@ -580,8 +580,15 @@ ipcMain.handle("check-for-updates", async () => {
   }
   try {
     const result = await autoUpdater.checkForUpdates();
-    if (!result || !result.updateInfo) return { status: "up-to-date" };
-    return { status: "available", version: result.updateInfo.version };
+    if (!result || !result.updateInfo) return { status: "up-to-date", version: app.getVersion() };
+    const latest = result.updateInfo.version;
+    const current = app.getVersion();
+    if (latest === current) return { status: "up-to-date", version: current };
+    // Compare as version numbers (e.g. 1.0.63 vs 1.0.62)
+    const latestNum = latest.split(".").reduce((a, n, i) => a + parseInt(n) * Math.pow(1000, 2 - i), 0);
+    const currentNum = current.split(".").reduce((a, n, i) => a + parseInt(n) * Math.pow(1000, 2 - i), 0);
+    if (latestNum <= currentNum) return { status: "up-to-date", version: current };
+    return { status: "available", version: latest };
   } catch (err) {
     return { status: "error", message: err.message };
   }

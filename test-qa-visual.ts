@@ -267,6 +267,37 @@ async function runWebUITests() {
     if (replay) ok(`Replay: ${replay.width.toFixed(0)}x${replay.height.toFixed(0)}px`);
     else fail("Replay", "not found");
 
+    // 16. Check for Updates — must show feedback (not silently do nothing)
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.waitForTimeout(300);
+    // Open help menu
+    const helpBtnQA = page.locator("#helpBtn");
+    await helpBtnQA.click({ force: true });
+    await page.waitForTimeout(300);
+    // Click "Check for Updates"
+    const updBtn = page.locator("#helpMenu button", { hasText: "Check for Updates" });
+    if (await updBtn.isVisible().catch(() => false)) {
+      // Intercept the dialog that should appear
+      let dialogText = "";
+      page.once("dialog", async (dlg) => {
+        dialogText = dlg.message();
+        await dlg.dismiss();
+      });
+      await updBtn.click({ force: true });
+      // Wait up to 8s for dialog (network call)
+      for (let i = 0; i < 16; i++) {
+        await page.waitForTimeout(500);
+        if (dialogText) break;
+      }
+      if (dialogText) ok(`Check for Updates dialog: "${dialogText.slice(0, 80)}"`);
+      else fail("Check for Updates", "no dialog appeared after click");
+    } else {
+      fail("Check for Updates button", "not visible in help menu");
+    }
+    // Close help menu
+    await page.locator(".header").click({ force: true });
+    await page.waitForTimeout(200);
+
   } catch (e: any) {
     fail("FATAL (web)", e.message);
     console.error(e);
