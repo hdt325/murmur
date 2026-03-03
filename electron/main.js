@@ -602,6 +602,9 @@ ipcMain.handle("install-prereq", async (_event, name) => {
   }
 });
 
+// Expose app version to preload
+ipcMain.on("get-app-version", (e) => { e.returnValue = app.getVersion(); });
+
 // Handle close from panel UI
 ipcMain.on("close-panel", () => {
   app.quit();
