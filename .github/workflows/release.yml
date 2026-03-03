@@ -87,3 +87,20 @@ jobs:
           EXE=$(find electron/dist -name '*.exe' -size +1M | head -1)
           if [ -z "$EXE" ]; then echo "ERROR: No exe found or file too small"; exit 1; fi
           echo "EXE OK: $(basename $EXE)"
+
+  # Verify both platforms published successfully
+  verify-release:
+    needs: [build-mac, build-win]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check release has both platform assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          ASSETS=$(echo "$RELEASE" | jq -r '.assets[].name')
+          echo "Release assets:"
+          echo "$ASSETS"
+          echo "$ASSETS" | grep -q '\.dmg' || echo "WARNING: No DMG in release"
+          echo "$ASSETS" | grep -q '\.exe' || echo "WARNING: No exe in release"

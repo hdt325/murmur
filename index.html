@@ -1237,6 +1237,34 @@
     if (ws?.readyState === WebSocket.OPEN) ws.send("log:" + msg);
   }
   const transcript = document.getElementById("transcript");
+
+  // Event delegation for transcript — handles click-to-copy and replay for all bubbles
+  transcript.addEventListener("click", (e) => {
+    // Replay button click
+    const replayBtn = e.target.closest(".msg-replay");
+    if (replayBtn) {
+      e.stopPropagation();
+      const wrap = replayBtn.closest(".msg-wrap");
+      const bubble = wrap?.querySelector(".msg");
+      if (bubble?.dataset.replayPayload && ws?.readyState === WebSocket.OPEN) {
+        _replayTargetBubble = bubble;
+        ws.send("replay:" + bubble.dataset.replayPayload);
+      }
+      return;
+    }
+    // Click-to-copy on message bubble
+    const bubble = e.target.closest(".msg");
+    if (bubble?.dataset.copyText) {
+      navigator.clipboard.writeText(bubble.dataset.copyText).then(() => {
+        const toast = document.createElement("span");
+        toast.className = "copied-toast";
+        toast.textContent = "Copied";
+        bubble.appendChild(toast);
+        setTimeout(() => toast.remove(), 800);
+      });
+    }
+  });
+
   const emptyState = document.getElementById("emptyState");
   const statusText = document.getElementById("statusText");
   const statusDot = document.getElementById("statusDot");
@@ -2030,28 +2058,15 @@
         ? `<div class="meta"><span class="role">${role === "user" ? "You" : "Claude"}</span><span class="time">${timeStr}</span></div>`
         : "";
       div.innerHTML = metaHtml + escapeHtml(para);
-
-      div.addEventListener("click", () => {
-        navigator.clipboard.writeText(para).then(() => {
-          const toast = document.createElement("span");
-          toast.className = "copied-toast";
-          toast.textContent = "Copied";
-          div.appendChild(toast);
-          setTimeout(() => toast.remove(), 800);
-        });
-      });
+      div.dataset.copyText = para;
 
       if (role === "assistant") {
+        div.dataset.replayPayload = para;
         const wrap = document.createElement("div");
         wrap.className = "msg-wrap";
         const replayBtn = document.createElement("button");
         replayBtn.className = "msg-replay";
         replayBtn.textContent = "↻";
-        replayBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          _replayTargetBubble = div;
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send("replay:" + para);
-        });
         wrap.appendChild(div);
         wrap.appendChild(replayBtn);
         transcript.appendChild(wrap);
@@ -2218,28 +2233,15 @@
         div.innerHTML =
           `<div class="meta"><span class="role">${roleName}</span><span class="time">${timeStr}</span></div>` +
           `<span class="entry-text">${escapeHtml(entry.text)}</span>`;
-
-        // Click-to-copy
-        div.addEventListener("click", () => {
-          navigator.clipboard.writeText(entry.text).then(() => {
-            const toast = document.createElement("span");
-            toast.className = "copied-toast";
-            toast.textContent = "Copied";
-            div.appendChild(toast);
-            setTimeout(() => toast.remove(), 800);
-          });
-        });
+        div.dataset.copyText = entry.text;
 
         if (entry.role === "assistant") {
+          div.dataset.replayPayload = String(entry.id);
           const wrap = document.createElement("div");
           wrap.className = "msg-wrap";
           const replayBtn = document.createElement("button");
           replayBtn.className = "msg-replay";
           replayBtn.textContent = "\u21bb";
-          replayBtn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (ws && ws.readyState === WebSocket.OPEN) ws.send("replay:" + entry.id);
-          });
           wrap.appendChild(div);
           wrap.appendChild(replayBtn);
           transcript.appendChild(wrap);
