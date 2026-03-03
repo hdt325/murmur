@@ -532,30 +532,13 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on("update-downloaded", (info) => {
-    // Bring window to front so the dialog is visible
+    console.log("Update downloaded:", info.version);
+    // Show persistent in-app banner (can't be dismissed by accident)
     if (win && !win.isDestroyed()) {
       win.show();
       win.focus();
+      win.webContents.send("update-ready", { version: info.version });
     }
-    dialog.showMessageBox(win && !win.isDestroyed() ? win : null, {
-      type: "info",
-      title: "Update Ready",
-      message: `Murmur ${info.version} is ready to install.`,
-      detail: "Restart now to apply the update.",
-      buttons: ["Restart Now", "Later"],
-      defaultId: 0,
-    }).then(({ response }) => {
-      if (response === 0) {
-        // Force quit: remove all listeners that could block exit
-        app.removeAllListeners("window-all-closed");
-        app.removeAllListeners("will-quit");
-        if (win && !win.isDestroyed()) {
-          win.removeAllListeners("close");
-          win.destroy();
-        }
-        setImmediate(() => autoUpdater.quitAndInstall(false, true));
-      }
-    });
   });
 
   autoUpdater.on("error", (err) => {
@@ -565,6 +548,30 @@ function setupAutoUpdater() {
   // Check for updates silently
   autoUpdater.checkForUpdatesAndNotify().catch(() => {});
 }
+
+// Install update from in-app banner button
+ipcMain.on("install-update", () => {
+  try {
+    app.removeAllListeners("window-all-closed");
+    app.removeAllListeners("will-quit");
+    if (win && !win.isDestroyed()) {
+      win.removeAllListeners("close");
+      win.destroy();
+    }
+    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+  } catch (err) {
+    console.log("quitAndInstall failed:", err.message);
+    // Fallback: open download page in browser
+    const { shell } = require("electron");
+    shell.openExternal("https://github.com/hdt325/murmur/releases/latest");
+  }
+});
+
+// Open releases page in browser (Download fallback button)
+ipcMain.on("open-releases-page", () => {
+  const { shell } = require("electron");
+  shell.openExternal("https://github.com/hdt325/murmur/releases/latest");
+});
 
 // Manual update check from UI
 ipcMain.handle("check-for-updates", async () => {

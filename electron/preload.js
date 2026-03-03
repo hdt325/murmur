@@ -16,4 +16,7 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   installPrereq: (name) => ipcRenderer.invoke("install-prereq", name),
   // App updates
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
+  onUpdateReady: (callback) => ipcRenderer.on("update-ready", (_e, info) => callback(info)),
+  installUpdate: () => ipcRenderer.send("install-update"),
+  openReleasesPage: () => ipcRenderer.send("open-releases-page"),
 });
