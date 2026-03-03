@@ -670,15 +670,22 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
+let quitting = false;
 app.on("will-quit", (e) => {
   globalShortcut.unregisterAll();
 
-  if (serverProcess) {
+  // Destroy tray so macOS doesn't keep the process alive
+  if (tray) { tray.destroy(); tray = null; }
+
+  if (serverProcess && !quitting) {
     // Prevent immediate quit — wait for server to exit cleanly
+    quitting = true;
     e.preventDefault();
     const proc = serverProcess;
     const killTimeout = setTimeout(() => {
       try { proc.kill("SIGKILL"); } catch {}
+      serverProcess = null;
+      app.quit();
     }, 3000);
     proc.once("exit", () => {
       clearTimeout(killTimeout);
