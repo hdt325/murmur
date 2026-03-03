@@ -972,6 +972,8 @@
         <div class="help-sep"></div>
         <a href="https://murmur.happythakkar.com" target="_blank">Murmur Homepage</a>
         <a href="https://github.com/hdt325/murmur" target="_blank">GitHub</a>
+        <div class="help-sep"></div>
+        <span id="helpVersion" style="display:block;padding:6px 14px;font-size:0.78rem;color:#71717a;cursor:default"></span>
       </div>
     </div>
   </div>
@@ -3268,6 +3270,8 @@
   const helpBtn = document.getElementById("helpBtn");
   const helpMenu = document.getElementById("helpMenu");
   helpBtn.addEventListener("click", () => helpMenu.classList.toggle("open"));
+  const ver = window.murmurElectron?.version;
+  document.getElementById("helpVersion").textContent = ver ? `v${ver}` : "dev";
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".help-wrap")) helpMenu.classList.remove("open");
   });

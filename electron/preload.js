@@ -7,6 +7,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("murmurElectron", {
   platform: process.platform,
   isElectron: true,
+  version: require("./package.json").version,
   // Startup diagnostics
   onStartupStatus: (callback) => ipcRenderer.on("startup-status", (_e, data) => callback(data)),
   retry: () => ipcRenderer.send("retry-startup"),
