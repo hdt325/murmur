@@ -568,6 +568,9 @@ function setupAutoUpdater() {
 
 // Manual update check from UI
 ipcMain.handle("check-for-updates", async () => {
+  if (!app.isPackaged) {
+    return { status: "dev", message: "Auto-update disabled in dev mode. Use git pull." };
+  }
   try {
     const result = await autoUpdater.checkForUpdates();
     if (!result || !result.updateInfo) return { status: "up-to-date" };
@@ -645,7 +648,11 @@ app.whenReady().then(async () => {
   createWindow();
   createTray();
   registerHotkey();
-  setupAutoUpdater();
+  // Auto-updater only works on packaged builds (not dev source runs)
+  // For source installs, the content auto-updater in startup() handles updates
+  if (app.isPackaged) {
+    setupAutoUpdater();
+  }
 
   // Run startup sequence (loading page is already showing)
   // Small delay to ensure loading page is rendered before sending messages
