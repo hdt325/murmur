@@ -16,10 +16,10 @@ jobs:
   build-mac:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
@@ -46,13 +46,19 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: cd electron && npm run release:mac
 
+      - name: Validate macOS artifacts
+        run: |
+          DMG=$(find electron/dist -name '*.dmg' -size +1M | head -1)
+          if [ -z "$DMG" ]; then echo "ERROR: No DMG found or file too small"; exit 1; fi
+          echo "DMG OK: $(basename $DMG) ($(du -h $DMG | cut -f1))"
+
   build-win:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
 
@@ -74,3 +80,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: cd electron && npm run release:win
+
+      - name: Validate Windows artifacts
+        shell: bash
+        run: |
+          EXE=$(find electron/dist -name '*.exe' -size +1M | head -1)
+          if [ -z "$EXE" ]; then echo "ERROR: No exe found or file too small"; exit 1; fi
+          echo "EXE OK: $(basename $EXE)"

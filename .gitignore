@@ -5,6 +5,15 @@ tests/test-audio/
 tests/screenshots/
 test-results/
 Murmur.app/
-/tmp/
+tmp/
 *.output
+*.log
 .DS_Store
+electron/dist/
+dist/
+build/
+.env
+.env.local
+.env.*.local
+*.swp
+.cache/

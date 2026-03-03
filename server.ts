@@ -523,6 +523,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
     if (!existsSync(ttsFile) || statSync(ttsFile).size < 100) {
       console.error("[tts] Produced empty/missing file");
+      ttsRetryCount = 0; // Reset retry counter on empty file (curl succeeded but output bad)
       ttsInProgress = false;
       broadcast({ type: "voice_status", state: "idle" });
       return;
@@ -2333,6 +2334,11 @@ function handleWsConnection(ws: WebSocket) {
     // Voice
     if (msg.startsWith("voice:")) {
       const voice = msg.slice(6).trim();
+      const localVoiceName = voice.startsWith("_local:") ? voice.slice(7) : "";
+      if (localVoiceName && !/^[a-zA-Z0-9 _\-().]+$/.test(localVoiceName)) {
+        console.warn(`[voice] Rejected unsafe local voice name: "${localVoiceName}"`);
+        return;
+      }
       if (voice && (VALID_VOICES.has(voice) || voice.startsWith("_local:"))) {
         writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), voice);
         saveSettings({ voice });
@@ -2901,3 +2907,9 @@ function cleanup() {
 
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] Unhandled rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] Uncaught exception:", err);
+});

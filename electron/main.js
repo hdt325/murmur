@@ -301,7 +301,10 @@ async function applyContentUpdates(updates) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(localPath, content);
+    // Atomic write: write to temp file then rename (prevents corruption on crash)
+    const tmpPath = localPath + ".tmp";
+    fs.writeFileSync(tmpPath, content);
+    fs.renameSync(tmpPath, localPath);
     console.log(`[update] Updated ${file}`);
   }
 }
@@ -447,12 +450,13 @@ function createWindow() {
     `);
   });
 
-  // Auto-grant all permissions (microphone, camera, etc.) for localhost
+  // Grant only needed permissions for localhost (microphone for STT, notifications for updates)
+  const ALLOWED_PERMISSIONS = new Set(["media", "microphone", "notifications", "clipboard-read", "clipboard-sanitized-write"]);
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(true);
+    callback(ALLOWED_PERMISSIONS.has(permission));
   });
   session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
-    return true;
+    return ALLOWED_PERMISSIONS.has(permission);
   });
 
   // Load the startup diagnostics page first
@@ -659,11 +663,21 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
-app.on("will-quit", () => {
+app.on("will-quit", (e) => {
   globalShortcut.unregisterAll();
 
   if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
+    // Prevent immediate quit — wait for server to exit cleanly
+    e.preventDefault();
+    const proc = serverProcess;
+    const killTimeout = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+    }, 3000);
+    proc.once("exit", () => {
+      clearTimeout(killTimeout);
+      serverProcess = null;
+      app.quit();
+    });
+    proc.kill("SIGTERM");
   }
 });

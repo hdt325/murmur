@@ -4,6 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "npx tsx server.ts",
+    "test": "npx tsx tests/test-smoke.ts",
+    "test:e2e": "npx tsx tests/test-e2e.ts",
+    "test:bugs": "npx tsx tests/test-bugs.ts",
     "electron": "cd electron && npx electron .",
     "build:mac": "cd electron && npx electron-builder --mac",
     "build:win": "cd electron && npx electron-builder --win"

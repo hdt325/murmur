@@ -147,12 +147,17 @@ export class TmuxBackend implements TerminalManager {
         timeout: 2000,
       });
     } catch {}
-    // Start new pipe
+    // Sanitize filePath — only allow alphanumeric, dash, underscore, dot, slash
+    if (!/^[a-zA-Z0-9._\-\/]+$/.test(filePath)) {
+      console.error("[tmux] Rejected unsafe pipe-pane path:", filePath);
+      return;
+    }
+    // Start new pipe using execFileSync to avoid shell injection
     try {
-      execSync(
-        `tmux pipe-pane -O -t ${TMUX_SESSION} 'cat >> ${filePath}'`,
-        { stdio: "ignore", timeout: 2000 }
-      );
+      execFileSync("tmux", [
+        "pipe-pane", "-O", "-t", TMUX_SESSION,
+        `cat >> ${filePath}`
+      ], { stdio: "ignore", timeout: 2000 });
     } catch (e) {
       console.error("[tmux] Failed to start pipe-pane:", e);
     }
@@ -169,5 +174,12 @@ export class TmuxBackend implements TerminalManager {
 
   destroy(): void {
     this.stopPipeStream();
+    // Kill the tmux session to prevent leaking
+    try {
+      execSync(`tmux kill-session -t ${TMUX_SESSION}`, {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+    } catch {}
   }
 }
