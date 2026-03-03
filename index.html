@@ -94,7 +94,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 14px;
+    padding: calc(6px + env(safe-area-inset-top, 0px)) 14px 6px;
     background: #222226;
     border-bottom: 1px solid #333338;
     height: 28px;
@@ -682,7 +682,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 5px 12px calc(6px + env(safe-area-inset-bottom, 0px));
+    padding: 5px 12px calc(10px + env(safe-area-inset-bottom, 0px));
     background: #222226;
     flex-shrink: 0;
   }
