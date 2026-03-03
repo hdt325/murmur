@@ -233,8 +233,8 @@ npm run test:bugs     # Regression tests
 
 | Test File | Purpose | Requires |
 |-----------|---------|----------|
-| `test-smoke.ts` | 14 UI smoke tests | server:3457 |
-| `test-e2e.ts` | 60+ E2E tests (all features) | server:3457 + Claude session |
+| `test-smoke.ts` | 20 UI smoke tests | server:3457 |
+| `test-e2e.ts` | 91 E2E tests (all features) | server:3457 + Claude session |
 | `test-bugs.ts` | 11+ regression tests | server:3457 |
 | `test-detection.ts` | Poll detection unit tests | optional: tmux |
 | `test-audio-pipeline.ts` | STT/TTS integration | server + Whisper + Kokoro |
@@ -246,14 +246,14 @@ Tests use Playwright. Run from project root, server must be running on :3457.
 
 ### Known Flaky Tests
 
-5 tests are flaky due to state leakage (prior interactions affect later tests):
+Up to 5 tests are flaky due to state leakage (prior interactions affect later tests):
 - "Empty state shown" — messages exist from prior runs
 - "Entry bubble text matches injected entries" — stale entries from previous conversations
 - "Read mode entries render as text" — leftover TTS highlight
-- "Spoken entries have bubble-spoken class" — test state dependency
 - "Unspoken entry has full opacity" — entry marked spoken by earlier test
+- "Opacity boundary" — passive watcher re-renders entries mid-animation during active Claude sessions
 
-These require a fresh server restart between full runs for 91/91 pass.
+Typical results: **20/20 smoke**, **86/91 E2E** (with active Claude session), **91/91 E2E** (fresh server + idle Claude).
 
 ## Security Hardening
 
