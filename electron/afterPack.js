@@ -10,6 +10,10 @@ const path = require("path");
 exports.default = async function (context) {
   if (context.electronPlatformName !== "darwin") return;
 
+  // Skip temp arch-specific builds — they get merged into the universal binary.
+  // Signing them changes CodeResources hashes and breaks the universal merge.
+  if (context.appOutDir.includes("-temp")) return;
+
   const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
   const entitlements = path.join(__dirname, "entitlements.mac.plist");
 
