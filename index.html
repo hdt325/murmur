@@ -10,7 +10,8 @@
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
 <link rel="icon" type="image/png" sizes="256x256" href="/icon-256.png">
-<link rel="apple-touch-icon" href="/icon-256.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-256.png">
+<meta name="apple-mobile-web-app-title" content="Murmur">
 <title>Murmur</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -190,6 +191,8 @@
 
   .header .svc-dot.up { background: #2ecc71; }
   .header .svc-dot.down { background: #e74c3c; }
+  .header .svc-dot.audio-off { background: #f39c12; cursor: pointer; }
+  .header .svc-dot.audio-off:hover { background: #e67e22; }
 
   .header .svc-label {
     font-size: 8px;
@@ -999,6 +1002,7 @@
   <div class="svc-indicators">
     <span class="svc-label">STT</span><div class="svc-dot" id="svcWhisper" data-tip="Whisper STT"></div>
     <span class="svc-label">TTS</span><div class="svc-dot" id="svcKokoro" data-tip="Kokoro TTS"></div>
+    <span class="svc-label">🔊</span><div class="svc-dot" id="svcAudio" data-tip="Audio: this device"></div>
     <button class="svc-restart" id="restartBtn" data-tip="Restart Murmur server">⟳</button>
   </div>
   <button class="close-btn" id="closeBtn" data-tip="Close panel">✕</button>
@@ -2078,6 +2082,17 @@
         const prev = statusText.textContent;
         statusText.textContent = "Context active";
         setTimeout(() => { if (statusText.textContent === "Context active") statusText.textContent = prev; }, 3000);
+      }
+
+      if (msg.type === "audio_control") {
+        const svcAudio = document.getElementById("svcAudio");
+        if (msg.hasControl) {
+          svcAudio.className = "svc-dot up";
+          svcAudio.dataset.tip = "Audio: this device";
+        } else {
+          svcAudio.className = "svc-dot audio-off";
+          svcAudio.dataset.tip = "Audio: other device — tap to claim";
+        }
       }
 
       if (msg.type === "signal") {
@@ -3322,6 +3337,11 @@
     }
   });
 
+  // Audio control dot — tap to claim audio when another device has it
+  document.getElementById("svcAudio").addEventListener("click", () => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send("claim:audio");
+  });
+
   // Restart server button
   document.getElementById("restartBtn").addEventListener("click", () => {
     if (confirm("Restart Murmur server?")) {
@@ -3506,7 +3526,8 @@
     { target: "#cleanBtn", title: "Verbose / Clean", text: "Toggle between Clean (shows only final responses) and Verbose (shows Claude\u2019s full streaming output including tool calls and thinking).", pos: "below" },
     { target: "#terminalHeader", title: "Terminal Panel", text: "Click to expand and watch Claude Code working in real-time with ANSI colors.", pos: "above" },
     { target: "#restartBtn", title: "Restart Server", text: "Restarts the Murmur server process. Use this if something gets stuck or services disconnect.", pos: "below" },
-    { target: ".svc-indicators", title: "Service Status", text: "Green dots mean Whisper (speech-to-text) and Kokoro (text-to-speech) are running.", pos: "below" },
+    { target: ".svc-indicators", title: "Service Status", text: "STT and TTS dots show Whisper and Kokoro status. The 🔊 dot shows which device has audio output — tap it to claim audio on this device.", pos: "below" },
+    { target: ".svc-indicators", title: "Remote & Mobile Access", text: "Use Murmur from your phone via Tailscale: install Tailscale on Mac and iPhone, get your Mac\u2019s Tailscale IP (\u2018tailscale ip\u2019 in Terminal), then open https://\u3008ip\u3009:3458 on your phone. Use a Kokoro voice (Heart, Sky, etc.) for audio on remote devices \u2014 device voices only play on the Mac.", pos: "below" },
   ];
 
   let _tourOverlay, _tourSpotlight, _tourTip, _tourStep;

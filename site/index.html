@@ -922,6 +922,39 @@
     </div>
   </section>
 
+  <!-- Remote Access -->
+  <section style="padding:80px 0;background:var(--bg)" id="remote">
+    <div class="container">
+      <h2 style="font-size:2rem;font-weight:700;margin-bottom:12px">Remote &amp; Mobile Access</h2>
+      <p class="subtitle" style="margin-bottom:40px">Use Murmur from your iPhone or any browser on your local network via Tailscale.</p>
+      <div style="display:grid;gap:20px;max-width:680px;margin:0 auto">
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:24px">
+          <h3 style="font-size:1.1rem;font-weight:600;margin-bottom:16px;color:var(--green)">Setup (one-time)</h3>
+          <ol style="list-style:decimal;padding-left:20px;display:flex;flex-direction:column;gap:10px;color:var(--text-muted);font-size:0.95rem">
+            <li>Install <a href="https://tailscale.com/download" style="color:var(--blue)">Tailscale</a> on your Mac and iPhone</li>
+            <li>Sign in with the same account on both devices</li>
+            <li>In Mac Terminal, run <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">tailscale ip</code> to get your Mac's Tailscale IP</li>
+            <li>On your iPhone, open Safari and go to <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">https://&lt;ip&gt;:3458</code></li>
+            <li>Or click <strong>Launch App</strong> above and enter your Tailscale IP when prompted — it's saved for next time</li>
+          </ol>
+        </div>
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:24px">
+          <h3 style="font-size:1.1rem;font-weight:600;margin-bottom:16px;color:var(--amber)">Multi-device audio</h3>
+          <p style="color:var(--text-muted);font-size:0.95rem;line-height:1.7">When both the desktop app and your phone are connected, the <strong style="color:var(--text)">🔊 dot</strong> in the top-right shows which device has audio output. The last-connected device automatically claims audio. Tap the 🔊 dot on any device to claim audio for it.</p>
+          <p style="color:var(--text-muted);font-size:0.95rem;margin-top:12px;line-height:1.7"><strong style="color:var(--text)">Use Kokoro voices</strong> (Heart, Sky, Adam, etc.) for audio on remote devices — device voices like Samantha only play on the Mac.</p>
+        </div>
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:24px">
+          <h3 style="font-size:1.1rem;font-weight:600;margin-bottom:12px;color:var(--purple)">Requirements</h3>
+          <ul style="list-style:disc;padding-left:20px;display:flex;flex-direction:column;gap:8px;color:var(--text-muted);font-size:0.95rem">
+            <li>Desktop Murmur app must be running on your Mac (server runs locally)</li>
+            <li>Both devices on the same Tailscale network</li>
+            <li>Whisper &amp; Kokoro running on the Mac for STT/TTS</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- Download -->
   <section class="download" id="download">
     <div class="container">

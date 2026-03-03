@@ -162,7 +162,7 @@ async function testTourWalkthrough() {
   const overlayGone = !(await page.locator(".tour-overlay").isVisible());
   await screenshot("tour-done");
 
-  report("Tour has 10 steps", stepCount === 10, `${stepCount} steps: ${stepTitles.join(" → ")}`);
+  report("Tour has 11 steps", stepCount === 11, `${stepCount} steps: ${stepTitles.join(" → ")}`);
   report("Tour sets localStorage and closes overlay", overlayGone && done === "1");
 }
 

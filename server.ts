@@ -98,6 +98,41 @@ async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean }
 let serviceStatus = { whisper: false, kokoro: false };
 let lastServiceCheckAt = 0;
 
+// --- Primary Audio Client ---
+// Only the active audio client receives TTS audio (binary or local_tts).
+// Last connected real client auto-claims. Client can send "claim:audio" to take control.
+let activeAudioClient: WebSocket | null = null;
+
+function setAudioClient(ws: WebSocket | null, reason: string) {
+  if (activeAudioClient === ws) return;
+  activeAudioClient = ws;
+  console.log(`[audio] Audio control → ${ws ? "new client" : "none"} (${reason})`);
+  // Notify all clients of their new audio control state
+  for (const client of Array.from(clients)) {
+    if (client.readyState === WebSocket.OPEN) {
+      try { client.send(JSON.stringify({ type: "audio_control", hasControl: client === ws })); } catch {}
+    }
+  }
+}
+
+// Send audio (binary or JSON) only to the active audio client.
+// Falls back to first available client if no active client is set (single-client mode).
+function sendToAudioClient(data: Buffer | object) {
+  let target = activeAudioClient && activeAudioClient.readyState === WebSocket.OPEN
+    ? activeAudioClient : null;
+  if (!target) {
+    // Fallback: pick first open non-test client (handles first-connect race)
+    for (const c of Array.from(clients)) {
+      if (c.readyState === WebSocket.OPEN && !(c as any)._isTestClient) { target = c; break; }
+    }
+  }
+  if (!target) return;
+  try {
+    if (Buffer.isBuffer(data)) target.send(data);
+    else target.send(JSON.stringify(data));
+  } catch { clients.delete(target); if (activeAudioClient === target) activeAudioClient = null; }
+}
+
 // --- Pipeline Instrumentation ---
 // Timestamped event log for debugging TTS/transcription timing issues.
 // Available via /debug/pipeline and broadcast as pipeline_trace on cycle end.
@@ -440,9 +475,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     if (anyClientHasVoice) {
       plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
       slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
-      console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to client`);
+      console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to audio client`);
       ttsActiveGen = myGen;
-      broadcast({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
+      sendToAudioClient({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
       broadcast({ type: "voice_status", state: "speaking" });
       // Safety timeout — 10s for local TTS, with auto-fallback to Kokoro
       ttsClientTimeout = setTimeout(() => {
@@ -611,11 +646,7 @@ function handleTtsDone() {
 }
 
 function broadcastBinary(data: Buffer) {
-  for (const ws of Array.from(clients)) {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send(data); } catch { clients.delete(ws); }
-    }
-  }
+  sendToAudioClient(data);
 }
 
 // --- Tmux Streaming State Machine ---
@@ -2035,6 +2066,11 @@ function handleWsConnection(ws: WebSocket) {
   // Cancel pending exit — a client reconnected
   if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
 
+  // Last connected real client takes audio control (auto-claim)
+  if (!(ws as any)._isTestClient) {
+    setAudioClient(ws, "new-client");
+  }
+
   // First real (non-test) client connecting — send context (30s debounce built into sendMurmurContext)
   // Test clients send "test:client" as their first message to skip context/exit
   if (wasEmpty && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
@@ -2058,6 +2094,9 @@ function handleWsConnection(ws: WebSocket) {
       alive: terminal.isSessionAlive(),
     })
   );
+
+  // Send audio control state
+  ws.send(JSON.stringify({ type: "audio_control", hasControl: activeAudioClient === ws }));
 
   // Send service status — re-check if last check was > 30s ago to ensure accuracy for new clients
   ws.send(JSON.stringify({ type: "services", ...serviceStatus }));
@@ -2317,8 +2356,22 @@ function handleWsConnection(ws: WebSocket) {
 
     // TTS playback complete (from client)
     if (msg === "tts_done") {
+      // Ignore tts_done from non-audio clients to prevent double-drain
+      if (activeAudioClient && activeAudioClient !== ws && !(ws as any)._isTestClient) {
+        console.log("[tts] Ignoring tts_done from non-audio client");
+        return;
+      }
       console.log(`[tts] Received tts_done from client (activeGen=${ttsActiveGen} gen=${ttsGeneration})`);
       handleTtsDone();
+      return;
+    }
+
+    // Explicit audio control claim
+    if (msg === "claim:audio") {
+      if (!(ws as any)._isTestClient) {
+        setAudioClient(ws, "claim");
+        console.log("[audio] Client explicitly claimed audio control");
+      }
       return;
     }
 
@@ -2667,6 +2720,13 @@ function handleWsConnection(ws: WebSocket) {
       (ws as any)._isTestClient = true;
       (ws as any)._testEntryIds = new Set<number>();
       console.log("[test] Client marked as test — skipping context/exit");
+      // Yield audio control back to the main browser client
+      if (activeAudioClient === ws) {
+        const nonTest = Array.from(clients).find(
+          (c) => c !== ws && c.readyState === WebSocket.OPEN && !(c as any)._isTestClient
+        );
+        setAudioClient(nonTest || null, "test-client-yield");
+      }
       return;
     }
 
@@ -2715,6 +2775,14 @@ function handleWsConnection(ws: WebSocket) {
   ws.on("close", () => {
     clients.delete(ws);
     slog("ws", "disconnect", { clients: clients.size });
+
+    // Transfer audio control if the active client disconnected
+    if (activeAudioClient === ws) {
+      const remaining = Array.from(clients).filter(
+        c => c.readyState === WebSocket.OPEN && !(c as any)._isTestClient
+      );
+      setAudioClient(remaining.length > 0 ? remaining[remaining.length - 1] : null, "client-left");
+    }
 
     // Auto-cleanup: remove entries created by this test client
     const testIds: Set<number> | undefined = (ws as any)._testEntryIds;

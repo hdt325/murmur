@@ -131,7 +131,7 @@ async function testTourWalkthrough() {
   const overlayGone = !(await page.locator(".tour-overlay").isVisible());
   await screenshot("tour-completed");
 
-  report("Tour has 10 steps", stepCount === 10, `${stepCount} steps: ${stepTitles.join(" → ")}`);
+  report("Tour has 11 steps", stepCount === 11, `${stepCount} steps: ${stepTitles.join(" → ")}`);
   report("Tour completion sets localStorage + closes", overlayGone && done === "1");
 }
 
@@ -298,12 +298,14 @@ async function testServiceDots() {
 
   const whisperVisible = await page.locator("#svcWhisper").isVisible();
   const kokoroVisible = await page.locator("#svcKokoro").isVisible();
+  const audioVisible = await page.locator("#svcAudio").isVisible();
   const whisperClass = await page.locator("#svcWhisper").getAttribute("class");
   const kokoroClass = await page.locator("#svcKokoro").getAttribute("class");
+  const audioClass = await page.locator("#svcAudio").getAttribute("class");
   await screenshot("service-dots");
 
-  report("Service indicator dots visible", whisperVisible && kokoroVisible,
-    `whisper=${whisperClass}, kokoro=${kokoroClass}`);
+  report("Service indicator dots visible", whisperVisible && kokoroVisible && audioVisible,
+    `whisper=${whisperClass}, kokoro=${kokoroClass}, audio=${audioClass}`);
 }
 
 async function testCleanVerboseToggle() {
