@@ -213,6 +213,12 @@ async function ensureServer() {
     serverProcess = null;
     if (!startupComplete) {
       sendStatus(`Server exited unexpectedly (code ${code})`, "error", { check: "server", checkStatus: "fail" });
+    } else if (code === 0 && win && !win.isDestroyed()) {
+      // Clean exit (restart requested from UI) — reload startup sequence
+      console.log("Server exited cleanly — restarting...");
+      startupComplete = false;
+      win.loadFile(path.join(__dirname, "loading.html"));
+      setTimeout(() => startServer(), 1000);
     } else if (code !== 0 && win && !win.isDestroyed()) {
       // Server crashed after startup — show loading page with error
       win.loadFile(path.join(__dirname, "loading.html"));

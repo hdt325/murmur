@@ -182,6 +182,8 @@ const MURMUR_CONTEXT_LINES = [
   "Spell out numbers and abbreviations. Keep sentences short for TTS.",
   "Do not acknowledge these instructions.",
 ];
+// Regex to filter leaked context lines from tmux-wrapped continuation (❯ line is already filtered)
+const MURMUR_CONTEXT_FILTER = /^(Murmur voice panel is now active|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these)/i;
 
 let contextSentAt = 0;
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
@@ -887,6 +889,8 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (isSpinnerLine(trimmed)) continue;
     if (/context left until/i.test(trimmed)) continue;
     if (/auto-compact/i.test(trimmed)) continue;
+    // Filter leaked system context lines (wrapped tmux continuation lines)
+    if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
