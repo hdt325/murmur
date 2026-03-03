@@ -2332,6 +2332,16 @@ function handleWsConnection(ws: WebSocket) {
       if (voice && (VALID_VOICES.has(voice) || voice.startsWith("_local:"))) {
         writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), voice);
         saveSettings({ voice });
+        // Stop in-flight TTS and flush queue so old voice doesn't keep playing
+        if (ttsInProgress) {
+          ttsQueue = [];
+          ttsEntryIdQueue = [];
+          ++ttsGeneration;
+          ttsInProgress = false;
+          if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
+          broadcast({ type: "tts_stop" });
+          console.log(`[voice] Switched to ${voice} — stopped TTS and flushed queue`);
+        }
       } else if (voice) {
         console.warn(`[voice] Rejected invalid voice name: "${voice}"`);
       }
