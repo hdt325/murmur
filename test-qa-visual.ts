@@ -1,9 +1,11 @@
 /**
- * Murmur Visual + Functional + Electron QA
+ * Murmur Visual + Functional + Electron + Site QA
  *
  * Usage:
  *   npx tsx test-qa-visual.ts              # Web UI tests only (needs server on :3457)
  *   npx tsx test-qa-visual.ts --electron   # Full suite: launches Electron, tests UI + app lifecycle
+ *   npx tsx test-qa-visual.ts --site       # Marketing site tests only (no server needed)
+ *   npx tsx test-qa-visual.ts --all        # Everything: web UI + site + Electron
  *
  * Screenshots saved to /tmp/murmur-qa-shots/ for visual review.
  * Launches a VISIBLE browser so the user can watch.
@@ -11,11 +13,16 @@
 import { chromium } from "playwright";
 import { execSync, spawn } from "child_process";
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const SHOTS = "/tmp/murmur-qa-shots";
 fs.mkdirSync(SHOTS, { recursive: true });
 
-const ELECTRON_MODE = process.argv.includes("--electron");
+const ELECTRON_MODE = process.argv.includes("--electron") || process.argv.includes("--all");
+const SITE_MODE = process.argv.includes("--site") || process.argv.includes("--all");
 const results: string[] = [];
 const ok = (label: string) => results.push(`✓ ${label}`);
 const fail = (label: string, detail: string) => results.push(`✗ ${label}: ${detail}`);
@@ -333,19 +340,248 @@ async function runElectronTests() {
   else fail("Quit: still in dock", "");
 }
 
+// ─── Marketing Site Tests ─────────────────────────────────
+
+async function runSiteTests() {
+  console.log("\n--- Marketing Site Tests (site/index.html) ---\n");
+
+  const siteFile = path.resolve(__dirname, "site/index.html");
+  if (!fs.existsSync(siteFile)) {
+    fail("Site file", `not found at ${siteFile}`);
+    return;
+  }
+  ok("site/index.html present");
+
+  const browser = await chromium.launch({ headless: false });
+  // Grant clipboard permissions so Copy button test works
+  const ctx = await browser.newContext({
+    viewport: { width: 375, height: 812 },
+    permissions: ["clipboard-read", "clipboard-write"],
+  });
+  const page = await ctx.newPage();
+
+  try {
+    await page.goto(`file://${siteFile}`, { waitUntil: "load", timeout: 10000 });
+    await page.waitForTimeout(500);
+    await page.screenshot({ path: `${SHOTS}/site-01-mobile-375.png`, fullPage: true });
+    ok("Site loads at 375px (mobile)");
+
+    // 1. Title
+    const title = await page.title();
+    if (title.includes("Murmur")) ok(`Page title: "${title}"`);
+    else fail("Page title", `got "${title}"`);
+
+    // 2. Hero heading
+    const h1 = await page.locator("h1").first().textContent();
+    if (h1?.trim() === "Murmur") ok(`H1: "${h1?.trim()}"`);
+    else fail("H1", `got "${h1?.trim()}"`);
+
+    // 3. Hero tagline
+    const tagline = await page.locator(".tagline").textContent().catch(() => null);
+    if (tagline?.includes("voice") || tagline?.includes("Claude")) ok(`Tagline: "${tagline?.trim()}"`);
+    else fail("Tagline", tagline || "not found");
+
+    // 4. Launch App CTA — href must point to localhost:3457
+    const launchHref = await page.locator("#launchBtn").getAttribute("href").catch(() => null);
+    if (launchHref === "http://localhost:3457") ok(`Launch App href: ${launchHref}`);
+    else fail("Launch App href", launchHref || "not found");
+
+    // 5. Download CTA — href must be #download anchor
+    const dlCtaHref = await page.locator("a[href='#download']").first().getAttribute("href").catch(() => null);
+    if (dlCtaHref === "#download") ok("Download CTA href: #download");
+    else fail("Download CTA href", dlCtaHref || "not found");
+
+    // 6. Feature cards — expect 6
+    const featureCards = await page.locator(".feature-card").all();
+    if (featureCards.length === 6) ok(`Feature cards: ${featureCards.length}`);
+    else fail("Feature cards", `expected 6, got ${featureCards.length}`);
+
+    // Check feature headings text
+    const featureTitles: string[] = [];
+    for (const card of featureCards) {
+      const t = await card.locator("h3").textContent().catch(() => "");
+      featureTitles.push(t?.trim() || "");
+    }
+    ok(`Features: ${featureTitles.join(", ")}`);
+
+    // 7. Getting started steps — expect 3
+    const steps = await page.locator(".step").all();
+    if (steps.length === 3) ok(`Getting started steps: ${steps.length}`);
+    else fail("Getting started steps", `expected 3, got ${steps.length}`);
+
+    // 8. Mode cards — expect 4 (Talk/Type/Read/Text)
+    const modeCards = await page.locator(".mode-card").all();
+    const modeNames: string[] = [];
+    for (const card of modeCards) {
+      const n = await card.locator(".mode-name").textContent().catch(() => "");
+      modeNames.push(n?.trim() || "");
+    }
+    if (modeCards.length === 4 && modeNames.includes("Talk") && modeNames.includes("Text")) {
+      ok(`Mode cards: ${modeNames.join(", ")}`);
+    } else {
+      fail("Mode cards", `got: ${modeNames.join(", ")}`);
+    }
+
+    // 9. Keyboard shortcuts section visible
+    const shortcuts = await page.locator("#shortcuts").isVisible().catch(() => false);
+    if (shortcuts) ok("Shortcuts section visible");
+    else fail("Shortcuts section", "not visible");
+
+    const shortcutRows = await page.locator(".shortcut-row").all();
+    if (shortcutRows.length >= 5) ok(`Shortcut rows: ${shortcutRows.length}`);
+    else fail("Shortcut rows", `expected ≥5, got ${shortcutRows.length}`);
+
+    // 10. Download section — macOS and Windows buttons
+    const dlMac = page.locator("#dlMac");
+    const dlWin = page.locator("#dlWin");
+    if (await dlMac.isVisible().catch(() => false)) ok("macOS download button visible");
+    else fail("macOS button", "not visible");
+    if (await dlWin.isVisible().catch(() => false)) ok("Windows download button visible");
+    else fail("Windows button", "not visible");
+
+    // Buttons initially point to /releases/latest (before GitHub API resolves)
+    const macHref = await dlMac.getAttribute("href").catch(() => null);
+    const winHref = await dlWin.getAttribute("href").catch(() => null);
+    if (macHref?.includes("github.com")) ok(`macOS href: ${macHref}`);
+    else fail("macOS href", macHref || "not found");
+    if (winHref?.includes("github.com")) ok(`Windows href: ${winHref}`);
+    else fail("Windows href", winHref || "not found");
+
+    await page.screenshot({ path: `${SHOTS}/site-02-download-section.png`, clip: { x: 0, y: 0, width: 375, height: 812 } });
+
+    // 11. "Build from source" code block
+    const codeBlock = page.locator(".code-block");
+    if (await codeBlock.isVisible().catch(() => false)) {
+      const code = await codeBlock.locator("code").textContent().catch(() => "");
+      if (code?.includes("git clone") && code?.includes("npm install")) ok("Source install code block present");
+      else fail("Source install code", code?.slice(0, 60) || "empty");
+    } else {
+      fail("Code block", "not visible");
+    }
+
+    // 12. Copy button — click, verify it changes to "Copied!"
+    const copyBtn = page.locator("#copyBtn");
+    if (await copyBtn.isVisible().catch(() => false)) {
+      const before = await copyBtn.textContent();
+      await copyBtn.click({ force: true });
+      await page.waitForTimeout(300);
+      const after = await copyBtn.textContent();
+      if (after?.includes("Copied")) ok(`Copy btn: "${before?.trim()}" → "${after?.trim()}"`);
+      else fail("Copy btn text change", `still: "${after?.trim()}"`);
+      // Wait for reset
+      await page.waitForTimeout(2200);
+      const reset = await copyBtn.textContent();
+      if (reset?.trim() === "Copy") ok("Copy btn resets to 'Copy' after 2s");
+      else fail("Copy btn reset", `got "${reset?.trim()}"`);
+    } else {
+      fail("Copy button", "not visible");
+    }
+
+    // 13. Prerequisites accordion — click to expand
+    const prereqSummary = page.locator(".prereqs summary");
+    if (await prereqSummary.isVisible().catch(() => false)) {
+      await prereqSummary.click({ force: true });
+      await page.waitForTimeout(400);
+      const prereqList = page.locator(".prereq-list");
+      if (await prereqList.isVisible().catch(() => false)) {
+        const items = await prereqList.locator("li").all();
+        ok(`Prerequisites expanded (${items.length} items)`);
+        // Click again to close
+        await prereqSummary.click({ force: true });
+        await page.waitForTimeout(300);
+      } else {
+        fail("Prerequisites list", "not visible after click");
+      }
+    } else {
+      fail("Prerequisites accordion", "summary not found");
+    }
+
+    await page.screenshot({ path: `${SHOTS}/site-03-prereqs.png`, fullPage: true });
+
+    // 14. Footer — GitHub link
+    const ghLink = page.locator("footer a[href*='github.com']");
+    const ghHref = await ghLink.getAttribute("href").catch(() => null);
+    if (ghHref?.includes("github.com")) ok(`Footer GitHub: ${ghHref}`);
+    else fail("Footer GitHub", ghHref || "not found");
+    const ghTarget = await ghLink.getAttribute("target").catch(() => null);
+    if (ghTarget === "_blank") ok("GitHub link opens in new tab");
+    else fail("GitHub link target", ghTarget || "missing");
+
+    // 15. Responsive — tablet
+    await page.setViewportSize({ width: 768, height: 1024 });
+    await page.waitForTimeout(400);
+    await page.screenshot({ path: `${SHOTS}/site-04-tablet-768.png`, fullPage: true });
+    ok("Tablet (768px) screenshot captured");
+
+    // 16. Responsive — desktop
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.waitForTimeout(400);
+    await page.screenshot({ path: `${SHOTS}/site-05-desktop-1280.png`, fullPage: true });
+    ok("Desktop (1280px) screenshot captured");
+
+    // 17. All 4 main sections present
+    const sections = ["hero", "features", "howto", "download"];
+    for (const s of sections) {
+      const visible = await page.locator(`.${s}, #${s}, section.${s}`).first().isVisible().catch(() => false);
+      if (visible) ok(`Section "${s}" visible`);
+      else fail(`Section "${s}"`, "not visible");
+    }
+
+    // 18. No broken inline images (SVG icons should render)
+    const svgs = await page.locator("svg").all();
+    if (svgs.length > 10) ok(`SVG icons: ${svgs.length}`);
+    else fail("SVG icons", `expected >10, got ${svgs.length}`);
+
+    // 19. Waveform animation element present
+    const waveform = page.locator(".waveform");
+    const bars = await waveform.locator(".bar").all();
+    if (bars.length === 7) ok(`Waveform bars: ${bars.length}`);
+    else fail("Waveform", `expected 7 bars, got ${bars.length}`);
+
+    // 20. Scroll to top and take final full-page desktop shot
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(300);
+    await page.screenshot({ path: `${SHOTS}/site-06-full-desktop.png`, fullPage: true });
+    ok("Full-page desktop screenshot saved");
+
+  } catch (e: any) {
+    fail("FATAL (site)", e.message);
+    console.error(e);
+  }
+
+  await page.waitForTimeout(1500);
+  await browser.close();
+}
+
 // ─── Main ─────────────────────────────────────────────────
 
 (async () => {
-  if (ELECTRON_MODE) {
-    console.log("Mode: Electron (full suite)\n");
-    await launchElectron();
+  const parts: string[] = [];
+
+  if (!SITE_MODE || ELECTRON_MODE) {
+    // Web UI tests require the server
+    if (ELECTRON_MODE) {
+      console.log("Mode: Electron\n");
+      await launchElectron();
+    } else {
+      console.log("Mode: Web UI only (server must be running on :3457)\n");
+      console.log("Tip: --electron for Electron lifecycle, --site for marketing site, --all for everything\n");
+    }
     await runWebUITests();
-    await runElectronTests();
-    printResults("MURMUR FULL QA (Web UI + Electron)");
-  } else {
-    console.log("Mode: Web UI only (server must be running on :3457)\n");
-    console.log("Tip: use --electron for full Electron lifecycle tests\n");
-    await runWebUITests();
-    printResults("MURMUR WEB UI QA");
+    parts.push("Web UI");
   }
+
+  if (SITE_MODE) {
+    await runSiteTests();
+    parts.push("Site");
+  }
+
+  if (ELECTRON_MODE) {
+    await runElectronTests();
+    parts.push("Electron");
+  }
+
+  const label = parts.length > 0 ? parts.join(" + ") : "Web UI";
+  printResults(`MURMUR QA (${label})`);
 })();

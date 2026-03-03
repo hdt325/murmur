@@ -218,7 +218,7 @@ async function ensureServer() {
       console.log("Server exited cleanly — restarting...");
       startupComplete = false;
       win.loadFile(path.join(__dirname, "loading.html"));
-      setTimeout(() => startServer(), 1000);
+      setTimeout(() => startup(), 1000);
     } else if (code !== 0 && win && !win.isDestroyed()) {
       // Server crashed after startup — show loading page with error
       win.loadFile(path.join(__dirname, "loading.html"));
