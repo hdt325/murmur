@@ -536,9 +536,14 @@ function setupAutoUpdater() {
       defaultId: 0,
     }).then(({ response }) => {
       if (response === 0) {
-        // Remove quit listeners so nothing blocks the restart
+        // Force quit: remove all listeners that could block exit
         app.removeAllListeners("window-all-closed");
-        autoUpdater.quitAndInstall(false, true);
+        app.removeAllListeners("will-quit");
+        if (win && !win.isDestroyed()) {
+          win.removeAllListeners("close");
+          win.destroy();
+        }
+        setImmediate(() => autoUpdater.quitAndInstall(false, true));
       }
     });
   });
