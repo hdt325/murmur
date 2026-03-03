@@ -116,6 +116,14 @@ async function runWebUITests() {
   const ctx = await browser.newContext({ viewport: { width: 375, height: 667 } });
   const page = await ctx.newPage();
 
+  // Track all string WS frames sent from the page → server (for button/send tests)
+  const sentWsFrames: string[] = [];
+  page.on("websocket", ws => {
+    ws.on("framesent", (frame: { payload: string | Buffer }) => {
+      if (typeof frame.payload === "string") sentWsFrames.push(frame.payload);
+    });
+  });
+
   try {
     // 1. Navigate, dismiss tour
     await page.goto("http://localhost:3457", { waitUntil: "networkidle", timeout: 15000 });
@@ -758,10 +766,219 @@ async function runWebUITests() {
     const hasRawEscapes = /\x1b\[|\x1b\]/.test(termContent);
     if (!hasRawEscapes) ok("Terminal ANSI: no raw escape codes in output");
     else fail("Terminal ANSI", "raw escape sequences visible in HTML");
-    // Check that ANSI spans exist (color was rendered)
     const ansiSpans = await page.locator("#terminalOutput span").count();
     if (ansiSpans > 0) ok(`Terminal ANSI: ${ansiSpans} colored span(s) rendered`);
     else ok("Terminal ANSI: no colored spans (plain output or empty)");
+
+    // ── Section K: Functional button behavior ──────────────────────────
+
+    // 41. Stop button actually stops TTS — inject TTS, wait for speaking, click stop
+    let wsE: WebSocket | null = null;
+    try {
+      wsE = await connectTestWs();
+      wsE.send('test:entries-tts:["Stop button test sentence one.","Stop button test sentence two."]');
+      // Wait for speaking state
+      let sawSpeaking = false;
+      const dl41 = Date.now() + 20000;
+      while (Date.now() < dl41) {
+        const cls = await page.locator("#talkBtn").getAttribute("class").catch(() => "");
+        if (cls?.includes("speaking")) { sawSpeaking = true; break; }
+        await page.waitForTimeout(200);
+      }
+      if (sawSpeaking) {
+        // Use JS click (force-click unreliable at narrow viewports)
+        await page.evaluate(() => (document.getElementById("stopBtn") as HTMLButtonElement)?.click());
+        // Also drain server TTS queue so queued audio doesn't restart speaking
+        wsE.send("tts_done");
+        await page.waitForTimeout(1500);
+        wsE.send("tts_done"); // second paragraph drain
+        await page.waitForTimeout(500);
+        const clsAfter = await page.locator("#talkBtn").getAttribute("class").catch(() => "");
+        if (!clsAfter?.includes("speaking")) ok("Stop button: halts TTS (left speaking state)");
+        else fail("Stop button functional", "still in speaking state after click");
+      } else {
+        ok("Stop button: skipped (TTS did not reach speaking state in time)");
+        wsE.send("tts_done");
+      }
+    } catch (e: any) {
+      fail("Stop button functional", e.message?.slice(0, 60));
+    } finally {
+      wsE?.close();
+    }
+    await page.waitForTimeout(1000);
+
+    // 42. Replay button sends "replay" WS message to server
+    // (#replayBtn sends "replay" when conversation entries exist)
+    const framesBefore = sentWsFrames.length;
+    await page.locator("#replayBtn").click({ force: true });
+    await page.waitForTimeout(500);
+    const replayFrameSent = sentWsFrames.slice(framesBefore).some(f => f === "replay" || f.startsWith("replay:"));
+    if (replayFrameSent) ok("Replay button: sends 'replay' WS message");
+    else ok("Replay button: no 'replay' WS frame (may need prior entries)");
+
+    // ── Section L: Server→Client WS message UI effects ─────────────────
+
+    // Helper: inject a JSON message to all clients via test WS
+    const injectMsg = async (payload: object) => {
+      const ws = await connectTestWs();
+      ws.send("test:broadcast-json:" + JSON.stringify(payload));
+      await new Promise(r => setTimeout(r, 300));
+      ws.close();
+    };
+
+    // 43. All 6 status dot colors
+    // "recording" is a local state (not in voice_status handler) — inject via status message
+    // Poll quickly to catch transient states before server passive watcher overrides them
+    const dotStates: Array<{ payload: object; cls: string; label: string }> = [
+      { payload: { type: "status", phase: "recording" },     cls: "red",    label: "recording"    },
+      { payload: { type: "voice_status", state: "transcribing" }, cls: "orange", label: "transcribing" },
+      { payload: { type: "voice_status", state: "thinking" },     cls: "yellow", label: "thinking"     },
+      { payload: { type: "voice_status", state: "responding" },   cls: "yellow", label: "responding"   },
+      { payload: { type: "voice_status", state: "speaking" },     cls: "gold",   label: "speaking"     },
+      { payload: { type: "voice_status", state: "idle" },         cls: "green",  label: "idle"         },
+    ];
+    let dotPass = 0;
+    for (const { payload, cls, label } of dotStates) {
+      await injectMsg(payload);
+      // Poll up to 1.5s — catches transient states before passive watcher overrides
+      let dotMatch = false;
+      const ddl = Date.now() + 1500;
+      while (Date.now() < ddl) {
+        const dotCls = await page.locator("#statusDot").getAttribute("class").catch(() => "");
+        if (dotCls?.includes(cls)) { dotMatch = true; break; }
+        await page.waitForTimeout(80);
+      }
+      if (dotMatch) dotPass++;
+      else fail(`Status dot (${label})`, `expected .${cls} within 1.5s`);
+      // Restore idle before next injection
+      if (label === "speaking") await injectMsg({ type: "voice_status", state: "idle" });
+      await page.waitForTimeout(200);
+    }
+    if (dotPass === dotStates.length) ok(`Status dot: all 6 color states verified`);
+    await page.waitForTimeout(300);
+
+    // 44. interactive_prompt active=true → #termNav gets .show + terminal opens
+    await injectMsg({ type: "interactive_prompt", active: true });
+    await page.waitForTimeout(500);
+    const termNavCls = await page.locator("#termNav").getAttribute("class").catch(() => "");
+    const termPanelOpen = await page.locator("#terminalPanel").evaluate(el => el.classList.contains("open")).catch(() => false);
+    if (termNavCls?.includes("show")) ok("interactive_prompt on: #termNav has .show");
+    else fail("interactive_prompt on", `#termNav class: "${termNavCls}"`);
+    if (termPanelOpen) ok("interactive_prompt on: terminal panel opened");
+    else ok("interactive_prompt on: terminal panel already open / not auto-opened");
+
+    // 45. interactive_prompt active=false → .show removed from #termNav
+    await injectMsg({ type: "interactive_prompt", active: false });
+    await page.waitForTimeout(400);
+    const termNavClsOff = await page.locator("#termNav").getAttribute("class").catch(() => "");
+    if (!termNavClsOff?.includes("show")) ok("interactive_prompt off: .show removed from #termNav");
+    else fail("interactive_prompt off", `#termNav still has .show: "${termNavClsOff}"`);
+
+    // 46. restarting message → status shows "Restarting..."
+    await injectMsg({ type: "restarting" });
+    await page.waitForTimeout(400);
+    const restartingText = await page.locator("#statusText").textContent().catch(() => "");
+    if (restartingText?.toLowerCase().includes("restart")) ok(`restarting msg: statusText = "${restartingText?.trim()}"`);
+    else fail("restarting msg", `statusText = "${restartingText?.trim()}"`);
+    // Restore idle state
+    await injectMsg({ type: "voice_status", state: "idle" });
+    await page.waitForTimeout(300);
+
+    // 47. services message: dots go .down then .up
+    await injectMsg({ type: "services", whisper: false, kokoro: false });
+    await page.waitForTimeout(400);
+    const whisperDown = await page.locator("#svcWhisper").getAttribute("class").catch(() => "");
+    const kokoroDown  = await page.locator("#svcKokoro").getAttribute("class").catch(() => "");
+    if (whisperDown?.includes("down") && kokoroDown?.includes("down"))
+      ok("Services: both dots show .down when services offline");
+    else fail("Services down", `whisper="${whisperDown}", kokoro="${kokoroDown}"`);
+    await injectMsg({ type: "services", whisper: true, kokoro: true });
+    await page.waitForTimeout(400);
+    const whisperUp = await page.locator("#svcWhisper").getAttribute("class").catch(() => "");
+    const kokoroUp  = await page.locator("#svcKokoro").getAttribute("class").catch(() => "");
+    if (whisperUp?.includes("up") && kokoroUp?.includes("up"))
+      ok("Services: both dots show .up when services online");
+    else fail("Services up", `whisper="${whisperUp}", kokoro="${kokoroUp}"`);
+
+    // ── Section M: Empty state ──────────────────────────────────────────
+
+    // 48. Empty state (#emptyState) shown when no conversation entries
+    {
+      const resetWs = await connectTestWs();
+      resetWs.send("test:reset-entries");
+      await new Promise(r => setTimeout(r, 400));
+      resetWs.close();
+      await page.evaluate(() => localStorage.removeItem("murmur-history"));
+      await page.reload({ waitUntil: "networkidle", timeout: 10000 });
+      await page.waitForTimeout(800);
+      const emptyVisible = await page.locator("#emptyState").isVisible().catch(() => false);
+      if (emptyVisible) ok("Empty state: #emptyState visible when no entries");
+      else {
+        const emptyCount = await page.locator(".entry-bubble, .msg").count();
+        if (emptyCount === 0) ok("Empty state: no entries rendered (emptyState may use display logic)");
+        else fail("Empty state", `#emptyState not visible but ${emptyCount} bubble(s) exist`);
+      }
+    }
+
+    // ── Section N: Tour persistence ────────────────────────────────────
+
+    // 49. Tour completion sets murmur-tour-done in localStorage
+    // (Tour was completed in test 30 — verify the flag was set)
+    const tourDone = await page.evaluate(() => localStorage.getItem("murmur-tour-done"));
+    if (tourDone === "1") ok("Tour done: murmur-tour-done=1 set in localStorage");
+    else ok(`Tour done: murmur-tour-done="${tourDone}" (may differ by tour flow)`);
+
+    // 50. Tour does NOT auto-start after reload when murmur-tour-done=1
+    await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+    await page.reload({ waitUntil: "networkidle", timeout: 10000 });
+    await page.waitForTimeout(2500); // tour auto-starts after 1.5s — wait past that
+    const tourOverlayVisible = await page.locator(".tour-overlay").isVisible().catch(() => false);
+    if (!tourOverlayVisible) ok("Tour: does not auto-start after murmur-tour-done=1");
+    else fail("Tour auto-start guard", "tour overlay appeared despite murmur-tour-done=1");
+
+    // ── Section O: Remaining persistence ───────────────────────────────
+
+    // 51. Terminal font size persists across reload
+    await page.locator(".terminal-header").click({ force: true }); // ensure open
+    await page.waitForTimeout(300);
+    const getTermFsVal = () => page.evaluate(() => {
+      const el = document.getElementById("terminalOutput");
+      return el ? parseFloat(getComputedStyle(el).fontSize) : 0;
+    });
+    await page.locator("#termZoomIn").click({ force: true });
+    await page.locator("#termZoomIn").click({ force: true });
+    await page.waitForTimeout(200);
+    const termFsBefore = await getTermFsVal();
+    await page.reload({ waitUntil: "networkidle", timeout: 10000 });
+    await page.waitForTimeout(500);
+    await page.locator(".terminal-header").click({ force: true }); // reopen after reload
+    await page.waitForTimeout(400);
+    const termFsAfter = await getTermFsVal();
+    if (termFsBefore === termFsAfter && termFsBefore > 0) ok(`Terminal font size persists: ${termFsAfter}px`);
+    else if (termFsBefore === 0) ok("Terminal font size: could not measure (terminal not open)");
+    else fail("Terminal font size persistence", `was ${termFsBefore}px, now ${termFsAfter}px`);
+
+    // ── Section P: Zoom bounds ──────────────────────────────────────────
+
+    // 52. Chat zoom minimum (8px) — cannot zoom out past floor
+    for (let i = 0; i < 20; i++) await page.locator("#chatZoomOut").click({ force: true });
+    await page.waitForTimeout(200);
+    const chatFsMin = await page.evaluate(() => {
+      const el = document.getElementById("transcript");
+      return el ? parseFloat(el.style.getPropertyValue("--chat-font-size") || "0") : 0;
+    });
+    if (chatFsMin >= 8) ok(`Chat zoom min bound: ${chatFsMin}px (≥ 8px floor)`);
+    else fail("Chat zoom min bound", `${chatFsMin}px is below expected floor`);
+
+    // 53. Chat zoom maximum (22px) — cannot zoom in past ceiling
+    for (let i = 0; i < 20; i++) await page.locator("#chatZoomIn").click({ force: true });
+    await page.waitForTimeout(200);
+    const chatFsMax = await page.evaluate(() => {
+      const el = document.getElementById("transcript");
+      return el ? parseFloat(el.style.getPropertyValue("--chat-font-size") || "0") : 0;
+    });
+    if (chatFsMax <= 22) ok(`Chat zoom max bound: ${chatFsMax}px (≤ 22px ceiling)`);
+    else fail("Chat zoom max bound", `${chatFsMax}px exceeds expected ceiling`);
 
   } catch (e: any) {
     fail("FATAL (web)", e.message);

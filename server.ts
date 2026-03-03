@@ -2680,6 +2680,27 @@ function handleWsConnection(ws: WebSocket) {
       console.log("[test] Next audio will be transcribed without terminal send");
       return;
     }
+
+    // test:broadcast-json:JSON — broadcast arbitrary JSON to all connected clients
+    // Used by E2E tests to inject server→client messages (voice_status, services, etc.)
+    if (msg.startsWith("test:broadcast-json:")) {
+      try {
+        const payload = JSON.parse(msg.slice(20));
+        broadcast(payload);
+        console.log(`[test] broadcast-json: ${JSON.stringify(payload).slice(0, 80)}`);
+      } catch {
+        console.warn("[test] test:broadcast-json: invalid JSON");
+      }
+      return;
+    }
+
+    // test:reset-entries — clear ALL conversation entries and broadcast empty list
+    if (msg === "test:reset-entries") {
+      conversationEntries = [];
+      broadcast({ type: "entry", entries: [], partial: false });
+      console.log("[test] All entries cleared");
+      return;
+    }
   });
 
   ws.on("close", () => {
