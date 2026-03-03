@@ -1070,8 +1070,12 @@
   }
 
   async function checkForAppUpdate() {
-    if (!window.murmurElectron?.checkForUpdates) {
+    if (!window.murmurElectron?.isElectron) {
       alert("Update check is only available in the desktop app.");
+      return;
+    }
+    if (!window.murmurElectron.checkForUpdates) {
+      alert("Update your app to enable this feature.\nThe app will check for updates automatically on next launch.");
       return;
     }
     const result = await window.murmurElectron.checkForUpdates();
