@@ -22,6 +22,7 @@
       "repo": "murmur",
       "releaseType": "release"
     },
+    "afterPack": "./afterPack.js",
     "mac": {
       "target": [
         {
@@ -38,9 +39,7 @@
         }
       ],
       "icon": "icons/icon.icns",
-      "category": "public.app-category.developer-tools",
-      "entitlements": "entitlements.mac.plist",
-      "entitlementsInherit": "entitlements.mac.plist"
+      "category": "public.app-category.developer-tools"
     },
     "win": {
       "target": "nsis",

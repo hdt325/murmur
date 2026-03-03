@@ -4,10 +4,13 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+let appVersion;
+try { appVersion = require("./package.json").version; } catch { appVersion = "unknown"; }
+
 contextBridge.exposeInMainWorld("murmurElectron", {
   platform: process.platform,
   isElectron: true,
-  version: require("./package.json").version,
+  version: appVersion,
   // Startup diagnostics
   onStartupStatus: (callback) => ipcRenderer.on("startup-status", (_e, data) => callback(data)),
   retry: () => ipcRenderer.send("retry-startup"),
