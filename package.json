@@ -7,6 +7,8 @@
     "test": "npx tsx tests/test-smoke.ts",
     "test:e2e": "npx tsx tests/test-e2e.ts",
     "test:bugs": "npx tsx tests/test-bugs.ts",
+    "test:qa": "npx tsx test-qa-visual.ts",
+    "test:qa:electron": "npx tsx test-qa-visual.ts --electron",
     "electron": "cd electron && npx electron .",
     "build:mac": "cd electron && npx electron-builder --mac",
     "build:win": "cd electron && npx electron-builder --win"
