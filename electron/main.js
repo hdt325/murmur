@@ -618,9 +618,10 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Request microphone permission once at startup (macOS)
+  // Request microphone permission before loading any web content (macOS)
+  // Must await so getUserMedia in the renderer doesn't race the system prompt
   if (process.platform === "darwin") {
-    systemPreferences.askForMediaAccess("microphone").catch(() => {});
+    await systemPreferences.askForMediaAccess("microphone").catch(() => {});
   }
 
   createWindow();

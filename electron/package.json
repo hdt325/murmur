@@ -39,7 +39,6 @@
       ],
       "icon": "icons/icon.icns",
       "category": "public.app-category.developer-tools",
-      "identity": null,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist"
     },
