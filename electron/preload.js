@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   close: () => ipcRenderer.send("close-panel"),
   // One-click prerequisite installs
   installPrereq: (name) => ipcRenderer.invoke("install-prereq", name),
+  // Mic permission — triggers native macOS permission dialog from main process
+  requestMicPermission: () => ipcRenderer.invoke("request-mic-permission"),
   // App updates
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
   onUpdateReady: (callback) => ipcRenderer.on("update-ready", (_e, info) => callback(info)),

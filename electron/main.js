@@ -632,6 +632,17 @@ ipcMain.on("open-releases-page", () => {
   shell.openExternal("https://github.com/hdt325/murmur/releases/latest");
 });
 
+// Trigger native macOS microphone permission dialog from renderer
+// Called when getUserMedia fails so TCC registers the current app bundle
+ipcMain.handle("request-mic-permission", async () => {
+  if (process.platform === "darwin") {
+    try {
+      return await systemPreferences.askForMediaAccess("microphone");
+    } catch { return false; }
+  }
+  return true;
+});
+
 // Manual update check from UI
 ipcMain.handle("check-for-updates", async () => {
   if (!app.isPackaged) {
