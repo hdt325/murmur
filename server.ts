@@ -2742,9 +2742,6 @@ function handleWsConnection(ws: WebSocket) {
         stopClientPlayback();
         broadcast({ type: "voice_status", state: "idle" });
         broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
-        // Force context resend on new target
-        contextSentAt = 0;
-        sendMurmurContext(1000);
         broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.currentTarget });
       }
       return;
