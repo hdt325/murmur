@@ -358,9 +358,12 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     plog("transcribe_start");
     const sttStart = Date.now();
     slog("stt", "start", { bytes: audioData.length });
+    // language=en avoids cross-language hallucinations.
+    // prompt biases Whisper toward domain vocabulary it otherwise mangles.
+    const STT_PROMPT = "Claude, Murmur, tmux, TypeScript, JavaScript, npm, npx, Python, Git, terminal, code, function, variable, component, server, error, install, run, test, stop, yes, no, okay.";
     const result = execSync(
       `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
-        `-F "file=@${normalizedFile}" -F "model=whisper-1"`,
+        `-F "file=@${normalizedFile}" -F "model=whisper-1" -F "language=en" -F "prompt=${STT_PROMPT}"`,
       { encoding: "utf-8", timeout: 10000 }
     );
     const json = JSON.parse(result);
