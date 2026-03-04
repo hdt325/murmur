@@ -469,10 +469,14 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   // But only if at least one connected client actually has that voice
   if (voice.startsWith("_local")) {
     const localName = voice.slice(7); // e.g. "Daniel" from "_local:Daniel"
-    const anyClientHasVoice = localName === "default" || Array.from(clients).some(
-      (c: any) => c._localVoices?.has(localName)
-    );
-    if (anyClientHasVoice) {
+    // Check that the AUDIO CLIENT (the one that will actually play it) has this voice.
+    // If the audio client is a phone/remote device, it won't have macOS-only voices like Samantha.
+    const audioClient = activeAudioClient && activeAudioClient.readyState === WebSocket.OPEN
+      ? activeAudioClient
+      : Array.from(clients).find((c) => c.readyState === WebSocket.OPEN && !(c as any)._isTestClient) || null;
+    const audioClientHasVoice = localName === "default" ||
+      (audioClient != null && (audioClient as any)._localVoices?.has(localName));
+    if (audioClientHasVoice) {
       plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
       slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
       console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to audio client`);
@@ -491,8 +495,8 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       }, 10000);
       return;
     } else {
-      // No client has the selected local voice — fall back to Kokoro
-      console.log(`[tts] Local voice "${localName}" not available on any client — using Kokoro`);
+      // Audio client doesn't have this local voice (e.g. phone without macOS voices) — fall back to Kokoro
+      console.log(`[tts] Local voice "${localName}" not available on audio client — using Kokoro`);
       // Fall through to Kokoro path below
     }
   }
