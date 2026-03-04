@@ -4045,10 +4045,14 @@
       '<div class="tour-footer">' +
         '<span class="tour-step">' + (_tourStep + 1) + ' / ' + TOUR_STEPS.length + '</span>' +
         '<div class="tour-btns">' +
-          '<button class="tour-skip" onclick="endTour()">Skip</button>' +
-          '<button class="tour-next" onclick="advanceTour()">' + (isLast ? "Done" : "Next") + '</button>' +
+          '<button class="tour-skip">Skip</button>' +
+          '<button class="tour-next">' + (isLast ? "Done" : "Next") + '</button>' +
         '</div>' +
       '</div>';
+    // Use addEventListener instead of inline onclick (inline handlers can silently
+    // fail in Electron's renderer when functions aren't accessible at bind time)
+    _tourTip.querySelector(".tour-skip").addEventListener("click", (e) => { e.stopPropagation(); endTour(); });
+    _tourTip.querySelector(".tour-next").addEventListener("click", (e) => { e.stopPropagation(); advanceTour(); });
 
     _tourTip.classList.remove("visible");
     requestAnimationFrame(() => {
