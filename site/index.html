@@ -991,13 +991,23 @@
       </div>
 
       <div class="source-section">
-        <h3>Or build from source</h3>
+        <h3>Run without installing</h3>
+        <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:12px">No app download needed. Paste this in any terminal — then open <strong>localhost:3457</strong> in your browser.</p>
+        <div class="code-block">
+          <pre><code>git clone https://github.com/hdt325/murmur.git && cd murmur && npm install && npm start</code></pre>
+          <button class="copy-btn" id="copyBtn">Copy</button>
+        </div>
+        <p style="font-size:0.8rem;color:var(--text-muted);margin-top:10px">The desktop app adds a floating window, dock icon, and global hotkey — but the server works standalone in any browser.</p>
+      </div>
+
+      <div class="source-section" style="margin-top:8px">
+        <h3>Build from source</h3>
         <div class="code-block">
           <pre><code>git clone https://github.com/hdt325/murmur.git
 cd murmur && npm install
 cd electron && npm install && cd ..
 npm run electron</code></pre>
-          <button class="copy-btn" id="copyBtn">Copy</button>
+          <button class="copy-btn" id="copyBtn2">Copy</button>
         </div>
       </div>
     </div>
@@ -1055,16 +1065,20 @@ npm run electron</code></pre>
       })
       .catch(() => {}); // fallback: links go to /releases/latest
 
-    document.getElementById("copyBtn").addEventListener("click", function() {
-      const code = this.previousElementSibling.textContent;
-      const btn = this;
-      navigator.clipboard.writeText(code).then(() => {
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = 'Copy';
-          btn.classList.remove('copied');
-        }, 2000);
+    ["copyBtn", "copyBtn2"].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener("click", function() {
+        const code = this.previousElementSibling.textContent;
+        const btn = this;
+        navigator.clipboard.writeText(code).then(() => {
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = 'Copy';
+            btn.classList.remove('copied');
+          }, 2000);
+        });
       });
     });
   </script>
