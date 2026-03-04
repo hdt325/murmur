@@ -962,6 +962,10 @@
   }
   .controls button.replay-btn:hover { background: #2a2a30; }
   .term-controls { display: flex; gap: 4px; align-items: center; }
+  .term-stats { font-size: 10px; color: #555; font-weight: normal; }
+  .term-stats.stale-warn { color: #c0853a; }
+  .term-stats.stale-critical { color: #c0453a; animation: stale-pulse 2s ease-in-out infinite; }
+  @keyframes stale-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
   .term-controls button {
     background: #2c313a;
     border: 1px solid #3e4451;
@@ -1537,6 +1541,37 @@
   }
   applyCleanMode();
   let termFontSize = parseInt(localStorage.getItem("term-font-size") || "10");
+
+  // Terminal activity stats — line count + staleness indicator
+  let termLineCount = 0;
+  let termLastUpdateAt = 0;
+  let termStaleTimer = null;
+
+  function updateTermLabel() {
+    const arrow = terminalOpen ? "▼" : "▶";
+    const label = document.getElementById("termToggleLabel");
+    if (!termLineCount) {
+      label.textContent = `${arrow} Terminal`;
+      return;
+    }
+    const elapsed = Date.now() - termLastUpdateAt;
+    const elapsedStr = elapsed > 90000
+      ? `${Math.floor(elapsed / 60000)}m ${Math.floor((elapsed % 60000) / 1000)}s ago`
+      : `${Math.round(elapsed / 1000)}s ago`;
+    const staleLevel = elapsed > 120000 ? "stale-critical" : elapsed > 30000 ? "stale-warn" : "";
+    const statsHtml = staleLevel
+      ? ` <span class="term-stats ${staleLevel}">${termLineCount} lines · ${elapsedStr}</span>`
+      : ` <span class="term-stats">${termLineCount} lines</span>`;
+    label.innerHTML = `${arrow} Terminal${statsHtml}`;
+  }
+
+  function recordTermActivity(text) {
+    termLineCount = (text.match(/\n/g) || []).length + 1;
+    termLastUpdateAt = Date.now();
+    updateTermLabel();
+    if (termStaleTimer) clearInterval(termStaleTimer);
+    termStaleTimer = setInterval(updateTermLabel, 5000);
+  }
 
   // Restore terminal state on load
   if (terminalOpen) {
@@ -2303,7 +2338,7 @@
         const termNav = document.getElementById("termNav");
         if (msg.active) {
           // Open terminal, show nav buttons, redirect text input to terminal
-          if (!terminalOpen) { terminalOpen = true; terminalPanel.classList.add("open"); document.getElementById("termToggleLabel").textContent = "▼ Terminal"; localStorage.setItem("term-open", "1"); }
+          if (!terminalOpen) { terminalOpen = true; terminalPanel.classList.add("open"); updateTermLabel(); localStorage.setItem("term-open", "1"); }
           termNav.classList.add("show");
           terminalOutput.scrollTop = terminalOutput.scrollHeight;
           terminalInput.placeholder = "Type response here (e.g. 1, 2, 3)...";
@@ -2323,6 +2358,7 @@
         } else {
           terminalOutput.scrollTop = prevScroll;
         }
+        recordTermActivity(msg.text);
       }
     };
   }
@@ -2608,7 +2644,12 @@
         if (el) {
           el.classList.add("bubble-active");
           el.classList.remove("bubble-spoken");
-          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          // Scroll so the entry appears near the top of the transcript (not just barely in view)
+          const containerRect = transcript.getBoundingClientRect();
+          const elRect = el.getBoundingClientRect();
+          const elRelTop = elRect.top - containerRect.top + transcript.scrollTop;
+          const targetScroll = elRelTop - 32; // 32px padding from top of container
+          transcript.scrollTo({ top: Math.max(0, targetScroll), behavior: "smooth" });
         } else if (retries > 0) {
           // Entry DOM may not exist yet (broadcast arrives before render) — retry
           setTimeout(() => apply(retries - 1), 50);
@@ -3815,7 +3856,7 @@
   function toggleTerminal() {
     terminalOpen = !terminalOpen;
     terminalPanel.classList.toggle("open", terminalOpen);
-    document.getElementById("termToggleLabel").textContent = (terminalOpen ? "▼" : "▶") + " Terminal";
+    updateTermLabel();
     localStorage.setItem("term-open", terminalOpen ? "1" : "0");
     const termNav = document.getElementById("termNav");
     if (terminalOpen) {
@@ -4043,6 +4084,12 @@
       e.preventDefault();
       sendTerminalInput();
     }
+  });
+  // Auto-submit on paste (so user doesn't have to manually press Enter after pasting)
+  terminalInput.addEventListener("paste", () => {
+    setTimeout(() => {
+      if (terminalInput.value.trim()) sendTerminalInput();
+    }, 50);
   });
 
   // Detect manual scroll-up to pause auto-scroll
