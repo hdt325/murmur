@@ -905,6 +905,8 @@ let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Add a user entry and broadcast the updated entry list
 function addUserEntry(text: string, queued = false) {
+  // Suppress voice panel instruction messages from appearing in the conversation view
+  if (MURMUR_CONTEXT_FILTER.test(text.trim())) return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn };
   const entry: ConversationEntry = {
     id: ++entryIdCounter,
     role: "user",
@@ -1103,6 +1105,9 @@ function loadScrollbackEntries(): ConversationEntry[] {
   if (!scrollback.trim()) return [];
 
   const lines = scrollback.split("\n");
+  // Debug: log first few lines to understand scrollback format
+  console.log(`[scrollback] target=${terminal.currentTarget} lines=${lines.length} sample:`, lines.slice(0, 5).map(l => JSON.stringify(l)));
+
   const turnStarts: { lineIdx: number; input: string }[] = [];
 
   // Find user input lines: ❯ followed by actual content
@@ -1113,6 +1118,7 @@ function loadScrollbackEntries(): ConversationEntry[] {
       turnStarts.push({ lineIdx: i, input: m[1].trim() });
     }
   }
+  console.log(`[scrollback] found ${turnStarts.length} ❯ turns`);
   if (turnStarts.length === 0) return [];
 
   // Only load the last 10 turns to avoid flooding the view
@@ -2721,9 +2727,13 @@ function handleWsConnection(ws: WebSocket) {
         saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
         // Load historical entries for the new session
         conversationEntries = loadScrollbackEntries();
-        entryIdCounter = conversationEntries.length > 0
-          ? Math.max(...conversationEntries.map(e => e.id))
-          : entryIdCounter;
+        if (conversationEntries.length > 0) {
+          entryIdCounter = Math.max(...conversationEntries.map(e => e.id));
+          console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
+        } else {
+          conversationEntries = [];
+          console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
+        }
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
         // Force context resend on new target
         contextSentAt = 0;
