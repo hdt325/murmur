@@ -177,17 +177,22 @@ async function ensureServer() {
     ? path.join(process.resourcesPath, "murmur")
     : path.resolve(__dirname, "..");
 
-  // Install deps if needed
+  // Install deps if needed (async — avoids blocking the main process event loop)
   const nodeModules = path.join(murmurDir, "node_modules");
   if (!fs.existsSync(nodeModules)) {
     sendStatus("Installing dependencies...", "info", { check: "deps", checkStatus: "pending" });
-    try {
-      execSync("npm install", { cwd: murmurDir, timeout: 120000 });
-      sendStatus("Dependencies installed", "info", { check: "deps", checkStatus: "ok" });
-    } catch (err) {
-      sendStatus(`npm install failed: ${err.message}`, "error", { check: "deps", checkStatus: "fail" });
-      return false;
-    }
+    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+    const ok = await new Promise((resolve) => {
+      const proc = spawn(npmCmd, ["install"], { cwd: murmurDir, stdio: ["ignore", "pipe", "pipe"] });
+      proc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+      proc.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+      proc.on("error", (err) => { sendStatus(`npm install failed: ${err.message}`, "error", { check: "deps", checkStatus: "fail" }); resolve(false); });
+      proc.on("close", (code) => {
+        if (code === 0) { sendStatus("Dependencies installed", "info", { check: "deps", checkStatus: "ok" }); resolve(true); }
+        else { sendStatus(`npm install failed (exit ${code})`, "error", { check: "deps", checkStatus: "fail" }); resolve(false); }
+      });
+    });
+    if (!ok) return false;
   } else {
     sendStatus("Dependencies OK", "info", { check: "deps", checkStatus: "ok" });
   }
