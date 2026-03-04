@@ -1461,6 +1461,10 @@
     || /Mac/.test(navigator.platform);
   if (isMac) document.body.classList.add("platform-mac");
 
+  // iOS detection — must be declared early; used in mic init and voice population
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
   // Friendly voice name lookup
   const VOICE_NAMES = {
     af_sky: "Sky", af_heart: "Heart", af_nova: "Nova",
@@ -3044,11 +3048,6 @@
   voicePopover.querySelectorAll(".voice-option").forEach(el => {
     voiceLabels[el.dataset.voice] = el.textContent;
   });
-
-  // iOS detection — speechSynthesis.speak() is blocked from async contexts on iOS,
-  // so device voices are not supported there. Kokoro works fine instead.
-  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
   // Populate local voices from Web Speech API
   function populateLocalVoices() {
