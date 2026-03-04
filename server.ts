@@ -246,6 +246,7 @@ function sendMurmurContext(delayMs = 2000) {
 interface PanelSettings {
   voice?: string;
   speed?: number;
+  tmuxTarget?: string; // "session:windowIndex" — last used tmux session
 }
 
 function loadSettings(): PanelSettings {
@@ -2638,6 +2639,7 @@ function handleWsConnection(ws: WebSocket) {
         console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
         stopTmuxStreaming();
         terminal.switchTarget(session, windowIdx);
+        saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
         // Force context resend on new target
         contextSentAt = 0;
         sendMurmurContext(1000);
@@ -3087,6 +3089,18 @@ app.get("/info", (_req, res) => {
 // Initialize terminal manager (async — tmux on macOS, node-pty on Windows)
 terminal = await createTerminalManager();
 terminal.createSession();
+// Restore last used tmux session/window
+const savedTarget = loadSettings().tmuxTarget;
+if (savedTarget && terminal.switchTarget) {
+  const lastColon = savedTarget.lastIndexOf(":");
+  if (lastColon !== -1) {
+    const session = savedTarget.slice(0, lastColon);
+    const windowIdx = parseInt(savedTarget.slice(lastColon + 1));
+    if (!isNaN(windowIdx)) {
+      try { terminal.switchTarget(session, windowIdx); console.log(`[startup] Restored tmux target: ${savedTarget}`); } catch {}
+    }
+  }
+}
 sendMurmurContext(5000);
 initSignalFiles();
 

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "npx tsx server.ts",
+    "start": "node start.mjs",
     "test": "npx tsx tests/test-smoke.ts",
     "test:e2e": "npx tsx tests/test-e2e.ts",
     "test:bugs": "npx tsx tests/test-bugs.ts",
