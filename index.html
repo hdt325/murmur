@@ -1005,7 +1005,7 @@
     position: fixed; inset: 0;
     background: rgba(0,0,0,0.6);
     z-index: 200;
-    pointer-events: auto;
+    pointer-events: none;
   }
   .tour-spotlight {
     position: fixed;
@@ -4021,8 +4021,6 @@
     _tourTip = document.createElement("div");
     _tourTip.className = "tour-tip";
     document.body.append(_tourOverlay, _tourSpotlight, _tourTip);
-    // Click overlay to advance
-    _tourOverlay.addEventListener("click", advanceTour);
     showTourStep();
   }
 
