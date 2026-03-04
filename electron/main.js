@@ -231,7 +231,7 @@ async function ensureServer() {
     console.log("Server exited with code", code);
     serverProcess = null;
     if (!startupComplete) {
-      sendStatus(`Server exited unexpectedly (code ${code})`, "error", { check: "server", checkStatus: "fail" });
+      sendStatus(`Server exited unexpectedly (code ${code})`, "fatal", { check: "server", checkStatus: "fail" });
     } else if (code === 0 && win && !win.isDestroyed()) {
       // Clean exit (restart requested from UI) — reload startup sequence
       console.log("Server exited cleanly — restarting...");
@@ -239,12 +239,14 @@ async function ensureServer() {
       win.loadFile(getLoadingPath());
       setTimeout(() => startup(), 1000);
     } else if (code !== 0 && win && !win.isDestroyed()) {
-      // Server crashed after startup — show loading page with error
+      // Server crashed after startup — auto-restart after 5s
+      console.log("Server crashed — auto-restarting in 5s...");
+      startupComplete = false;
       win.loadFile(getLoadingPath());
       setTimeout(() => {
-        sendStatus(`Server crashed (exit code ${code}). Click Retry to restart.`, "error", { check: "server", checkStatus: "fail" });
+        sendStatus(`Server crashed (exit ${code}) — restarting automatically...`, "warn", { check: "server", checkStatus: "fail" });
+        setTimeout(() => startup(), 3000);
       }, 500);
-      startupComplete = false;
     }
   });
 
@@ -293,9 +295,8 @@ function fileHash(filePath) {
 }
 
 async function checkContentUpdates(murmurDir) {
-  const updatedFiles = [];
-
-  for (const entry of CONTENT_FILES) {
+  // Fetch all files in parallel to avoid sequential network delays
+  const results = await Promise.all(CONTENT_FILES.map(async (entry) => {
     const src  = typeof entry === "string" ? entry : entry.src;
     const dest = typeof entry === "string" ? entry : entry.dest;
     try {
@@ -303,16 +304,13 @@ async function checkContentUpdates(murmurDir) {
       const localHash = fileHash(localPath);
       const remoteContent = await httpsGet(`${GH_RAW_BASE}/${src}`);
       const remoteHash = crypto.createHash("sha256").update(remoteContent).digest("hex");
-
-      if (localHash !== remoteHash) {
-        updatedFiles.push({ file: dest, localPath, content: remoteContent });
-      }
+      if (localHash !== remoteHash) return { file: dest, localPath, content: remoteContent };
     } catch (err) {
       console.log(`[update] Skip ${src}: ${err.message}`);
     }
-  }
-
-  return updatedFiles;
+    return null;
+  }));
+  return results.filter(Boolean);
 }
 
 async function applyContentUpdates(updates) {
