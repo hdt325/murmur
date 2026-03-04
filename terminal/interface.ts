@@ -6,6 +6,17 @@
 
 export type TerminalKey = "Up" | "Down" | "Enter" | "Escape" | "Tab" | "C-u";
 
+export interface TmuxWindowInfo {
+  index: number;
+  name: string;
+  active: boolean;
+}
+
+export interface TmuxSessionInfo {
+  name: string;
+  windows: TmuxWindowInfo[];
+}
+
 export interface TerminalManager {
   /** Check if the Claude CLI session is alive */
   isSessionAlive(): boolean;
@@ -36,6 +47,15 @@ export interface TerminalManager {
 
   /** Clean up resources */
   destroy(): void;
+
+  /** Switch to a different tmux session/window (tmux only — no-op on pty) */
+  switchTarget?(session: string, window?: number): void;
+
+  /** List all tmux sessions and their windows (tmux only — returns [] on pty) */
+  listTmuxSessions?(): TmuxSessionInfo[];
+
+  /** The current tmux target string (e.g. "claude-voice" or "main:1") */
+  readonly currentTarget?: string;
 }
 
 /**

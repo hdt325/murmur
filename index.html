@@ -10,7 +10,7 @@
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
 <link rel="icon" type="image/png" sizes="256x256" href="/icon-256.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/icon-256.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
 <meta name="apple-mobile-web-app-title" content="Murmur">
 <title>Murmur</title>
 <style>
@@ -812,6 +812,55 @@
   .terminal-output::-webkit-scrollbar { width: 3px; }
   .terminal-output::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
+  /* Session selector */
+  #sessionBtn {
+    background: #2c313a;
+    border: 1px solid #3e4451;
+    border-radius: 4px;
+    font-size: 10px;
+    color: #888;
+    padding: 2px 7px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #sessionBtn:hover { border-color: #4b5263; background: #3e4451; color: #ccc; }
+  .session-popover {
+    position: fixed;
+    background: #21252b;
+    border: 1px solid #3e4451;
+    border-radius: 6px;
+    padding: 4px 0;
+    min-width: 180px;
+    max-width: 260px;
+    z-index: 999;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    font-size: 11px;
+    display: none;
+  }
+  .session-popover.open { display: block; }
+  .session-popover .sess-group {
+    padding: 4px 10px 2px;
+    color: #555;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .session-popover .sess-item {
+    padding: 5px 14px;
+    cursor: pointer;
+    color: #abb2bf;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .session-popover .sess-item:hover { background: #2c313a; color: #e0ddd8; }
+  .session-popover .sess-item.active { color: #c9a227; }
+  .session-popover .sess-item .sess-win { color: #666; font-size: 10px; margin-left: auto; }
+
   .controls button.replay-btn {
     border-color: #333338;
     color: #9a9aa0;
@@ -1072,7 +1121,8 @@
 <div class="terminal-panel" id="terminalPanel">
   <div class="terminal-header" id="terminalHeader">
     <span id="termToggleLabel">▶ Terminal</span>
-    <div class="term-controls">
+    <div class="term-controls" style="display:flex;align-items:center;gap:6px;">
+      <button id="sessionBtn" data-tip="Switch tmux session/window">claude-voice</button>
       <button id="termZoomOut">−</button>
       <button id="termZoomIn">+</button>
     </div>
@@ -1086,6 +1136,9 @@
   </div>
   <pre class="terminal-output" id="terminalOutput"></pre>
 </div>
+
+<!-- Session selector popover -->
+<div class="session-popover" id="sessionPopover"></div>
 
 <!-- Voice selection popover -->
 <div class="voice-popover" id="voicePopover">
@@ -2082,6 +2135,18 @@
         const prev = statusText.textContent;
         statusText.textContent = "Context active";
         setTimeout(() => { if (statusText.textContent === "Context active") statusText.textContent = prev; }, 3000);
+      }
+
+      if (msg.type === "tmux_sessions" || msg.type === "tmux") {
+        if (msg.type === "tmux_sessions" && window._onTmuxSessions) {
+          window._onTmuxSessions(msg);
+        }
+        if (msg.current || msg.session) {
+          const target = msg.current || msg.session;
+          _currentTmuxTarget = target;
+          const parts = target.split(":");
+          if (sessionBtn) sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
+        }
       }
 
       if (msg.type === "audio_control") {
@@ -3439,6 +3504,69 @@
     terminalOutput.style.fontSize = termFontSize + "px";
     localStorage.setItem("term-font-size", String(termFontSize));
   });
+
+  // Session selector
+  let _currentTmuxTarget = "claude-voice";
+  const sessionBtn = document.getElementById("sessionBtn");
+  const sessionPopover = document.getElementById("sessionPopover");
+
+  function closeSessPopover() { sessionPopover.classList.remove("open"); }
+
+  sessionBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (sessionPopover.classList.contains("open")) { closeSessPopover(); return; }
+    // Request fresh list from server
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("tmux:list");
+    // Position popover above the button
+    const rect = sessionBtn.getBoundingClientRect();
+    sessionPopover.style.left = rect.left + "px";
+    sessionPopover.style.bottom = (window.innerHeight - rect.top + 4) + "px";
+    sessionPopover.style.top = "auto";
+    sessionPopover.classList.add("open");
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!sessionPopover.contains(e.target) && e.target !== sessionBtn) closeSessPopover();
+  });
+
+  function renderSessPopover(sessions) {
+    sessionPopover.innerHTML = "";
+    if (!sessions.length) {
+      sessionPopover.innerHTML = '<div class="sess-group">No tmux sessions</div>';
+      return;
+    }
+    for (const sess of sessions) {
+      const grp = document.createElement("div");
+      grp.className = "sess-group";
+      grp.textContent = sess.name;
+      sessionPopover.appendChild(grp);
+
+      for (const win of sess.windows) {
+        const target = win.index >= 0 ? `${sess.name}:${win.index}` : sess.name;
+        const item = document.createElement("div");
+        item.className = "sess-item" + (target === _currentTmuxTarget ? " active" : "");
+        item.innerHTML = `<span>${win.name || "window " + win.index}</span>` +
+          `<span class="sess-win">#${win.index}</span>`;
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          closeSessPopover();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send("tmux:switch:" + encodeURIComponent(sess.name) + ":" + win.index);
+          }
+        });
+        sessionPopover.appendChild(item);
+      }
+    }
+  }
+
+  // WS handler for tmux_sessions — rendered inline in ws.onmessage below
+  window._onTmuxSessions = (data) => {
+    _currentTmuxTarget = data.current || _currentTmuxTarget;
+    // Update button label
+    const parts = _currentTmuxTarget.split(":");
+    sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
+    renderSessPopover(data.sessions || []);
+  };
 
   // Terminal nav buttons for interactive prompts
   document.getElementById("termKeyUp").addEventListener("click", (e) => { e.stopPropagation(); if (ws?.readyState === WebSocket.OPEN) ws.send("key:up"); });

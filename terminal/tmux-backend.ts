@@ -5,16 +5,71 @@
  */
 
 import { execSync, execFileSync } from "child_process";
-import type { TerminalManager, TerminalKey } from "./interface.js";
+import type { TerminalManager, TerminalKey, TmuxSessionInfo, TmuxWindowInfo } from "./interface.js";
 
-const TMUX_SESSION = "claude-voice";
+const DEFAULT_SESSION = "claude-voice";
 
 export class TmuxBackend implements TerminalManager {
-  readonly sessionName = TMUX_SESSION;
+  private _session: string;
+  private _window: number; // -1 = use active window
+
+  get sessionName(): string { return this._session; }
+
+  get currentTarget(): string {
+    return this._window >= 0 ? `${this._session}:${this._window}` : this._session;
+  }
+
+  constructor(session = DEFAULT_SESSION) {
+    this._session = session;
+    this._window = -1;
+  }
+
+  /** Switch target to a different session and optional window index. */
+  switchTarget(session: string, window = -1): void {
+    this._session = session;
+    this._window = window;
+  }
+
+  /** List all tmux sessions and their windows. */
+  listTmuxSessions(): TmuxSessionInfo[] {
+    try {
+      const rawSessions = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], {
+        encoding: "utf-8", timeout: 3000,
+      }).trim();
+      if (!rawSessions) return [];
+
+      const sessions: TmuxSessionInfo[] = [];
+      for (const sessionName of rawSessions.split("\n").filter(Boolean)) {
+        try {
+          const rawWindows = execFileSync(
+            "tmux", ["list-windows", "-t", sessionName, "-F", "#{window_index}|#{window_name}|#{window_active}"],
+            { encoding: "utf-8", timeout: 3000 }
+          ).trim();
+
+          const windows: TmuxWindowInfo[] = rawWindows.split("\n")
+            .filter(Boolean)
+            .map(line => {
+              const parts = line.split("|");
+              return {
+                index: parseInt(parts[0] ?? "0"),
+                name: parts[1] ?? "",
+                active: parts[2] === "1",
+              };
+            });
+          sessions.push({ name: sessionName, windows });
+        } catch {
+          sessions.push({ name: sessionName, windows: [] });
+        }
+      }
+      return sessions;
+    } catch {
+      return [];
+    }
+  }
 
   isSessionAlive(): boolean {
     try {
-      execSync(`tmux has-session -t ${TMUX_SESSION} 2>/dev/null`, {
+      execFileSync("tmux", ["has-session", "-t", this._session], {
         stdio: "ignore",
         timeout: 5000,
       });
@@ -26,35 +81,34 @@ export class TmuxBackend implements TerminalManager {
 
   createSession(): void {
     if (this.isSessionAlive()) {
-      console.log(`tmux session "${TMUX_SESSION}" already exists`);
+      console.log(`tmux session "${this._session}" already exists`);
       return;
     }
 
     try {
-      execSync(
-        `tmux new-session -d -s ${TMUX_SESSION} -x 120 -y 30`,
-        { stdio: "ignore", timeout: 5000 }
-      );
+      execFileSync("tmux", ["new-session", "-d", "-s", this._session, "-x", "120", "-y", "30"], {
+        stdio: "ignore", timeout: 5000,
+      });
 
-      execSync(
-        `tmux send-keys -t ${TMUX_SESSION} 'claude --dangerously-skip-permissions' Enter`,
-        { stdio: "ignore", timeout: 5000 }
-      );
+      execFileSync("tmux", ["send-keys", "-t", this._session, "claude --dangerously-skip-permissions", "Enter"], {
+        stdio: "ignore", timeout: 5000,
+      });
 
-      console.log(`tmux session "${TMUX_SESSION}" created with claude`);
-      console.log(`  Attach with: tmux attach -t ${TMUX_SESSION}`);
+      console.log(`tmux session "${this._session}" created with claude`);
+      console.log(`  Attach with: tmux attach -t ${this._session}`);
     } catch (err) {
       console.error("Failed to create tmux session:", (err as Error).message);
     }
   }
 
   sendText(text: string): void {
+    const target = this.currentTarget;
     try {
-      execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "-l", text], {
+      execFileSync("tmux", ["send-keys", "-t", target, "-l", text], {
         stdio: "ignore",
         timeout: 5000,
       });
-      execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, "Enter"], {
+      execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
         stdio: "ignore",
         timeout: 5000,
       });
@@ -65,10 +119,9 @@ export class TmuxBackend implements TerminalManager {
     // Fallback: if text got stuck as a bracketed paste, retry Enter
     setTimeout(() => {
       try {
-        const pane = execSync(
-          `tmux capture-pane -t ${TMUX_SESSION} -p`,
-          { encoding: "utf-8", timeout: 2000 }
-        ).trim();
+        const pane = execFileSync("tmux", ["capture-pane", "-t", target, "-p"], {
+          encoding: "utf-8", timeout: 2000,
+        }).trim();
         const lines = pane.split("\n");
         const lastLines = lines.slice(-5).join("\n");
         // Stuck = prompt has text but no spinner/response started
@@ -84,11 +137,9 @@ export class TmuxBackend implements TerminalManager {
             console.log(
               `[sendText] Text stuck on prompt — sending Enter to confirm`
             );
-            execFileSync(
-              "tmux",
-              ["send-keys", "-t", TMUX_SESSION, "Enter"],
-              { stdio: "ignore", timeout: 2000 }
-            );
+            execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
+              stdio: "ignore", timeout: 2000,
+            });
           }
         }
       } catch {}
@@ -96,10 +147,8 @@ export class TmuxBackend implements TerminalManager {
   }
 
   sendKey(key: TerminalKey): void {
-    const tmuxKey =
-      key === "C-u" ? "C-u" : key; // tmux uses same key names
     try {
-      execFileSync("tmux", ["send-keys", "-t", TMUX_SESSION, tmuxKey], {
+      execFileSync("tmux", ["send-keys", "-t", this.currentTarget, key], {
         stdio: "ignore",
         timeout: 2000,
       });
@@ -108,7 +157,7 @@ export class TmuxBackend implements TerminalManager {
 
   capturePane(): string {
     try {
-      return execSync(`tmux capture-pane -t ${TMUX_SESSION} -p`, {
+      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p"], {
         encoding: "utf-8",
         timeout: 2000,
       });
@@ -119,7 +168,7 @@ export class TmuxBackend implements TerminalManager {
 
   capturePaneAnsi(): string {
     try {
-      return execSync(`tmux capture-pane -t ${TMUX_SESSION} -e -p`, {
+      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-e", "-p"], {
         encoding: "utf-8",
         timeout: 2000,
       });
@@ -130,7 +179,7 @@ export class TmuxBackend implements TerminalManager {
 
   capturePaneScrollback(): string {
     try {
-      return execSync(`tmux capture-pane -t ${TMUX_SESSION} -p -S -2000`, {
+      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p", "-S", "-2000"], {
         encoding: "utf-8",
         timeout: 2000,
       });
@@ -142,7 +191,7 @@ export class TmuxBackend implements TerminalManager {
   startPipeStream(filePath: string): void {
     // Close any existing pipe first
     try {
-      execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, {
+      execFileSync("tmux", ["pipe-pane", "-t", this.currentTarget], {
         stdio: "ignore",
         timeout: 2000,
       });
@@ -155,7 +204,7 @@ export class TmuxBackend implements TerminalManager {
     // Start new pipe using execFileSync to avoid shell injection
     try {
       execFileSync("tmux", [
-        "pipe-pane", "-O", "-t", TMUX_SESSION,
+        "pipe-pane", "-O", "-t", this.currentTarget,
         `cat >> ${filePath}`
       ], { stdio: "ignore", timeout: 2000 });
     } catch (e) {
@@ -165,7 +214,7 @@ export class TmuxBackend implements TerminalManager {
 
   stopPipeStream(): void {
     try {
-      execSync(`tmux pipe-pane -t ${TMUX_SESSION}`, {
+      execFileSync("tmux", ["pipe-pane", "-t", this.currentTarget], {
         stdio: "ignore",
         timeout: 2000,
       });
@@ -176,7 +225,7 @@ export class TmuxBackend implements TerminalManager {
     this.stopPipeStream();
     // Kill the tmux session to prevent leaking
     try {
-      execSync(`tmux kill-session -t ${TMUX_SESSION}`, {
+      execFileSync("tmux", ["kill-session", "-t", this._session], {
         stdio: "ignore",
         timeout: 5000,
       });

@@ -15,9 +15,20 @@
 - Added "Remote & Mobile Access" section to site/index.html (Tailscale setup, multi-device audio)
 
 ### #6 — iOS home screen iconography ✓
-- `manifest.json`: added 192×192 and 512×512 icon entries
-- `apple-touch-icon` updated with `sizes="180x180"`
-- Added `apple-mobile-web-app-title` meta tag
+- `manifest.json`: updated with accurate 180×256×512 sizes, proper icon-512.png asset
+- `apple-touch-icon` now points to `icon-180.png` (correct 180×180 PNG)
+- All icon files are real PNGs with soundwave design (dark bg + gold bars)
+- Server routes added for `icon-180.png` and `icon-512.png`
+
+### #7 — Fix device voices on iPhone ✓
+- `_local:Samantha` etc. now checks AUDIO CLIENT for voice availability, not any client
+- Falls through to Kokoro when audio client (e.g. iPhone) doesn't support the local voice
+
+### #8 — tmux session/window selector ✓
+- `TmuxBackend`: dynamic target (`session` + `window` instance vars), `switchTarget()`, `listTmuxSessions()`
+- `interface.ts`: `TmuxWindowInfo`, `TmuxSessionInfo` types; optional `switchTarget`/`listTmuxSessions`/`currentTarget`
+- Server WS: `tmux:list` → `tmux_sessions` response; `tmux:switch:SESSION:WINDOW` → switch + resend context
+- UI: session dropdown button in terminal header; popover lists all sessions + windows; switch sends context to new target
 
 ## Pending
 

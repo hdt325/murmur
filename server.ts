@@ -2094,8 +2094,9 @@ function handleWsConnection(ws: WebSocket) {
   ws.send(
     JSON.stringify({
       type: "tmux",
-      session: "claude-voice",
+      session: terminal.currentTarget ?? "claude-voice",
       alive: terminal.isSessionAlive(),
+      current: terminal.currentTarget ?? "claude-voice",
     })
   );
 
@@ -2493,6 +2494,33 @@ function handleWsConnection(ws: WebSocket) {
       return;
     }
 
+    // List tmux sessions and windows
+    if (msg === "tmux:list") {
+      const sessions = terminal.listTmuxSessions?.() ?? [];
+      ws.send(JSON.stringify({ type: "tmux_sessions", sessions, current: terminal.currentTarget ?? "" }));
+      return;
+    }
+
+    // Switch to a different tmux session/window
+    // Format: tmux:switch:ENCODED_SESSION:WINDOW_INDEX
+    if (msg.startsWith("tmux:switch:")) {
+      const rest = msg.slice("tmux:switch:".length);
+      const lastColon = rest.lastIndexOf(":");
+      if (lastColon !== -1 && terminal.switchTarget) {
+        const encodedSession = rest.slice(0, lastColon);
+        const windowIdx = parseInt(rest.slice(lastColon + 1));
+        const session = decodeURIComponent(encodedSession);
+        console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
+        stopTmuxStreaming();
+        terminal.switchTarget(session, windowIdx);
+        // Force context resend on new target
+        contextSentAt = 0;
+        sendMurmurContext(1000);
+        broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.currentTarget });
+      }
+      return;
+    }
+
     // Text input from terminal panel
     if (msg.startsWith("text:")) {
       const text = msg.slice(5);
@@ -2835,8 +2863,14 @@ app.get("/manifest.json", (_req, res) => {
 app.get("/favicon.ico", (_req, res) => {
   res.sendFile(join(__dirname, "site", "favicon.ico"));
 });
+app.get("/icon-180.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "icon-180.png"));
+});
 app.get("/icon-256.png", (_req, res) => {
   res.sendFile(join(__dirname, "site", "icon-256.png"));
+});
+app.get("/icon-512.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "icon-512.png"));
 });
 app.get("/favicon-16.png", (_req, res) => {
   res.sendFile(join(__dirname, "site", "favicon-16.png"));
@@ -2884,7 +2918,7 @@ app.get("/info", (_req, res) => {
     pid: null as number | null,
     cwd: null as string | null,
     version: null as string | null,
-    tmuxSession: "claude-voice",
+    tmuxSession: terminal.currentTarget ?? "claude-voice",
     tmuxAlive: terminal.isSessionAlive(),
   };
   try {
