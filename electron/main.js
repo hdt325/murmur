@@ -343,9 +343,22 @@ async function applyContentUpdates(updates) {
 }
 
 async function contentUpdateCheck(murmurDir) {
+  // Skip GitHub check if we checked within the last 12 hours (speeds up repeat launches)
+  const stampFile = path.join(app.getPath("userData"), "last-content-check.txt");
+  const TWELVE_HOURS = 12 * 60 * 60 * 1000;
+  try {
+    const stamp = parseInt(fs.readFileSync(stampFile, "utf8").trim(), 10);
+    if (Date.now() - stamp < TWELVE_HOURS) {
+      sendStatus("Content up to date", "info", { check: "update", checkStatus: "ok" });
+      return false;
+    }
+  } catch {}
+
   try {
     sendStatus("Checking for updates...", "info", { check: "update", checkStatus: "pending" });
     const updates = await checkContentUpdates(murmurDir);
+    // Record successful check time
+    try { fs.writeFileSync(stampFile, String(Date.now())); } catch {}
 
     if (updates.length === 0) {
       sendStatus("Content up to date", "info", { check: "update", checkStatus: "ok" });
