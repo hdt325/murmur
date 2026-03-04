@@ -38,7 +38,7 @@ const CONTENT_FILES = [
   // NOTE: settings.json excluded — it's per-user preferences
 ];
 
-// macOS GUI apps don't inherit shell PATH — add common tool locations
+// macOS GUI apps don't inherit shell PATH — add common tool locations synchronously
 if (process.platform === "darwin") {
   const extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/local/sbin"];
   const currentPath = process.env.PATH || "";
@@ -46,16 +46,24 @@ if (process.platform === "darwin") {
   if (missing.length > 0) {
     process.env.PATH = missing.join(":") + ":" + currentPath;
   }
-  // Also try to source the user's shell PATH for globally installed npm packages
-  try {
-    const shellPath = execSync("zsh -ilc 'echo $PATH'", { encoding: "utf8", timeout: 5000 }).trim();
-    if (shellPath) {
-      const shellParts = shellPath.split(":").filter(p => !process.env.PATH.includes(p));
-      if (shellParts.length > 0) {
-        process.env.PATH = process.env.PATH + ":" + shellParts.join(":");
-      }
-    }
-  } catch {}
+  // Full shell PATH (e.g. nvm, conda) fetched async inside startup() to avoid
+  // blocking module load. The hardcoded paths above cover most installations.
+}
+
+// Fetch full shell PATH asynchronously (called early in startup before server spawn)
+function getShellPath() {
+  return new Promise((resolve) => {
+    let out = "";
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const proc = spawn("zsh", ["-ilc", "echo $PATH"], { env: process.env });
+      proc.stdout.on("data", (d) => { out += d.toString(); });
+      proc.on("error", () => finish(null));
+      proc.on("close", () => finish(out.trim() || null));
+      setTimeout(() => { try { proc.kill(); } catch {} finish(null); }, 2000);
+    } catch { finish(null); }
+  });
 }
 
 let win = null;
@@ -402,6 +410,15 @@ async function contentUpdateCheck(murmurDir) {
 // Full startup sequence
 async function startup() {
   startupComplete = false;
+
+  // Extend PATH with full shell environment (async, so window stays responsive)
+  if (process.platform === "darwin") {
+    const shellPath = await getShellPath();
+    if (shellPath) {
+      const extra = shellPath.split(":").filter(p => !process.env.PATH.includes(p));
+      if (extra.length > 0) process.env.PATH = process.env.PATH + ":" + extra.join(":");
+    }
+  }
 
   // Check prerequisites
   sendStatus("Checking prerequisites...", "info");
