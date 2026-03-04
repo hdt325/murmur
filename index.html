@@ -2934,7 +2934,7 @@
   _modeReady = true;
   let silenceTimer = null;
   let silenceStart = 0;
-  const SILENCE_THRESHOLD = 0.015;
+  const SILENCE_THRESHOLD_MIN = 0.010;  // Hard floor — dynamic threshold applied at runtime
   const SILENCE_DURATION = 1500;
   const MIN_RECORDING_MS = 500;
   let recordingStartTime = 0;
@@ -2944,7 +2944,7 @@
   let autoListenEnabled = true;
   let autoListenActive = false;
   let speechConfirmStart = 0;
-  const SPEECH_THRESHOLD = 0.015;  // Require clear speech signal above ambient/keyboard noise
+  const SPEECH_THRESHOLD_MIN = 0.012;  // Hard floor — dynamic threshold adapts to ambient noise
   const SPEECH_CONFIRM_MS = 350;   // Sustained speech for 350ms before triggering recording
   let conversationHot = false;     // After Claude speaks, next speech goes direct (no wake word)
   let ttsStartedAt = 0;
@@ -3059,8 +3059,9 @@
         const recBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
 
         // Pre-filter: skip sending to Whisper if audio was just noise
-        if (recordingPeakRms < AUDIO_ENERGY_THRESHOLD) {
-          rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${AUDIO_ENERGY_THRESHOLD}`);
+        const energyThreshold = Math.max(AUDIO_ENERGY_THRESHOLD_MIN, ambientRmsBaseline * 2.5);
+        if (recordingPeakRms < energyThreshold) {
+          rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${energyThreshold.toFixed(4)} (baseline=${ambientRmsBaseline.toFixed(4)})`);
           setTalkState("idle");
           autoListenActive = false;
           return;
@@ -3127,7 +3128,8 @@
         if (rms > recordingPeakRms) recordingPeakRms = rms; // Track peak
         const elapsed = Date.now() - recordingStartTime;
 
-        if (rms < SILENCE_THRESHOLD && elapsed > MIN_RECORDING_MS) {
+        const silenceThreshold = Math.max(SILENCE_THRESHOLD_MIN, ambientRmsBaseline * 2.0);
+        if (rms < silenceThreshold && elapsed > MIN_RECORDING_MS) {
           if (silenceStart === 0) silenceStart = Date.now();
           else if (Date.now() - silenceStart > SILENCE_DURATION) {
             stopRecording();
@@ -3561,7 +3563,10 @@
   let autoListenDebugCounter = 0;
   // Audio pre-filter: track peak RMS during recording to skip noise-only audio
   let recordingPeakRms = 0;
-  const AUDIO_ENERGY_THRESHOLD = 0.02; // Minimum peak RMS to consider as speech (not just noise)
+  const AUDIO_ENERGY_THRESHOLD_MIN = 0.015; // Hard floor for post-recording energy check
+  // Adaptive ambient noise baseline: slow exponential moving average of idle mic RMS
+  // Starts conservative (quiet room); adapts up in noisy environments (car, office, etc.)
+  let ambientRmsBaseline = 0.006;
 
   function startAutoListen() {
     if (autoListenInterval) return;
@@ -3596,13 +3601,19 @@
       for (let i = 0; i < micDataArray.length; i++) sum += micDataArray[i] * micDataArray[i];
       const rms = Math.sqrt(sum / micDataArray.length);
 
+      // Update ambient baseline when fully idle (slow EMA — adapts over ~5s)
+      const dynSpeechThreshold = Math.max(SPEECH_THRESHOLD_MIN, ambientRmsBaseline * 3.5);
+      if (rms < dynSpeechThreshold) {
+        ambientRmsBaseline = ambientRmsBaseline * 0.97 + rms * 0.03;
+      }
+
       // Debug log every 5s (remote)
       if (shouldLog) {
         const ctxState = ttsAudioCtx ? ttsAudioCtx.state : "none";
-        rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${SPEECH_THRESHOLD} hot=${conversationHot} ctxState=${ctxState} btnClass=${btnClass}`);
+        rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${dynSpeechThreshold.toFixed(4)} baseline=${ambientRmsBaseline.toFixed(4)} hot=${conversationHot} ctxState=${ctxState}`);
       }
 
-      if (rms > SPEECH_THRESHOLD) {
+      if (rms > dynSpeechThreshold) {
         if (speechConfirmStart === 0) {
           speechConfirmStart = Date.now();
         } else if (Date.now() - speechConfirmStart > SPEECH_CONFIRM_MS) {
