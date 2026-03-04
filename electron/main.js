@@ -671,15 +671,17 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Request microphone permission before loading any web content (macOS)
-  // Must await so getUserMedia in the renderer doesn't race the system prompt
-  if (process.platform === "darwin") {
-    await systemPreferences.askForMediaAccess("microphone").catch(() => {});
-  }
-
+  // Show window immediately — never block on permission dialogs
   createWindow();
   createTray();
   registerHotkey();
+
+  // Request microphone permission after window is visible (macOS).
+  // Previously awaited before createWindow(), which caused the window to never
+  // appear on first launch when the system permission dialog was pending.
+  if (process.platform === "darwin") {
+    systemPreferences.askForMediaAccess("microphone").catch(() => {});
+  }
   // Auto-updater only works on packaged builds (not dev source runs)
   // For source installs, the content auto-updater in startup() handles updates
   if (app.isPackaged) {
