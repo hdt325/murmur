@@ -1899,6 +1899,7 @@
         try {
           ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
           if (ttsAudioCtx.state === "suspended") ttsAudioCtx.resume();
+          _watchAudioCtx?.();
           console.log("[audio] AudioContext pre-unlocked on first gesture");
         } catch (e) { console.warn("[audio] AudioContext create failed:", e); }
       } else if (ttsAudioCtx.state === "suspended") {
@@ -3351,11 +3352,54 @@
   try { connect(); } catch(e) { console.warn("[ws] connect() error:", e); }
 
   // =============================================
-  // iOS app-switch: re-acquire mic + resume AudioContext
+  // Background keep-alive: prevent Chromium from suspending AudioContext
+  // when the window goes behind other apps (Electron on macOS).
+  // A zero-gain oscillator tricks the context into thinking audio is active.
+  let _bgKeepAliveOsc = null;
+  function _startAudioKeepAlive() {
+    if (!ttsAudioCtx || _bgKeepAliveOsc) return;
+    try {
+      const osc = ttsAudioCtx.createOscillator();
+      const gain = ttsAudioCtx.createGain();
+      gain.gain.setValueAtTime(0.0001, ttsAudioCtx.currentTime); // inaudible, not zero (avoids optimisation)
+      osc.connect(gain);
+      gain.connect(ttsAudioCtx.destination);
+      osc.start();
+      _bgKeepAliveOsc = osc;
+      console.log("[bg] AudioContext keep-alive started");
+    } catch (e) { console.warn("[bg] keep-alive error:", e); }
+  }
+  function _stopAudioKeepAlive() {
+    if (!_bgKeepAliveOsc) return;
+    try { _bgKeepAliveOsc.stop(); } catch {}
+    _bgKeepAliveOsc = null;
+    console.log("[bg] AudioContext keep-alive stopped");
+  }
+
+  // Also watch AudioContext state — auto-resume if Chromium suspends it
+  function _watchAudioCtx() {
+    if (!ttsAudioCtx) return;
+    ttsAudioCtx.addEventListener("statechange", () => {
+      if (ttsAudioCtx.state === "suspended" && document.hidden) {
+        console.log("[bg] AudioContext suspended in background — resuming");
+        ttsAudioCtx.resume().catch(() => {});
+      }
+    });
+  }
+
+  // =============================================
+  // App-switch visibility handler
   // =============================================
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) return;
-    // iOS kills mic streams when backgrounded — check and re-acquire
+    if (document.hidden) {
+      // Going to background: start keep-alive to prevent AudioContext suspension
+      _startAudioKeepAlive();
+      return;
+    }
+    // Coming back to foreground
+    _stopAudioKeepAlive();
+
+    // iOS/macOS kills mic streams when backgrounded — check and re-acquire
     if (micStream) {
       const alive = micStream.getTracks().every(t => t.readyState === "live");
       if (!alive) {
@@ -3366,7 +3410,7 @@
         initMicMeter();
       }
     }
-    // Resume AudioContext if iOS suspended it
+    // Resume AudioContext if it was suspended
     if (ttsAudioCtx && ttsAudioCtx.state === "suspended") {
       console.log("[visibility] Resuming suspended AudioContext");
       ttsAudioCtx.resume();

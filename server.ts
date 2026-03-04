@@ -835,19 +835,35 @@ function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput
   for (let i = 0; i < newLines.length; i++) {
     const t = newLines[i].trim();
     if (!t) continue;
-    if (t.startsWith("❯")) { startIdx = i + 1; continue; }
-    const tNorm = t.toLowerCase().replace(/\s+/g, " ");
-    // Try matching as sequential continuation of consumed input
-    const remaining = inputNorm.slice(consumedLen).trimStart();
-    if (remaining.startsWith(tNorm)) {
-      consumedLen += inputNorm.slice(consumedLen).indexOf(tNorm) + tNorm.length;
+    if (t.startsWith("❯")) {
+      // Track how much of userInput appeared on this prompt line so that
+      // short tail fragments on the NEXT line can be matched correctly.
+      const lineContent = t.replace(/^❯\s*/, "").toLowerCase().replace(/\s+/g, " ").trim();
+      if (lineContent) {
+        const idx = inputNorm.indexOf(lineContent, consumedLen);
+        if (idx >= 0) consumedLen = idx + lineContent.length;
+      }
       startIdx = i + 1;
       continue;
     }
-    // Fallback: line is a substring of user input
-    if (tNorm.length >= 5 && inputNorm.includes(tNorm)) {
-      startIdx = i + 1;
-      continue;
+    const tNorm = t.toLowerCase().replace(/\s+/g, " ");
+    // Only try to skip lines as user-input echo while inputNorm not fully consumed
+    if (consumedLen < inputNorm.length) {
+      const remaining = inputNorm.slice(consumedLen).trimStart();
+      // Primary: sequential continuation (handles tmux-wrapped tail fragments)
+      if (remaining.startsWith(tNorm)) {
+        const idx = inputNorm.indexOf(tNorm, consumedLen);
+        consumedLen = (idx >= 0 ? idx : consumedLen) + tNorm.length;
+        startIdx = i + 1;
+        continue;
+      }
+      // Fallback: substring match within remaining unconsumed input (min 3 chars)
+      if (tNorm.length >= 3 && remaining.includes(tNorm)) {
+        const idx = remaining.indexOf(tNorm);
+        consumedLen += idx + tNorm.length;
+        startIdx = i + 1;
+        continue;
+      }
     }
     break;
   }

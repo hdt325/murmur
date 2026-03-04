@@ -431,6 +431,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false, // Keep timers + AudioContext alive when Murmur is behind other windows
     },
   });
 
