@@ -573,18 +573,43 @@ function setupAutoUpdater() {
 // Install update from in-app banner button
 ipcMain.on("install-update", () => {
   try {
+    // Remove lifecycle listeners so nothing blocks the quit
     app.removeAllListeners("window-all-closed");
     app.removeAllListeners("will-quit");
+
+    // Destroy tray so the app doesn't linger as a background process
+    if (tray) { tray.destroy(); tray = null; }
+
+    // Kill server process cleanly
+    if (serverProcess) {
+      try { serverProcess.kill("SIGTERM"); } catch {}
+      serverProcess = null;
+    }
+
+    // Destroy window
     if (win && !win.isDestroyed()) {
       win.removeAllListeners("close");
       win.destroy();
+      win = null;
     }
-    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+
+    // Safety fallback: force exit after 6s if quitAndInstall hangs
+    setTimeout(() => app.exit(0), 6000);
+
+    setImmediate(() => {
+      try {
+        autoUpdater.quitAndInstall(false, true);
+      } catch (err) {
+        console.log("quitAndInstall failed:", err.message);
+        app.exit(0);
+      }
+    });
   } catch (err) {
-    console.log("quitAndInstall failed:", err.message);
+    console.log("install-update handler error:", err.message);
     // Fallback: open download page in browser
     const { shell } = require("electron");
     shell.openExternal("https://github.com/hdt325/murmur/releases/latest");
+    setTimeout(() => app.quit(), 1000);
   }
 });
 
