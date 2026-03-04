@@ -2817,7 +2817,7 @@
       else if (state === "responding") setHeaderState("responding", "Claude is responding...");
       return;
     }
-    if (talkBtn.classList.contains("transcribing") && !["thinking", "sent", "blank", "wake_no_match"].includes(state)) {
+    if (talkBtn.classList.contains("transcribing") && !["thinking", "responding", "sent", "blank", "wake_no_match"].includes(state)) {
       rlog(`[voice_status] ${state} IGNORED — transcribing in progress`);
       return;
     }

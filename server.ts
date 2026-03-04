@@ -2341,9 +2341,9 @@ function handleWsConnection(ws: WebSocket) {
           const count = pendingVoiceInput.length;
           console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
           broadcast({ type: "voice_queue", count });
-          // Return to current stream state so UI shows thinking/responding again
-          const vsState = streamState === "THINKING" ? "thinking"
-            : streamState === "RESPONDING" ? "responding" : "idle";
+          // Return to current stream state so UI exits transcribing
+          // WAITING also maps to "thinking" — Claude hasn't started yet but will
+          const vsState = streamState === "RESPONDING" ? "responding" : "thinking";
           broadcast({ type: "voice_status", state: vsState });
         }
       }
