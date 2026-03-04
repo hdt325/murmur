@@ -1131,6 +1131,9 @@ function loadScrollbackEntries(): ConversationEntry[] {
     const endLineIdx = t + 1 < totalTurns ? recentTurns[t + 1].lineIdx : lines.length;
     const turnNum = -(totalTurns - t); // negative so they precede live turns
 
+    // Skip voice panel instruction turns entirely
+    if (MURMUR_CONTEXT_FILTER.test(start.input)) continue;
+
     // User entry
     entries.push({
       id: ++entryIdCounter,
