@@ -3107,7 +3107,15 @@
           startRecording();
           return;
         }
-        talkBtn.textContent = "Allow mic in System Settings";
+        // Still denied — show button to open System Settings directly
+        talkBtn.textContent = "🎙 Open Mic Settings";
+        talkBtn.className = "";
+        talkBtn.onclick = () => {
+          window.murmurElectron.openMicSettings();
+          talkBtn.onclick = null;
+          setTimeout(() => setTalkState("idle"), 500);
+        };
+        return; // Don't reset — leave button clickable
       } else {
         talkBtn.textContent = "Mic access denied";
       }

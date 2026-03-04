@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld("murmurElectron", {
   installPrereq: (name) => ipcRenderer.invoke("install-prereq", name),
   // Mic permission — triggers native macOS permission dialog from main process
   requestMicPermission: () => ipcRenderer.invoke("request-mic-permission"),
+  // Open System Settings → Privacy → Microphone directly
+  openMicSettings: () => ipcRenderer.send("open-mic-settings"),
   // App updates
   checkForUpdates: () => ipcRenderer.invoke("check-for-updates"),
   onUpdateReady: (callback) => ipcRenderer.on("update-ready", (_e, info) => callback(info)),

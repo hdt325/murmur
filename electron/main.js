@@ -643,6 +643,13 @@ ipcMain.handle("request-mic-permission", async () => {
   return true;
 });
 
+// Open System Settings → Privacy → Microphone directly
+ipcMain.on("open-mic-settings", () => {
+  const { shell } = require("electron");
+  // macOS deep link to Microphone privacy pane
+  shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone");
+});
+
 // Manual update check from UI
 ipcMain.handle("check-for-updates", async () => {
   if (!app.isPackaged) {
