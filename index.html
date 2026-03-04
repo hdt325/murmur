@@ -2114,9 +2114,16 @@
     document.addEventListener("touchstart", unlockAudio, { passive: true });
   })();
 
-  // Auto-init mic on load, click mic meter or talk button as fallback
-  setTimeout(initMicMeter, 500);
+  // Mic init: on iOS, always wait for a user gesture so the permission grant
+  // is remembered by the OS. On desktop, init immediately (no prompt behavior difference).
   micMeter.addEventListener("click", initMicMeter);
+  if (isIOS) {
+    // Defer until first tap — iOS only persists permissions granted in gesture context
+    const _iosInitMic = () => { document.removeEventListener("touchstart", _iosInitMic); initMicMeter(); };
+    document.addEventListener("touchstart", _iosInitMic, { passive: true });
+  } else {
+    setTimeout(initMicMeter, 500);
+  }
 
   function resizeMicCanvas() {
     const rect = micMeter.getBoundingClientRect();
