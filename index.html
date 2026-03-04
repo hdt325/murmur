@@ -653,10 +653,10 @@
 
   .controls button.stop { border-color: #333338; color: #e74c3c; font-size: 9px; }
   .controls button.stop:hover { background: #e74c3c22; border-color: #e74c3c88; }
-  .controls button.interrupt-btn { border-color: #333338; color: #f39c12; font-size: 12px; position: relative; }
-  .controls button.interrupt-btn:hover { background: #f39c1222; border-color: #f39c1288; }
-  .controls button.interrupt-btn.has-queue { color: #e67e22; border-color: #e67e2266; }
-  .controls button.interrupt-btn .queue-badge { position: absolute; top: -5px; right: -5px; background: #e67e22; color: #fff; border-radius: 8px; font-size: 9px; min-width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; padding: 0 2px; }
+  .controls button.interrupt-btn { border-color: #222225; color: #444; font-size: 12px; cursor: default; }
+  .controls button.interrupt-btn.active { border-color: #333338; color: #f39c12; cursor: pointer; }
+  .controls button.interrupt-btn.active:hover { background: #f39c1222; border-color: #f39c1288; }
+  .controls button.interrupt-btn.has-queue { color: #e67e22; border-color: #e67e2266; cursor: pointer; }
 
   .controls button.mute-btn { color: #e74c3c; width: 28px; padding: 0; }
   .controls button.mute-btn svg { display: block; }
@@ -1217,7 +1217,7 @@
 <!-- Section 5: Controls + Input -->
 <div class="controls">
   <button class="stop" id="stopBtn" data-tip="Stop voice playback">■</button>
-  <button class="interrupt-btn" id="interruptBtn" data-tip="Interrupt Claude &amp; send queued voice" style="display:none">⚡</button>
+  <button class="interrupt-btn" id="interruptBtn" data-tip="Interrupt Claude &amp; send queued voice">⚡</button>
   <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
   <button class="mode-btn" id="modeBtn" data-tip="Talk ↔ Talk">Talk</button>
   <button class="replay-btn" id="replayBtn" data-tip="Replay last response">↻</button>
@@ -2740,8 +2740,7 @@
         if (mode.micOn && micAnalyser && micDataArray) {
           startTalkWaveform("#e74c3c44", micAnalyser, micDataArray);
         }
-        // Hide interrupt button when idle (unless there's a pending queue)
-        if (pendingVoiceCount === 0) interruptBtn.style.display = "none";
+        updateInterruptBtn(pendingVoiceCount); // Deactivate when idle
         break;
       }
       case "recording":
@@ -2769,7 +2768,7 @@
         talkBtn.className = "thinking";
         setHeaderState("thinking", "Claude is thinking...");
         showThinkingBubble();
-        interruptBtn.style.display = "";
+        updateInterruptBtn(pendingVoiceCount);
         break;
       case "responding":
         talkBtn.textContent = "";
@@ -2777,7 +2776,7 @@
         talkBtn.insertAdjacentText('beforeend', "Claude is responding... (tap to queue voice)");
         talkBtn.className = "responding";
         setHeaderState("responding", "Claude is responding...");
-        interruptBtn.style.display = "";
+        updateInterruptBtn(pendingVoiceCount);
         break;
       case "speaking": {
         talkBtn.innerHTML = '';
@@ -2799,7 +2798,7 @@
         // Don't call startBubbleHighlight() — server drives highlights via tts_highlight messages
         setHeaderState("speaking", "Speaking");
         removeThinkingBubble();
-        if (pendingVoiceCount > 0) interruptBtn.style.display = "";
+        updateInterruptBtn(pendingVoiceCount);
         break;
       }
     }
@@ -2872,16 +2871,11 @@
 
   function updateInterruptBtn(count) {
     pendingVoiceCount = count;
-    // Queue shown in transcript now — button just shows/hides based on active state + queue
     const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
-    if (count > 0 || isActive) {
-      interruptBtn.style.display = "";
-    } else {
-      interruptBtn.style.display = "none";
-    }
+    const enabled = isActive || count > 0;
+    interruptBtn.classList.toggle("active", enabled);
     interruptBtn.classList.toggle("has-queue", count > 0);
-    interruptBtn.innerHTML = "⚡";
-    interruptBtn.setAttribute("data-tip", count > 0 ? "Interrupt Claude & send queued voice" : "Interrupt Claude");
+    interruptBtn.setAttribute("data-tip", enabled ? (count > 0 ? "Interrupt Claude & send queued voice" : "Interrupt Claude") : "Interrupt (inactive)");
   }
 
   // =============================================
@@ -2896,9 +2890,9 @@
   });
 
   interruptBtn.addEventListener("click", () => {
+    if (!interruptBtn.classList.contains("active")) return;
     if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
     stopTtsPlayback();
-    // Keep UI in current state — server will drain queue and broadcast new state
   });
 
   muteBtn.addEventListener("click", () => {
