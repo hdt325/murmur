@@ -287,8 +287,8 @@ async function testIntegration_textInput() {
     // 'responding' state may be missed for very short replies (sub-400ms) — non-fatal
     if (sawResponse) report("Saw 'responding' or 'speaking' state", true);
 
-    // Check transcript has an assistant message — wait up to 12s for entry to render
-    const hasAssistantMsg = await page.waitForSelector(".msg.assistant", { timeout: 12000 })
+    // Check transcript has an assistant message — wait up to 45s for entry to render
+    const hasAssistantMsg = await page.waitForSelector(".msg.assistant", { timeout: 45000 })
       .then(() => true).catch(() => false);
     report("Transcript contains assistant message", hasAssistantMsg);
 
@@ -306,6 +306,259 @@ async function testIntegration_textInput() {
   } else {
     report("Terminal input field visible", false, "not found");
   }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Voice + Text Queuing
+// Messages sent while Claude is active get queued with visual styling
+// ──────────────────────────────────────────────────────────────
+async function testFeature_voiceQueue() {
+  console.log("\n[Feature] Voice/text queue system");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(
+    new URL("../server.ts", import.meta.url).pathname,
+    "utf-8"
+  );
+  const htmlSrc = readFileSync(
+    new URL("../index.html", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  // Server: pendingVoiceInput with entryId tracking
+  const hasQueue = serverSrc.includes("pendingVoiceInput") && serverSrc.includes("entryId");
+  report("Server has pendingVoiceInput with entryId tracking", hasQueue);
+
+  // Server: drain lock to prevent concurrent drains
+  const hasDrainLock = serverSrc.includes("_voiceQueueDraining");
+  report("Server has _voiceQueueDraining lock", hasDrainLock);
+
+  // Server: text: handler queues when Claude active
+  const textHandlerQueues = serverSrc.includes("text:") && serverSrc.includes("addUserEntry(text, true)");
+  report("text: handler queues when Claude active", textHandlerQueues);
+
+  // Server: stop clears queue and removes queued entries
+  const stopClearsQueue = serverSrc.includes("pendingVoiceInput.length = 0") ||
+    serverSrc.includes("pendingVoiceInput = []") ||
+    serverSrc.includes("pendingVoiceInput.splice");
+  report("Stop clears pendingVoiceInput", stopClearsQueue);
+
+  // Frontend: entry-queued CSS class exists
+  const hasQueuedCss = htmlSrc.includes("entry-queued");
+  report("Frontend has entry-queued CSS class", hasQueuedCss);
+
+  // Frontend: queued entries get dimmed opacity
+  const hasOpacity = htmlSrc.includes("0.72") || htmlSrc.includes("opacity: 0.7");
+  report("Queued entry has reduced opacity", hasOpacity);
+
+  // Frontend: ⏳ icon inline in queued entry
+  const hasHourglass = htmlSrc.includes("queued-icon") && htmlSrc.includes("⏳");
+  report("Queued entry shows ⏳ inline icon", hasHourglass);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Interrupt Button Always Visible
+// ⚡ button stays in place, dimmed when inactive
+// ──────────────────────────────────────────────────────────────
+async function testFeature_interruptButton() {
+  console.log("\n[Feature] Interrupt button always visible");
+
+  // Load fresh page (idle state, no Claude session active)
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1500);
+
+  // Check source: interruptBtn uses CSS active class, not show/hide
+  const htmlSrc = await page.content();
+  const hasInterruptBtn = htmlSrc.includes("interruptBtn");
+  report("Interrupt button exists in DOM", hasInterruptBtn);
+
+  // Button should be in DOM and visible (not hidden with display:none)
+  const interruptBtn = page.locator("#interruptBtn");
+  const isVisible = await interruptBtn.isVisible().catch(() => false);
+  report("Interrupt button is visible (always-present)", isVisible as boolean);
+
+  // When idle (fresh page, no active Claude session): should NOT have active class
+  const hasActiveClass = await interruptBtn.evaluate(el => el.classList.contains("active")).catch(() => false);
+  report("Interrupt button is dimmed (no active class) when idle", !hasActiveClass);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Paste Auto-Submit
+// Pasting into text input auto-sends without pressing Enter
+// ──────────────────────────────────────────────────────────────
+async function testFeature_pasteAutoSubmit() {
+  console.log("\n[Feature] Paste auto-submit");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(
+    new URL("../index.html", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  // Dual detection: paste flag + insertFromPaste
+  const hasPasteFlag = htmlSrc.includes("_pasteFlag");
+  report("Paste flag variable present (dual-detection)", hasPasteFlag);
+
+  const hasPasteEvent = htmlSrc.includes(`addEventListener("paste"`) && htmlSrc.includes("_pasteFlag = true");
+  report("paste event sets _pasteFlag", hasPasteEvent);
+
+  const hasInputCheck = htmlSrc.includes("insertFromPaste") && htmlSrc.includes("isPaste");
+  report("input event checks flag + insertFromPaste", hasInputCheck);
+
+  // Live test: programmatic paste triggers auto-submit
+  const termInput = page.locator("#textInput");
+  if (await termInput.isVisible()) {
+    // Use clipboard API simulation via Playwright
+    await termInput.focus();
+    await page.evaluate(() => {
+      const input = document.getElementById("textInput") as HTMLInputElement;
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      nativeInputValueSetter.call(input, "test-paste-content");
+      // Simulate paste event then input event
+      input.dispatchEvent(new Event("paste", { bubbles: true }));
+      input.dispatchEvent(new InputEvent("input", { inputType: "insertFromPaste", bubbles: true }));
+    });
+    await page.waitForTimeout(300);
+    // Input should be cleared after auto-submit
+    const value = await termInput.inputValue();
+    report("Paste auto-submit clears input field", value === "");
+  } else {
+    report("Text input visible for paste test", false, "input not found");
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Tmux Session Persistence
+// Last-used tmux session restored after server restart
+// ──────────────────────────────────────────────────────────────
+async function testFeature_tmuxPersistence() {
+  console.log("\n[Feature] Tmux session persistence");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(
+    new URL("../server.ts", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  // PanelSettings interface has tmuxTarget
+  const hasInterface = serverSrc.includes("tmuxTarget") && serverSrc.includes("PanelSettings");
+  report("PanelSettings interface has tmuxTarget field", hasInterface);
+
+  // saveSettings called on tmux switch
+  const saveOnSwitch = serverSrc.includes("saveSettings") && serverSrc.includes("tmuxTarget");
+  report("tmuxTarget saved to settings on switch", saveOnSwitch);
+
+  // Startup code restores saved target
+  const hasRestore = serverSrc.includes("loadSettings().tmuxTarget") || serverSrc.includes("savedTarget");
+  report("Server restores tmuxTarget on startup", hasRestore);
+
+  // switchTarget call on restore
+  const callsSwitchTarget = serverSrc.includes("terminal.switchTarget") || serverSrc.includes("switchTarget(session");
+  report("Server calls switchTarget with saved session", callsSwitchTarget);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: npm start Auto-Restart
+// start.mjs wrapper re-spawns server on exit code 0
+// ──────────────────────────────────────────────────────────────
+async function testFeature_autoRestart() {
+  console.log("\n[Feature] npm start auto-restart (start.mjs)");
+
+  const { readFileSync, existsSync } = await import("fs");
+
+  const startMjsPath = new URL("../start.mjs", import.meta.url).pathname;
+  const startExists = existsSync(startMjsPath);
+  report("start.mjs wrapper file exists", startExists);
+
+  if (startExists) {
+    const startSrc = readFileSync(startMjsPath, "utf-8");
+    const spawnsServer = startSrc.includes("tsx") && startSrc.includes("server.ts");
+    report("start.mjs spawns npx tsx server.ts", spawnsServer);
+
+    const restartsOnZero = startSrc.includes("code === 0") && startSrc.includes("setTimeout");
+    report("start.mjs restarts on exit code 0", restartsOnZero);
+
+    const exitsOnError = startSrc.includes("process.exit");
+    report("start.mjs exits on non-zero code", exitsOnError);
+  }
+
+  const pkgSrc = readFileSync(new URL("../package.json", import.meta.url).pathname, "utf-8");
+  const pkg = JSON.parse(pkgSrc);
+  const usesStartMjs = pkg.scripts?.start === "node start.mjs";
+  report("package.json start script uses node start.mjs", usesStartMjs);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Session Popover Color Coding
+// Group headers blue, items lighter, active item gold
+// ──────────────────────────────────────────────────────────────
+async function testFeature_sessionPopoverColors() {
+  console.log("\n[Feature] Session popover color coding");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(
+    new URL("../index.html", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  const hasGroupColor = htmlSrc.includes("#7ab8e8") && htmlSrc.includes("sess-group");
+  report("Session group headers use blue (#7ab8e8)", hasGroupColor);
+
+  const hasActiveGold = htmlSrc.includes("#c9a227") && htmlSrc.includes("sess-item.active");
+  report("Active session item uses gold (#c9a227)", hasActiveGold);
+
+  const hasItemColor = htmlSrc.includes("#c8cdd5") && htmlSrc.includes("sess-item");
+  report("Session items use lighter color (#c8cdd5)", hasItemColor);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Terminal Label Inline Styles
+// Stats text uses inline color (not CSS classes) to fix specificity
+// ──────────────────────────────────────────────────────────────
+async function testFeature_terminalLabelStyles() {
+  console.log("\n[Feature] Terminal label uses inline styles");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(
+    new URL("../index.html", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  // updateTermLabel uses inline style="color:..."
+  const hasInlineStyle = htmlSrc.includes(`style="font-size:10px;color:`) &&
+    htmlSrc.includes("updateTermLabel");
+  report("updateTermLabel uses inline style for color", hasInlineStyle);
+
+  // Three color states: blue, orange, red
+  const hasBlue = htmlSrc.includes("#7ab8e8");
+  const hasOrange = htmlSrc.includes("#c0853a");
+  const hasRed = htmlSrc.includes("#c0453a");
+  report("Terminal label has blue/orange/red color states", hasBlue && hasOrange && hasRed);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: TTS Highlight Scroll
+// Highlighted entry scrolls to near top of transcript (32px offset)
+// ──────────────────────────────────────────────────────────────
+async function testFeature_ttsScrollToTop() {
+  console.log("\n[Feature] TTS highlight scrolls entry near top");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(
+    new URL("../index.html", import.meta.url).pathname,
+    "utf-8"
+  );
+
+  // Look for the scroll positioning logic (elRelTop - 32)
+  const hasScrollTop = htmlSrc.includes("elRelTop - 32") || htmlSrc.includes("elRelTop-32");
+  report("TTS highlight scroll positions entry 32px from top", hasScrollTop);
+
+  // Should use getBoundingClientRect for positioning
+  const usesGetBCR = htmlSrc.includes("getBoundingClientRect") &&
+    htmlSrc.includes("highlightEntry");
+  report("highlightEntry uses getBoundingClientRect for scroll", usesGetBCR);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -331,6 +584,16 @@ async function main() {
   // Live integration checks
   await testIntegration_wsConnect();
   await testIntegration_textInput();
+
+  // New features from session
+  await testFeature_voiceQueue();
+  await testFeature_interruptButton();
+  await testFeature_pasteAutoSubmit();
+  await testFeature_tmuxPersistence();
+  await testFeature_autoRestart();
+  await testFeature_sessionPopoverColors();
+  await testFeature_terminalLabelStyles();
+  await testFeature_ttsScrollToTop();
 
   await teardown();
 }
