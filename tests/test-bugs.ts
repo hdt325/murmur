@@ -287,12 +287,9 @@ async function testIntegration_textInput() {
     // 'responding' state may be missed for very short replies (sub-400ms) — non-fatal
     if (sawResponse) report("Saw 'responding' or 'speaking' state", true);
 
-    // Check transcript has an assistant message
-    await page.waitForTimeout(3000); // Wait for TTS to finish
-    const hasAssistantMsg = await page.evaluate(() => {
-      const msgs = document.querySelectorAll(".msg.assistant");
-      return msgs.length > 0;
-    });
+    // Check transcript has an assistant message — wait up to 12s for entry to render
+    const hasAssistantMsg = await page.waitForSelector(".msg.assistant", { timeout: 12000 })
+      .then(() => true).catch(() => false);
     report("Transcript contains assistant message", hasAssistantMsg);
 
     // Verify the assistant message is scoped (not full scrollback) — Bug 10
