@@ -348,15 +348,10 @@
 
   /* Queued voice — pending while Claude is active, not yet sent */
   .msg.user.entry-queued {
-    opacity: 0.55;
+    opacity: 0.72;
     border-style: dashed;
     border-color: rgba(180, 140, 60, 0.4);
     background: rgba(180, 140, 60, 0.06);
-  }
-  .msg.user.entry-queued::after {
-    content: " ⏳";
-    font-size: 0.85em;
-    opacity: 0.7;
   }
 
   /* Entry-based clean mode: hide non-speakable entries via CSS */
