@@ -1094,6 +1094,81 @@ function stripChrome(lines: string[]): string[] {
   return cleaned;
 }
 
+// Parse tmux scrollback into historical conversation entries.
+// Splits on ❯ input markers, extracts user inputs and assistant responses.
+// All entries are marked spoken=true so they appear silently (no auto-TTS).
+function loadScrollbackEntries(): ConversationEntry[] {
+  let scrollback: string;
+  try { scrollback = terminal.capturePaneScrollback(); } catch { return []; }
+  if (!scrollback.trim()) return [];
+
+  const lines = scrollback.split("\n");
+  const turnStarts: { lineIdx: number; input: string }[] = [];
+
+  // Find user input lines: ❯ followed by actual content
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimEnd();
+    const m = trimmed.match(/^❯\s+(.+)$/);
+    if (m && m[1].trim()) {
+      turnStarts.push({ lineIdx: i, input: m[1].trim() });
+    }
+  }
+  if (turnStarts.length === 0) return [];
+
+  // Only load the last 10 turns to avoid flooding the view
+  const recentTurns = turnStarts.slice(-10);
+  const entries: ConversationEntry[] = [];
+  const totalTurns = recentTurns.length;
+
+  for (let t = 0; t < totalTurns; t++) {
+    const start = recentTurns[t];
+    const endLineIdx = t + 1 < totalTurns ? recentTurns[t + 1].lineIdx : lines.length;
+    const turnNum = -(totalTurns - t); // negative so they precede live turns
+
+    // User entry
+    entries.push({
+      id: ++entryIdCounter,
+      role: "user",
+      text: start.input,
+      speakable: false,
+      spoken: true,
+      ts: Date.now() - (totalTurns - t) * 300000,
+      turn: turnNum,
+    });
+
+    // Collect and filter assistant response lines
+    const responseLines: string[] = [];
+    for (let i = start.lineIdx + 1; i < endLineIdx; i++) {
+      const trimmed = lines[i].trim();
+      if (!trimmed) { responseLines.push(""); continue; }
+      if (/^[─━═]{3,}/.test(trimmed)) continue;
+      if (/^❯/.test(trimmed)) continue;
+      if (isSpinnerLine(trimmed)) continue;
+      if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
+      if (/bypass\s+permissions/i.test(trimmed)) continue;
+      if (/context left until/i.test(trimmed)) continue;
+      if (/auto-compact/i.test(trimmed)) continue;
+      if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(trimmed)) continue;
+      responseLines.push(lines[i]);
+    }
+
+    const text = reflowText(responseLines.join("\n")).trim();
+    if (text) {
+      entries.push({
+        id: ++entryIdCounter,
+        role: "assistant",
+        text,
+        speakable: true,
+        spoken: true, // silent — user replays on demand
+        ts: Date.now() - (totalTurns - t) * 300000 + 1000,
+        turn: turnNum,
+      });
+    }
+  }
+
+  return entries;
+}
+
 // Reflow tmux-wrapped lines into natural paragraphs.
 // Tmux hard-wraps at terminal width (120 cols), which looks broken in the UI.
 // Join consecutive non-empty lines into paragraphs, preserving intentional breaks.
@@ -2644,6 +2719,12 @@ function handleWsConnection(ws: WebSocket) {
         stopTmuxStreaming();
         terminal.switchTarget(session, windowIdx);
         saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
+        // Load historical entries for the new session
+        conversationEntries = loadScrollbackEntries();
+        entryIdCounter = conversationEntries.length > 0
+          ? Math.max(...conversationEntries.map(e => e.id))
+          : entryIdCounter;
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
         // Force context resend on new target
         contextSentAt = 0;
         sendMurmurContext(1000);
@@ -3115,6 +3196,14 @@ if (savedTarget && terminal.switchTarget) {
     }
   }
 }
+// Load historical entries from tmux scrollback so clients see prior context on connect
+const catchupEntries = loadScrollbackEntries();
+if (catchupEntries.length > 0) {
+  conversationEntries = catchupEntries;
+  // currentTurn starts at 0; live turns will be positive, historical are negative
+  console.log(`[startup] Loaded ${catchupEntries.length} entries from scrollback`);
+}
+
 sendMurmurContext(5000);
 initSignalFiles();
 
