@@ -2076,6 +2076,8 @@
 
   // iOS audio unlock: create AudioContext on first user gesture so TTS works before mic is granted.
   // iOS requires a user gesture to start audio — this pre-unlocks it on the first tap/click.
+  // Also unlocks speechSynthesis for device voices (iOS blocks speak() outside user gesture).
+  let _speechSynthUnlocked = false;
   (function() {
     function unlockAudio() {
       document.removeEventListener("click", unlockAudio);
@@ -2089,6 +2091,16 @@
         } catch (e) { console.warn("[audio] AudioContext create failed:", e); }
       } else if (ttsAudioCtx.state === "suspended") {
         ttsAudioCtx.resume();
+      }
+      // Unlock speechSynthesis on iOS — speak a silent utterance inside the gesture
+      if (!_speechSynthUnlocked && window.speechSynthesis) {
+        try {
+          const silent = new SpeechSynthesisUtterance("");
+          silent.volume = 0;
+          silent.onend = () => { _speechSynthUnlocked = true; };
+          window.speechSynthesis.speak(silent);
+          console.log("[audio] speechSynthesis unlocked on first gesture");
+        } catch (e) { console.warn("[audio] speechSynthesis unlock failed:", e); }
       }
     }
     document.addEventListener("click", unlockAudio);
@@ -3533,18 +3545,19 @@
       // Highlight the entry being spoken
       if (entryId != null) highlightEntry(entryId);
 
-      // Safety: if onstart doesn't fire within 3s, assume speechSynthesis failed silently
+      // Safety: if onstart doesn't fire within 6s, assume speechSynthesis failed silently
+      // iOS can take longer to start speech after unlock, so give it extra time
       let started = false;
       const safetyTimer = setTimeout(() => {
         if (!started) {
-          rlog("[local-tts] No onstart after 3s — assuming silent failure, sending tts_done");
+          rlog("[local-tts] No onstart after 6s — assuming silent failure, sending tts_done");
           ttsPlaying = false;
           localTtsUtterance = null;
           window.speechSynthesis.cancel();
           if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
           if (pendingIdle) applyIdleState();
         }
-      }, 3000);
+      }, 6000);
 
       utter.onstart = () => {
         started = true;
