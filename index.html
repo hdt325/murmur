@@ -281,7 +281,7 @@
     line-height: 1.4;
     max-width: 88%;
     word-wrap: break-word;
-    white-space: pre-wrap;
+    white-space: normal;
     animation: fadeIn 0.15s ease-in;
     cursor: pointer;
     position: relative;
@@ -2395,6 +2395,16 @@
     return d.innerHTML;
   }
 
+  // Convert plain entry text to HTML that reflows correctly with CSS.
+  // \n\n = paragraph break, \n = line break within a paragraph.
+  function entryTextToHtml(text) {
+    return text.split(/\n\n+/)
+      .map(p => p.trim())
+      .filter(Boolean)
+      .map(p => `<p style="margin:0 0 0.4em">${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+      .join("") || "&nbsp;";
+  }
+
   let activeSpeakBubbles = [];
   let activeSpeakIdx = 0;
   let _replayTargetBubble = null; // Set when user clicks replay on a specific bubble
@@ -2491,7 +2501,7 @@
       if (div) {
         // Update existing bubble text if changed
         const textEl = div.querySelector(".entry-text");
-        const newText = escapeHtml(entry.text);
+        const newText = entryTextToHtml(entry.text);
         if (textEl && textEl.innerHTML !== newText) {
           textEl.innerHTML = newText;
         }
@@ -2508,7 +2518,7 @@
         const roleName = entry.role === "user" ? "You" : "Claude";
         div.innerHTML =
           `<div class="meta"><span class="role">${roleName}</span><span class="time">${timeStr}</span></div>` +
-          `<span class="entry-text">${escapeHtml(entry.text)}</span>`;
+          `<span class="entry-text">${entryTextToHtml(entry.text)}</span>`;
         div.dataset.copyText = entry.text;
 
         if (entry.role === "assistant") {
