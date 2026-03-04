@@ -677,7 +677,7 @@ const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
 const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
-let pendingVoiceInput: string[] = []; // Queued voice while Claude is active
+let pendingVoiceInput: Array<{ text: string; entryId: number }> = []; // Queued voice while Claude is active
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -892,6 +892,7 @@ interface ConversationEntry {
   spoken: boolean;
   ts: number;
   turn: number;
+  queued?: boolean; // true = pending while Claude is active, not yet sent
 }
 
 let conversationEntries: ConversationEntry[] = [];
@@ -901,7 +902,7 @@ let currentTtsEntryId: number | null = null;
 let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Add a user entry and broadcast the updated entry list
-function addUserEntry(text: string) {
+function addUserEntry(text: string, queued = false) {
   const entry: ConversationEntry = {
     id: ++entryIdCounter,
     role: "user",
@@ -910,9 +911,11 @@ function addUserEntry(text: string) {
     spoken: false,
     ts: Date.now(),
     turn: currentTurn,
+    queued,
   };
   conversationEntries.push(entry);
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
+  return entry;
 }
 
 // Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
@@ -1605,13 +1608,19 @@ function stopTmuxStreaming() {
 
   // Drain pending queued voice input
   if (pendingVoiceInput.length > 0) {
-    const nextInput = pendingVoiceInput.shift()!;
+    const next = pendingVoiceInput.shift()!;
     const remaining = pendingVoiceInput.length;
-    console.log(`[voice] Draining queued input: "${nextInput.slice(0, 60)}" — ${remaining} remaining`);
+    console.log(`[voice] Draining queued input: "${next.text.slice(0, 60)}" — ${remaining} remaining`);
     setTimeout(() => {
-      startTmuxStreaming(nextInput);
-      addUserEntry(nextInput);
-      terminal.sendText(nextInput);
+      // Mark the queued entry as sent (remove queued flag) before starting stream
+      const queuedEntry = conversationEntries.find(e => e.id === next.entryId);
+      if (queuedEntry) {
+        queuedEntry.queued = false;
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
+      startTmuxStreaming(next.text);
+      if (!queuedEntry) addUserEntry(next.text); // Fallback if entry was lost
+      terminal.sendText(next.text);
       broadcast({ type: "voice_queue", count: remaining });
     }, 500);
   }
@@ -2326,11 +2335,12 @@ function handleWsConnection(ws: WebSocket) {
           addUserEntry(text);
           terminal.sendText(text);
         } else {
-          // Claude is active — queue the transcription
-          pendingVoiceInput.push(text);
+          // Claude is active — queue the transcription, add to transcript immediately
+          const queuedEntry = addUserEntry(text, true);
+          pendingVoiceInput.push({ text, entryId: queuedEntry.id });
           const count = pendingVoiceInput.length;
           console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
-          broadcast({ type: "voice_queue", count, text });
+          broadcast({ type: "voice_queue", count });
           // Return to current stream state so UI shows thinking/responding again
           const vsState = streamState === "THINKING" ? "thinking"
             : streamState === "RESPONDING" ? "responding" : "idle";
@@ -2408,7 +2418,13 @@ function handleWsConnection(ws: WebSocket) {
     if (msg === "key:tab") { terminal.sendKey("Tab"); return; }
 
     if (msg === "stop") {
-      pendingVoiceInput = []; // Clear any queued voice on explicit stop
+      // Remove queued entries from transcript and clear queue
+      if (pendingVoiceInput.length > 0) {
+        const queuedIds = new Set(pendingVoiceInput.map(p => p.entryId));
+        conversationEntries = conversationEntries.filter(e => !queuedIds.has(e.id));
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
+      pendingVoiceInput = [];
       terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();

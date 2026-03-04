@@ -346,6 +346,19 @@
     opacity: 0.6;
   }
 
+  /* Queued voice — pending while Claude is active, not yet sent */
+  .msg.user.entry-queued {
+    opacity: 0.55;
+    border-style: dashed;
+    border-color: rgba(180, 140, 60, 0.4);
+    background: rgba(180, 140, 60, 0.06);
+  }
+  .msg.user.entry-queued::after {
+    content: " ⏳";
+    font-size: 0.85em;
+    opacity: 0.7;
+  }
+
   /* Entry-based clean mode: hide non-speakable entries via CSS */
   body.clean-mode .entry-nonspeakable { display: none; }
 
@@ -1542,35 +1555,61 @@
   applyCleanMode();
   let termFontSize = parseInt(localStorage.getItem("term-font-size") || "10");
 
-  // Terminal activity stats — line count + staleness indicator
-  let termLineCount = 0;
+  // Terminal activity — spinner text extraction + staleness indicator
+  let termLastSpinner = "";    // e.g. "✻ Thinking…"
   let termLastUpdateAt = 0;
   let termStaleTimer = null;
+
+  function stripAnsi(str) {
+    return str.replace(/\x1b\[[0-9;?]*[mGKHFABCDJ]/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+  }
+
+  function extractSpinner(text) {
+    const plain = stripAnsi(text);
+    const lines = plain.split("\n");
+    // Scan from bottom — spinner is near the end of pane output
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+      const line = lines[i].trim();
+      // Claude Code spinner lines start with ✻ or braille spinner chars
+      if (/^[✻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]/.test(line)) {
+        // Strip the timing parenthetical: " (1m 13s · ↓ 1.5k tokens · thinking)"
+        return line.replace(/\s*\(.*\)\s*$/, "").trim();
+      }
+    }
+    return "";
+  }
+
+  function elapsedStr(ms) {
+    if (ms < 60000) return `${Math.round(ms / 1000)}s ago`;
+    return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s ago`;
+  }
 
   function updateTermLabel() {
     const arrow = terminalOpen ? "▼" : "▶";
     const label = document.getElementById("termToggleLabel");
-    if (!termLineCount) {
-      label.textContent = `${arrow} Terminal`;
-      return;
-    }
+    if (!termLastUpdateAt) { label.textContent = `${arrow} Terminal`; return; }
     const elapsed = Date.now() - termLastUpdateAt;
-    const elapsedStr = elapsed > 90000
-      ? `${Math.floor(elapsed / 60000)}m ${Math.floor((elapsed % 60000) / 1000)}s ago`
-      : `${Math.round(elapsed / 1000)}s ago`;
-    const staleLevel = elapsed > 120000 ? "stale-critical" : elapsed > 30000 ? "stale-warn" : "";
-    const statsHtml = staleLevel
-      ? ` <span class="term-stats ${staleLevel}">${termLineCount} lines · ${elapsedStr}</span>`
-      : ` <span class="term-stats">${termLineCount} lines</span>`;
+    let statsHtml;
+    if (termLastSpinner && elapsed < 6000) {
+      // Active spinner — show it directly
+      statsHtml = ` <span class="term-stats">${escapeHtml(termLastSpinner)}</span>`;
+    } else if (elapsed < 30000) {
+      // Recently active, no spinner — show how long ago
+      statsHtml = ` <span class="term-stats">last active ${elapsedStr(elapsed)}</span>`;
+    } else if (elapsed < 120000) {
+      statsHtml = ` <span class="term-stats stale-warn">last active ${elapsedStr(elapsed)}</span>`;
+    } else {
+      statsHtml = ` <span class="term-stats stale-critical">last active ${elapsedStr(elapsed)}</span>`;
+    }
     label.innerHTML = `${arrow} Terminal${statsHtml}`;
   }
 
   function recordTermActivity(text) {
-    termLineCount = (text.match(/\n/g) || []).length + 1;
+    termLastSpinner = extractSpinner(text);
     termLastUpdateAt = Date.now();
     updateTermLabel();
     if (termStaleTimer) clearInterval(termStaleTimer);
-    termStaleTimer = setInterval(updateTermLabel, 5000);
+    termStaleTimer = setInterval(updateTermLabel, 2000);
   }
 
   // Restore terminal state on load
@@ -2589,6 +2628,13 @@
         div.classList.remove("entry-nonspeakable");
       }
 
+      // Queued voice styling — dashed border + faded until actually sent
+      if (entry.queued) {
+        div.classList.add("entry-queued");
+      } else {
+        div.classList.remove("entry-queued");
+      }
+
       // Mark spoken entries — but don't override active TTS highlight
       // Once bubble-spoken is set (by TTS highlight advancement), never remove it
       if (entry.spoken && !div.classList.contains("bubble-active")) {
@@ -2827,19 +2873,16 @@
 
   function updateInterruptBtn(count) {
     pendingVoiceCount = count;
-    if (count > 0) {
+    // Queue shown in transcript now — button just shows/hides based on active state + queue
+    const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
+    if (count > 0 || isActive) {
       interruptBtn.style.display = "";
-      interruptBtn.classList.add("has-queue");
-      interruptBtn.innerHTML = `⚡<span class="queue-badge">${count}</span>`;
-      interruptBtn.setAttribute("data-tip", `${count} voice message${count > 1 ? "s" : ""} queued — click to send now`);
     } else {
-      // Hide when no queue AND Claude is not active
-      const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
-      interruptBtn.classList.remove("has-queue");
-      interruptBtn.innerHTML = "⚡";
-      interruptBtn.setAttribute("data-tip", "Interrupt Claude");
-      if (!isActive) interruptBtn.style.display = "none";
+      interruptBtn.style.display = "none";
     }
+    interruptBtn.classList.toggle("has-queue", count > 0);
+    interruptBtn.innerHTML = "⚡";
+    interruptBtn.setAttribute("data-tip", count > 0 ? "Interrupt Claude & send queued voice" : "Interrupt Claude");
   }
 
   // =============================================
@@ -4089,7 +4132,7 @@
   terminalInput.addEventListener("paste", () => {
     setTimeout(() => {
       if (terminalInput.value.trim()) sendTerminalInput();
-    }, 50);
+    }, 150); // 150ms: enough for browser to finish populating value after paste
   });
 
   // Detect manual scroll-up to pause auto-scroll
