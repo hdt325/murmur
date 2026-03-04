@@ -868,9 +868,7 @@
     border-top: 1px solid #3e4451;
     display: flex;
     flex-direction: column;
-    /* Closed: header height + safe area so home indicator doesn't cover it */
     height: calc(36px + env(safe-area-inset-bottom, 0px));
-    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .terminal-panel.open {
     height: calc(35vh + env(safe-area-inset-bottom, 0px));
@@ -880,6 +878,8 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 12px;
+    /* Extend background into safe area so header visually reaches screen edge */
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     background: #21252b;
     border-bottom: 1px solid #3e4451;
     cursor: pointer;
