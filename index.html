@@ -946,24 +946,23 @@
   .session-popover.open { display: block; }
   .session-popover .sess-group {
     padding: 4px 10px 2px;
-    color: #7ab8e8;
     font-size: 10px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+    /* color set via inline style per session */
   }
   .session-popover .sess-item {
     padding: 5px 14px;
     cursor: pointer;
-    color: #c8cdd5;
     display: flex;
     align-items: center;
     gap: 6px;
+    /* color set via inline style per session */
   }
-  .session-popover .sess-item:hover { background: #2c313a; color: #e8e4de; }
-  .session-popover .sess-item.active { color: #c9a227; font-weight: 600; }
-  .session-popover .sess-item.active .sess-win { color: #c9a22799; }
-  .session-popover .sess-item .sess-win { color: #7ab8e8; font-size: 10px; margin-left: auto; }
+  .session-popover .sess-item:hover { background: #2c313a; }
+  .session-popover .sess-item.active { font-weight: 600; }
+  .session-popover .sess-item .sess-win { font-size: 10px; margin-left: auto; opacity: 0.7; }
 
   .controls button.replay-btn {
     border-color: #333338;
@@ -2347,7 +2346,10 @@
           const target = msg.current || msg.session;
           _currentTmuxTarget = target;
           const parts = target.split(":");
-          if (sessionBtn) sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
+          if (sessionBtn) {
+            sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
+            if (typeof applySessionBtnColor === "function") applySessionBtnColor();
+          }
         }
       }
 
@@ -4084,6 +4086,36 @@
     if (!sessionPopover.contains(e.target) && e.target !== sessionBtn) closeSessPopover();
   });
 
+  // Per-session color palette — distinct hues, readable on dark backgrounds
+  const SESS_COLORS = [
+    "#7ab8e8", // blue
+    "#e87a7a", // red
+    "#7ae8a0", // green
+    "#e8a87a", // orange
+    "#b07ae8", // purple
+    "#7ae8d8", // teal
+    "#e87ab8", // pink
+    "#b8e87a", // lime
+  ];
+  const _sessColorCache = {}; // session name → color
+  let _sessColorIdx = 0;
+
+  function getSessColor(name) {
+    if (!_sessColorCache[name]) {
+      _sessColorCache[name] = SESS_COLORS[_sessColorIdx % SESS_COLORS.length];
+      _sessColorIdx++;
+    }
+    return _sessColorCache[name];
+  }
+
+  function applySessionBtnColor() {
+    const parts = _currentTmuxTarget.split(":");
+    const sessName = parts[0];
+    const color = _sessColorCache[sessName] || "#888";
+    sessionBtn.style.color = color;
+    sessionBtn.style.borderColor = color + "55";
+  }
+
   function renderSessPopover(sessions) {
     sessionPopover.innerHTML = "";
     if (!sessions.length) {
@@ -4091,17 +4123,23 @@
       return;
     }
     for (const sess of sessions) {
+      const color = getSessColor(sess.name);
+      const dimColor = color + "99"; // 60% opacity shade for windows
+
       const grp = document.createElement("div");
       grp.className = "sess-group";
       grp.textContent = sess.name;
+      grp.style.color = color;
       sessionPopover.appendChild(grp);
 
       for (const win of sess.windows) {
         const target = win.index >= 0 ? `${sess.name}:${win.index}` : sess.name;
+        const isActive = target === _currentTmuxTarget;
         const item = document.createElement("div");
-        item.className = "sess-item" + (target === _currentTmuxTarget ? " active" : "");
+        item.className = "sess-item" + (isActive ? " active" : "");
+        item.style.color = isActive ? color : dimColor;
         item.innerHTML = `<span>${win.name || "window " + win.index}</span>` +
-          `<span class="sess-win">#${win.index}</span>`;
+          `<span class="sess-win" style="color:${color}88">#${win.index}</span>`;
         item.addEventListener("click", (e) => {
           e.stopPropagation();
           closeSessPopover();
@@ -4112,6 +4150,7 @@
         sessionPopover.appendChild(item);
       }
     }
+    applySessionBtnColor();
   }
 
   // WS handler for tmux_sessions — rendered inline in ws.onmessage below
