@@ -2735,6 +2735,10 @@ function handleWsConnection(ws: WebSocket) {
           console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
         }
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
+        // Reset status indicators for the new session
+        stopClientPlayback();
+        broadcast({ type: "voice_status", state: "idle" });
+        broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
         // Force context resend on new target
         contextSentAt = 0;
         sendMurmurContext(1000);
