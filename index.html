@@ -878,13 +878,19 @@
     align-items: center;
     justify-content: space-between;
     padding: 8px 12px;
-    /* Extend background into safe area so header visually reaches screen edge */
-    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     background: #21252b;
     border-bottom: 1px solid #3e4451;
     cursor: pointer;
     flex-shrink: 0;
     min-height: 36px;
+  }
+  /* When closed: header is at screen bottom, extend into safe area */
+  .terminal-panel:not(.open) .terminal-header {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+  /* When open: terminal output is at screen bottom, give it the safe area */
+  .terminal-panel.open .terminal-output {
+    padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   }
   .terminal-header span {
     font-size: 11px;
