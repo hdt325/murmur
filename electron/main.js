@@ -303,6 +303,12 @@ async function checkContentUpdates(murmurDir) {
       const localPath = path.join(murmurDir, dest);
       const localHash = fileHash(localPath);
       const remoteContent = await httpsGet(`${GH_RAW_BASE}/${src}`);
+      // Reject GitHub error pages — they're HTML and typically >10KB
+      const str = remoteContent.toString("utf8", 0, 200);
+      if (str.trimStart().startsWith("<")) {
+        console.log(`[update] Skip ${src}: received HTML (GitHub error page)`);
+        return null;
+      }
       const remoteHash = crypto.createHash("sha256").update(remoteContent).digest("hex");
       if (localHash !== remoteHash) return { file: dest, localPath, content: remoteContent };
     } catch (err) {
@@ -341,8 +347,8 @@ async function contentUpdateCheck(murmurDir) {
     const fileList = updates.map(u => u.file).join(", ");
     console.log(`[update] ${updates.length} files changed: ${fileList}`);
 
-    // Prompt user
-    const response = dialog.showMessageBoxSync(win, {
+    // Prompt user — use async showMessageBox to avoid blocking main process
+    const { response } = await dialog.showMessageBox(win, {
       type: "info",
       title: "Murmur Update Available",
       message: `${updates.length} file${updates.length > 1 ? "s" : ""} updated on GitHub.`,
@@ -356,15 +362,21 @@ async function contentUpdateCheck(murmurDir) {
       applyContentUpdates(updates);
       sendStatus(`Updated ${updates.length} files`, "success", { check: "update", checkStatus: "ok" });
 
-      // If package.json changed, reinstall deps
+      // If package.json changed, reinstall deps (async — avoids blocking event loop)
       if (updates.some(u => u.file === "package.json")) {
         sendStatus("Updating dependencies...", "info", { check: "deps", checkStatus: "pending" });
-        try {
-          execSync("npm install", { cwd: murmurDir, timeout: 120000 });
-          sendStatus("Dependencies updated", "info", { check: "deps", checkStatus: "ok" });
-        } catch (err) {
-          sendStatus(`npm install failed: ${err.message}`, "warn", { check: "deps", checkStatus: "warn" });
-        }
+        const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+        await new Promise((resolve) => {
+          const proc = spawn(npmCmd, ["install"], { cwd: murmurDir, stdio: ["ignore", "pipe", "pipe"] });
+          proc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+          proc.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+          proc.on("error", (err) => { sendStatus(`npm install failed: ${err.message}`, "warn", { check: "deps", checkStatus: "warn" }); resolve(); });
+          proc.on("close", (code) => {
+            if (code === 0) sendStatus("Dependencies updated", "info", { check: "deps", checkStatus: "ok" });
+            else sendStatus(`npm install exited ${code}`, "warn", { check: "deps", checkStatus: "warn" });
+            resolve();
+          });
+        });
       }
 
       // Kill server if running so it restarts with new files
