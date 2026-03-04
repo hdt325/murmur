@@ -640,6 +640,10 @@
 
   .controls button.stop { border-color: #333338; color: #e74c3c; font-size: 9px; }
   .controls button.stop:hover { background: #e74c3c22; border-color: #e74c3c88; }
+  .controls button.interrupt-btn { border-color: #333338; color: #f39c12; font-size: 12px; position: relative; }
+  .controls button.interrupt-btn:hover { background: #f39c1222; border-color: #f39c1288; }
+  .controls button.interrupt-btn.has-queue { color: #e67e22; border-color: #e67e2266; }
+  .controls button.interrupt-btn .queue-badge { position: absolute; top: -5px; right: -5px; background: #e67e22; color: #fff; border-radius: 8px; font-size: 9px; min-width: 14px; height: 14px; display: flex; align-items: center; justify-content: center; padding: 0 2px; }
 
   .controls button.mute-btn { color: #e74c3c; width: 28px; padding: 0; }
   .controls button.mute-btn svg { display: block; }
@@ -1197,6 +1201,7 @@
 <!-- Section 5: Controls + Input -->
 <div class="controls">
   <button class="stop" id="stopBtn" data-tip="Stop voice playback">■</button>
+  <button class="interrupt-btn" id="interruptBtn" data-tip="Interrupt Claude &amp; send queued voice" style="display:none">⚡</button>
   <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
   <button class="mode-btn" id="modeBtn" data-tip="Talk ↔ Talk">Talk</button>
   <button class="replay-btn" id="replayBtn" data-tip="Replay last response">↻</button>
@@ -1492,6 +1497,7 @@
   const statusText = document.getElementById("statusText");
   const statusDot = document.getElementById("statusDot");
   const stopBtn = document.getElementById("stopBtn");
+  const interruptBtn = document.getElementById("interruptBtn");
   const muteBtn = document.getElementById("muteBtn");
   const speedBtn = document.getElementById("speedBtn");
   const voiceBtn = document.getElementById("voiceBtn");
@@ -2213,6 +2219,10 @@
         handleVoiceStatus(msg.state);
       }
 
+      if (msg.type === "voice_queue") {
+        updateInterruptBtn(msg.count || 0);
+      }
+
       // Legacy: spoken_text for backward compat (will be removed in cleanup phase)
       if (msg.type === "spoken_text" && voicedOnly) {
         removeThinkingBubble();
@@ -2644,6 +2654,8 @@
         if (mode.micOn && micAnalyser && micDataArray) {
           startTalkWaveform("#e74c3c44", micAnalyser, micDataArray);
         }
+        // Hide interrupt button when idle (unless there's a pending queue)
+        if (pendingVoiceCount === 0) interruptBtn.style.display = "none";
         break;
       }
       case "recording":
@@ -2667,17 +2679,19 @@
       case "thinking":
         talkBtn.textContent = "";
         talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentText('beforeend', "Claude is thinking... (tap to stop)");
+        talkBtn.insertAdjacentText('beforeend', "Claude is thinking... (tap to queue voice)");
         talkBtn.className = "thinking";
         setHeaderState("thinking", "Claude is thinking...");
         showThinkingBubble();
+        interruptBtn.style.display = "";
         break;
       case "responding":
         talkBtn.textContent = "";
         talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentText('beforeend', "Claude is responding... (tap to stop)");
+        talkBtn.insertAdjacentText('beforeend', "Claude is responding... (tap to queue voice)");
         talkBtn.className = "responding";
         setHeaderState("responding", "Claude is responding...");
+        interruptBtn.style.display = "";
         break;
       case "speaking": {
         talkBtn.innerHTML = '';
@@ -2699,6 +2713,7 @@
         // Don't call startBubbleHighlight() — server drives highlights via tts_highlight messages
         setHeaderState("speaking", "Speaking");
         removeThinkingBubble();
+        if (pendingVoiceCount > 0) interruptBtn.style.display = "";
         break;
       }
     }
@@ -2765,12 +2780,42 @@
   let conversationHotTimer = null;
 
   // =============================================
+  // Voice Queue (queued voice while Claude is active)
+  // =============================================
+  let pendingVoiceCount = 0;
+
+  function updateInterruptBtn(count) {
+    pendingVoiceCount = count;
+    if (count > 0) {
+      interruptBtn.style.display = "";
+      interruptBtn.classList.add("has-queue");
+      interruptBtn.innerHTML = `⚡<span class="queue-badge">${count}</span>`;
+      interruptBtn.setAttribute("data-tip", `${count} voice message${count > 1 ? "s" : ""} queued — click to send now`);
+    } else {
+      // Hide when no queue AND Claude is not active
+      const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
+      interruptBtn.classList.remove("has-queue");
+      interruptBtn.innerHTML = "⚡";
+      interruptBtn.setAttribute("data-tip", "Interrupt Claude");
+      if (!isActive) interruptBtn.style.display = "none";
+    }
+  }
+
+  // =============================================
   // Controls
   // =============================================
   stopBtn.addEventListener("click", () => {
     idleFromTtsCompletion = false; // Prevent beep after manual stop
     stopTtsPlayback();
+    if (ws?.readyState === WebSocket.OPEN) ws.send("stop"); // Also clears pending voice queue on server
     setTalkState("idle");
+    updateInterruptBtn(0); // Clear queue badge
+  });
+
+  interruptBtn.addEventListener("click", () => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
+    stopTtsPlayback();
+    // Keep UI in current state — server will drain queue and broadcast new state
   });
 
   muteBtn.addEventListener("click", () => {
@@ -3548,12 +3593,30 @@
   // Talk button click
   talkBtn.addEventListener("click", () => {
     _startBgAudioSession(); // Start iOS background audio session on first user gesture
-    // If Claude is speaking/thinking/responding, stop everything
-    if (talkBtn.classList.contains("speaking") || talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
+
+    // If Claude is speaking: stop TTS
+    if (talkBtn.classList.contains("speaking")) {
       stopTtsPlayback();
       if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
       setTalkState("idle");
       removeThinkingBubble();
+      return;
+    }
+
+    // If Claude is thinking/responding: record in queue mode (don't interrupt)
+    if (talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
+      if (isRecording) {
+        stopRecording(); // Finish and queue the current recording
+      } else {
+        startRecording(false); // Record — server will queue transcription
+        // Brief label change to signal queue mode
+        setTimeout(() => {
+          if (isRecording) {
+            const label = talkBtn.querySelector(".talk-wave-label");
+            if (label) label.textContent = "Recording to queue...";
+          }
+        }, 100);
+      }
       return;
     }
 
@@ -3574,6 +3637,15 @@
       stopTtsPlayback();
       if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
       setTalkState("idle");
+      return;
+    }
+    // If Claude is thinking/responding, record in queue mode
+    if (talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording(false);
+      }
       return;
     }
     if (isRecording) {

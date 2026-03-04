@@ -677,6 +677,7 @@ const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
 const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
+let pendingVoiceInput: string[] = []; // Queued voice while Claude is active
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -1601,6 +1602,19 @@ function stopTmuxStreaming() {
 
   // Clean up stream file
   try { unlinkSync(STREAM_FILE); } catch {}
+
+  // Drain pending queued voice input
+  if (pendingVoiceInput.length > 0) {
+    const nextInput = pendingVoiceInput.shift()!;
+    const remaining = pendingVoiceInput.length;
+    console.log(`[voice] Draining queued input: "${nextInput.slice(0, 60)}" — ${remaining} remaining`);
+    setTimeout(() => {
+      startTmuxStreaming(nextInput);
+      addUserEntry(nextInput);
+      terminal.sendText(nextInput);
+      broadcast({ type: "voice_queue", count: remaining });
+    }, 500);
+  }
 }
 
 // --- Passive Pane Watcher ---
@@ -2306,10 +2320,22 @@ function handleWsConnection(ws: WebSocket) {
         }
       } else {
         // Direct send — no wake word check
-        // Snapshot BEFORE sending, then send, then polling starts after delay
-        startTmuxStreaming(text);
-        addUserEntry(text); // After startTmuxStreaming which resets entries
-        terminal.sendText(text);
+        if (streamState === "IDLE" || streamState === "DONE") {
+          // Normal: send immediately
+          startTmuxStreaming(text);
+          addUserEntry(text);
+          terminal.sendText(text);
+        } else {
+          // Claude is active — queue the transcription
+          pendingVoiceInput.push(text);
+          const count = pendingVoiceInput.length;
+          console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
+          broadcast({ type: "voice_queue", count, text });
+          // Return to current stream state so UI shows thinking/responding again
+          const vsState = streamState === "THINKING" ? "thinking"
+            : streamState === "RESPONDING" ? "responding" : "idle";
+          broadcast({ type: "voice_status", state: vsState });
+        }
       }
       return;
     }
@@ -2382,6 +2408,7 @@ function handleWsConnection(ws: WebSocket) {
     if (msg === "key:tab") { terminal.sendKey("Tab"); return; }
 
     if (msg === "stop") {
+      pendingVoiceInput = []; // Clear any queued voice on explicit stop
       terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();
@@ -2393,6 +2420,22 @@ function handleWsConnection(ws: WebSocket) {
       vmState.micActive = false;
       broadcast({ type: "status", ...vmState });
       broadcast({ type: "voice_status", state: "idle" });
+      broadcast({ type: "signal", name: "voice-stop" });
+      broadcast({ type: "voice_queue", count: 0 }); // Clear badge
+      return;
+    }
+
+    // Interrupt — stop Claude immediately, then flush any pending queued voice
+    if (msg === "interrupt") {
+      terminal.sendKey("Escape");
+      stopTts();
+      stopTmuxStreaming(); // Sets IDLE and drains pendingVoiceInput (if any)
+      if (process.platform !== "win32") {
+        try { execSync("pkill -f 'sounddevice\\|rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
+      }
+      vmState.ttsPlaying = false;
+      vmState.micActive = false;
+      broadcast({ type: "status", ...vmState });
       broadcast({ type: "signal", name: "voice-stop" });
       return;
     }
