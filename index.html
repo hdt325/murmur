@@ -3098,16 +3098,8 @@
     } catch (err) {
       _recordingStarting = false;
       console.error("Mic access failed:", err);
-      // In Electron: trigger native macOS permission dialog, then retry once
-      if (window.murmurElectron?.requestMicPermission) {
-        const granted = await window.murmurElectron.requestMicPermission();
-        if (granted) {
-          // Permission just granted — retry immediately
-          _recordingStarting = false;
-          startRecording();
-          return;
-        }
-        // Still denied — show button to open System Settings directly
+      // Show settings button in Electron, plain message in browser
+      if (window.murmurElectron?.openMicSettings) {
         talkBtn.textContent = "🎙 Open Mic Settings";
         talkBtn.className = "";
         talkBtn.onclick = () => {
@@ -3115,10 +3107,9 @@
           talkBtn.onclick = null;
           setTimeout(() => setTalkState("idle"), 500);
         };
-        return; // Don't reset — leave button clickable
-      } else {
-        talkBtn.textContent = "Mic access denied";
+        return; // Leave button clickable — don't auto-reset
       }
+      talkBtn.textContent = "Mic access denied";
       talkBtn.className = "";
       setTimeout(() => setTalkState("idle"), 3000);
     }

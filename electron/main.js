@@ -752,12 +752,9 @@ app.whenReady().then(async () => {
   createTray();
   registerHotkey();
 
-  // Request microphone permission after window is visible (macOS).
-  // Previously awaited before createWindow(), which caused the window to never
-  // appear on first launch when the system permission dialog was pending.
-  if (process.platform === "darwin") {
-    systemPreferences.askForMediaAccess("microphone").catch(() => {});
-  }
+  // Mic permission is requested naturally by getUserMedia in the renderer
+  // when the user first clicks Talk. Do NOT call askForMediaAccess here —
+  // it triggers the system dialog on every launch which is annoying.
   // Auto-updater only works on packaged builds (not dev source runs)
   // For source installs, the content auto-updater in startup() handles updates
   if (app.isPackaged) {
