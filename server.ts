@@ -2891,6 +2891,13 @@ app.get("/icon-512.png", (_req, res) => {
 app.get("/favicon-16.png", (_req, res) => {
   res.sendFile(join(__dirname, "site", "favicon-16.png"));
 });
+// iOS auto-discovers these paths before checking <link> tags
+app.get("/apple-touch-icon.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "icon-180.png"));
+});
+app.get("/apple-touch-icon-precomposed.png", (_req, res) => {
+  res.sendFile(join(__dirname, "site", "icon-180.png"));
+});
 
 app.get("/version", (_req, res) => {
   res.json({ version: 75 });
