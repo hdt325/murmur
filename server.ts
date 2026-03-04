@@ -679,6 +679,7 @@ const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
 let pendingVoiceInput: Array<{ text: string; entryId: number }> = []; // Queued voice while Claude is active
+let _voiceQueueDraining = false; // Drain lock — prevents concurrent drains
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -1607,12 +1608,14 @@ function stopTmuxStreaming() {
   // Clean up stream file
   try { unlinkSync(STREAM_FILE); } catch {}
 
-  // Drain pending queued voice input
-  if (pendingVoiceInput.length > 0) {
+  // Drain pending queued voice input (lock prevents concurrent drains)
+  if (pendingVoiceInput.length > 0 && !_voiceQueueDraining) {
+    _voiceQueueDraining = true;
     const next = pendingVoiceInput.shift()!;
     const remaining = pendingVoiceInput.length;
     console.log(`[voice] Draining queued input: "${next.text.slice(0, 60)}" — ${remaining} remaining`);
     setTimeout(() => {
+      _voiceQueueDraining = false;
       // Mark the queued entry as sent (remove queued flag) before starting stream
       const queuedEntry = conversationEntries.find(e => e.id === next.entryId);
       if (queuedEntry) {
@@ -2426,6 +2429,7 @@ function handleWsConnection(ws: WebSocket) {
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
       }
       pendingVoiceInput = [];
+      _voiceQueueDraining = false;
       terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();
@@ -2653,14 +2657,24 @@ function handleWsConnection(ws: WebSocket) {
       const text = msg.slice(5);
       if (text) {
         if (interactivePromptActive) {
-          // Interactive prompt — send keystroke directly (e.g. "1" + Enter for numbered choices)
+          // Interactive prompt — send keystroke directly
           console.log(`[terminal] Interactive response: "${text}"`);
           terminal.sendText(text);
-        } else {
+        } else if (streamState === "IDLE" || streamState === "DONE") {
+          // Normal: send immediately
           console.log(`[terminal] Text input: "${text}"`);
           startTmuxStreaming(text);
-          addUserEntry(text); // After startTmuxStreaming which resets entries
+          addUserEntry(text);
           terminal.sendText(text);
+        } else {
+          // Claude is active — queue typed text same as voice
+          const queuedEntry = addUserEntry(text, true);
+          pendingVoiceInput.push({ text, entryId: queuedEntry.id });
+          const count = pendingVoiceInput.length;
+          console.log(`[terminal] Text queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
+          broadcast({ type: "voice_queue", count });
+          const vsState = streamState === "RESPONDING" ? "responding" : "thinking";
+          broadcast({ type: "voice_status", state: vsState });
         }
       }
       return;
