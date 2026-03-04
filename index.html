@@ -631,7 +631,7 @@
     align-items: center;
     justify-content: center;
     width: 28px;
-    min-height: 36px; /* Larger touch target for mobile */
+    height: 28px;
     flex-shrink: 0;
   }
 
@@ -677,6 +677,7 @@
     width: 72px;
     flex-shrink: 0;
     text-align: left;
+    justify-content: flex-start;
   }
   .controls button.voice-btn:hover { background: #2a2a30; color: #e0d8d5; }
 
@@ -719,7 +720,6 @@
   .voice-popover {
     display: none;
     position: fixed;
-    bottom: 80px;
     left: 12px;
     right: 12px;
     background: #222226;
@@ -770,7 +770,6 @@
   .settings-popover {
     display: none;
     position: fixed;
-    bottom: 80px;
     right: 12px;
     background: #222226;
     border: 1px solid #333338;
@@ -1537,6 +1536,7 @@
   if (terminalOpen) {
     terminalPanel.classList.add("open");
     document.getElementById("termToggleLabel").textContent = "▼ Terminal";
+    document.getElementById("termNav").classList.add("show");
   }
   // Cached terminal output — rendered after ansiToHtml is defined below
   const cachedTerminal = localStorage.getItem("term-output");
@@ -2795,6 +2795,8 @@
   // Voice selection
   voiceBtn.addEventListener("click", (e) => {
     e.stopPropagation();
+    const rect = voiceBtn.getBoundingClientRect();
+    voicePopover.style.bottom = (window.innerHeight - rect.top + 4) + "px";
     voicePopover.classList.toggle("show");
   });
 
@@ -2844,7 +2846,11 @@
 
   if (settingsBtn) settingsBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (settingsPopover) settingsPopover.classList.toggle("show");
+    if (settingsPopover) {
+      const rect = settingsBtn.getBoundingClientRect();
+      settingsPopover.style.bottom = (window.innerHeight - rect.top + 4) + "px";
+      settingsPopover.classList.toggle("show");
+    }
   });
 
   document.addEventListener("click", (e) => {
@@ -3718,9 +3724,13 @@
     terminalPanel.classList.toggle("open", terminalOpen);
     document.getElementById("termToggleLabel").textContent = (terminalOpen ? "▼" : "▶") + " Terminal";
     localStorage.setItem("term-open", terminalOpen ? "1" : "0");
+    const termNav = document.getElementById("termNav");
     if (terminalOpen) {
       termAutoScroll = true;
       terminalOutput.scrollTop = terminalOutput.scrollHeight;
+      termNav.classList.add("show");
+    } else {
+      termNav.classList.remove("show");
     }
   }
 
