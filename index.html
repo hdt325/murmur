@@ -3755,9 +3755,12 @@
   // Audio pre-filter: track peak RMS during recording to skip noise-only audio
   let recordingPeakRms = 0;
   const AUDIO_ENERGY_THRESHOLD_MIN = 0.015; // Hard floor for post-recording energy check
-  // Adaptive ambient noise baseline: slow exponential moving average of idle mic RMS
-  // Starts conservative (quiet room); adapts up in noisy environments (car, office, etc.)
+  // Adaptive ambient noise baseline: exponential moving average of idle mic RMS.
+  // Adapts in both directions — including noisy environments (car, office, etc.)
   let ambientRmsBaseline = 0.006;
+  // Sustained noise detection: if noise stays above speech threshold continuously
+  // for >5s, it's ambient (road noise, AC, etc.) not speech — raise the baseline.
+  let _noisySince = 0; // timestamp when noise first exceeded speech threshold
 
   function startAutoListen() {
     if (autoListenInterval) return;
@@ -3792,22 +3795,40 @@
       for (let i = 0; i < micDataArray.length; i++) sum += micDataArray[i] * micDataArray[i];
       const rms = Math.sqrt(sum / micDataArray.length);
 
-      // Update ambient baseline when fully idle (slow EMA — adapts over ~5s)
+      // Adaptive ambient baseline — two-path update:
+      // 1. Below speech threshold: normal bidirectional EMA (quiet/normal room)
+      // 2. Sustained above threshold for >5s: likely ambient noise (car, fan, AC)
+      //    → raise baseline so speech detection stays relative to environment
       const dynSpeechThreshold = Math.max(SPEECH_THRESHOLD_MIN, ambientRmsBaseline * 3.5);
+      const now = Date.now();
       if (rms < dynSpeechThreshold) {
-        ambientRmsBaseline = ambientRmsBaseline * 0.97 + rms * 0.03;
+        _noisySince = 0; // Reset sustained-noise timer when quiet
+        ambientRmsBaseline = ambientRmsBaseline * 0.95 + rms * 0.05;
+      } else {
+        if (_noisySince === 0) _noisySince = now;
+        const sustainedMs = now - _noisySince;
+        if (sustainedMs > 5000) {
+          // Sustained loud noise — treat as new ambient floor, not speech
+          // Slow upward EMA so a genuine long speech doesn't inflate baseline too fast
+          ambientRmsBaseline = ambientRmsBaseline * 0.98 + rms * 0.02;
+          if (sustainedMs > 5100) speechConfirmStart = 0; // Suppress false speech trigger
+        }
       }
+
+      // Recompute threshold after possible baseline update
+      const adjSpeechThreshold = Math.max(SPEECH_THRESHOLD_MIN, ambientRmsBaseline * 3.5);
 
       // Debug log every 5s (remote)
       if (shouldLog) {
         const ctxState = ttsAudioCtx ? ttsAudioCtx.state : "none";
-        rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${dynSpeechThreshold.toFixed(4)} baseline=${ambientRmsBaseline.toFixed(4)} hot=${conversationHot} ctxState=${ctxState}`);
+        const noisyFor = _noisySince ? Math.round((now - _noisySince) / 1000) + "s" : "0s";
+        rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${adjSpeechThreshold.toFixed(4)} baseline=${ambientRmsBaseline.toFixed(4)} noisyFor=${noisyFor} hot=${conversationHot} ctxState=${ctxState}`);
       }
 
-      if (rms > dynSpeechThreshold) {
+      if (rms > adjSpeechThreshold && (_noisySince === 0 || now - _noisySince < 5000)) {
         if (speechConfirmStart === 0) {
-          speechConfirmStart = Date.now();
-        } else if (Date.now() - speechConfirmStart > SPEECH_CONFIRM_MS) {
+          speechConfirmStart = now;
+        } else if (now - speechConfirmStart > SPEECH_CONFIRM_MS) {
           rlog(`[auto-listen] Speech detected! rms=${rms.toFixed(4)} hot=${conversationHot} — starting recording`);
           speechConfirmStart = 0;
           startRecording(true);
