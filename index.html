@@ -2622,11 +2622,19 @@
         div.classList.remove("entry-nonspeakable");
       }
 
-      // Queued voice styling — dashed border + faded until actually sent
+      // Queued voice styling — dashed border + faded + inline hourglass until sent
       if (entry.queued) {
         div.classList.add("entry-queued");
+        const textEl = div.querySelector(".entry-text");
+        if (textEl && !textEl.querySelector(".queued-icon")) {
+          const icon = document.createElement("span");
+          icon.className = "queued-icon";
+          icon.textContent = " ⏳";
+          textEl.appendChild(icon);
+        }
       } else {
         div.classList.remove("entry-queued");
+        div.querySelector(".queued-icon")?.remove();
       }
 
       // Mark spoken entries — but don't override active TTS highlight
