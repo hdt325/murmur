@@ -104,48 +104,56 @@ function isServiceUp(port, urlPath = "/") {
   });
 }
 
-// Check prerequisites and report to loading page
+// Async command check: resolves with trimmed stdout, or null on failure/timeout
+function spawnCheck(cmd, args, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    let out = "";
+    let done = false;
+    const finish = (val) => { if (!done) { done = true; resolve(val); } };
+    try {
+      const proc = spawn(cmd, args, { env: process.env });
+      proc.stdout.on("data", (d) => { out += d.toString(); });
+      proc.on("error", () => finish(null));
+      proc.on("close", (code) => finish(code === 0 ? out.trim() : null));
+      setTimeout(() => { try { proc.kill(); } catch {} finish(null); }, timeoutMs);
+    } catch { finish(null); }
+  });
+}
+
+// Check prerequisites and report to loading page.
+// All checks run in parallel via async spawn — never blocks the main process event loop.
 async function checkPrerequisites() {
-  let hasBlocker = false;
+  // Node.js — always available in Electron; report version directly from process
+  sendStatus(`Node.js ${process.version}`, "info", { check: "node", checkStatus: "ok" });
 
-  // Node.js (always available since we're running in Electron, but check anyway)
-  try {
-    const ver = execSync("node -v", { timeout: 3000, encoding: "utf8" }).trim();
-    sendStatus(`Node.js ${ver}`, "info", { check: "node", checkStatus: "ok" });
-  } catch {
-    sendStatus("Node.js not found", "error", { check: "node", checkStatus: "fail", checkHint: "Install from nodejs.org" });
-    hasBlocker = true;
-  }
+  // Run remaining checks in parallel (warnings only — no hard blockers)
+  const [claudeVer, tmuxOk, voicemodeOk] = await Promise.all([
+    spawnCheck("claude", ["--version"]),
+    process.platform === "darwin" ? spawnCheck("which", ["tmux"]) : Promise.resolve("ok"),
+    spawnCheck("which", ["voicemode"]),
+  ]);
 
-  // Claude Code CLI
-  try {
-    const ver = execSync("claude --version", { timeout: 5000, encoding: "utf8" }).trim();
-    sendStatus(`Claude Code CLI ${ver}`, "info", { check: "claude", checkStatus: "ok" });
-  } catch {
+  if (claudeVer) {
+    sendStatus(`Claude Code CLI ${claudeVer}`, "info", { check: "claude", checkStatus: "ok" });
+  } else {
     sendStatus("Claude Code CLI not found", "warn", { check: "claude", checkStatus: "warn", checkHint: "npm i -g @anthropic-ai/claude-code" });
   }
 
-  // tmux (macOS only)
-  if (process.platform === "darwin") {
-    try {
-      execSync("which tmux", { timeout: 3000 });
-      sendStatus("tmux available", "info", { check: "tmux", checkStatus: "ok" });
-    } catch {
-      sendStatus("tmux not found", "warn", { check: "tmux", checkStatus: "warn", checkHint: "brew install tmux" });
-    }
-  } else {
+  if (process.platform !== "darwin") {
     sendStatus("", "info", { check: "tmux", checkStatus: "ok" });
+  } else if (tmuxOk) {
+    sendStatus("tmux available", "info", { check: "tmux", checkStatus: "ok" });
+  } else {
+    sendStatus("tmux not found", "warn", { check: "tmux", checkStatus: "warn", checkHint: "brew install tmux" });
   }
 
-  // VoiceMode (provides Whisper STT + Kokoro TTS)
-  try {
-    execSync("which voicemode", { timeout: 3000 });
+  if (voicemodeOk) {
     sendStatus("VoiceMode available", "info", { check: "voicemode", checkStatus: "ok" });
-  } catch {
+  } else {
     sendStatus("VoiceMode not found", "warn", { check: "voicemode", checkStatus: "warn", checkHint: "uv tool install voicemode" });
   }
 
-  return hasBlocker;
+  return false; // Node is always present (we're inside Electron)
 }
 
 // Check optional voice services
