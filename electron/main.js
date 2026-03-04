@@ -347,50 +347,30 @@ async function contentUpdateCheck(murmurDir) {
     const fileList = updates.map(u => u.file).join(", ");
     console.log(`[update] ${updates.length} files changed: ${fileList}`);
 
-    // Prompt user — use async showMessageBox to avoid blocking main process
-    const { response } = await dialog.showMessageBox(win, {
-      type: "info",
-      title: "Murmur Update Available",
-      message: `${updates.length} file${updates.length > 1 ? "s" : ""} updated on GitHub.`,
-      detail: `Changed: ${fileList}\n\nApply update and restart server?`,
-      buttons: ["Update Now", "Skip"],
-      defaultId: 0,
-    });
+    // Apply silently — no dialog prompt. The always-on-top window means any
+    // dialog can appear behind it and block startup indefinitely.
+    sendStatus(`Applying ${updates.length} update${updates.length > 1 ? "s" : ""}...`, "info", { check: "update", checkStatus: "pending" });
+    await applyContentUpdates(updates);
+    sendStatus(`Updated: ${fileList}`, "success", { check: "update", checkStatus: "ok" });
 
-    if (response === 0) {
-      sendStatus("Applying updates...", "info", { check: "update", checkStatus: "pending" });
-      applyContentUpdates(updates);
-      sendStatus(`Updated ${updates.length} files`, "success", { check: "update", checkStatus: "ok" });
-
-      // If package.json changed, reinstall deps (async — avoids blocking event loop)
-      if (updates.some(u => u.file === "package.json")) {
-        sendStatus("Updating dependencies...", "info", { check: "deps", checkStatus: "pending" });
-        const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-        await new Promise((resolve) => {
-          const proc = spawn(npmCmd, ["install"], { cwd: murmurDir, stdio: ["ignore", "pipe", "pipe"] });
-          proc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
-          proc.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
-          proc.on("error", (err) => { sendStatus(`npm install failed: ${err.message}`, "warn", { check: "deps", checkStatus: "warn" }); resolve(); });
-          proc.on("close", (code) => {
-            if (code === 0) sendStatus("Dependencies updated", "info", { check: "deps", checkStatus: "ok" });
-            else sendStatus(`npm install exited ${code}`, "warn", { check: "deps", checkStatus: "warn" });
-            resolve();
-          });
+    // If package.json changed, reinstall deps (async — avoids blocking event loop)
+    if (updates.some(u => u.file === "package.json")) {
+      sendStatus("Updating dependencies...", "info", { check: "deps", checkStatus: "pending" });
+      const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+      await new Promise((resolve) => {
+        const proc = spawn(npmCmd, ["install"], { cwd: murmurDir, stdio: ["ignore", "pipe", "pipe"] });
+        proc.stdout.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+        proc.stderr.on("data", (d) => { const t = d.toString().trim(); if (t) sendStatus(t, "info"); });
+        proc.on("error", (err) => { sendStatus(`npm install failed: ${err.message}`, "warn", { check: "deps", checkStatus: "warn" }); resolve(); });
+        proc.on("close", (code) => {
+          if (code === 0) sendStatus("Dependencies updated", "info", { check: "deps", checkStatus: "ok" });
+          else sendStatus(`npm install exited ${code}`, "warn", { check: "deps", checkStatus: "warn" });
+          resolve();
         });
-      }
-
-      // Kill server if running so it restarts with new files
-      if (serverProcess) {
-        serverProcess.kill();
-        serverProcess = null;
-        // Wait for it to die
-        await new Promise(r => setTimeout(r, 1000));
-      }
-      return true;
-    } else {
-      sendStatus("Update skipped", "info", { check: "update", checkStatus: "ok" });
-      return false;
+      });
     }
+
+    return true;
   } catch (err) {
     console.log(`[update] Content update check failed: ${err.message}`);
     sendStatus("Update check failed (non-fatal)", "warn", { check: "update", checkStatus: "warn" });
