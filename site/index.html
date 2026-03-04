@@ -736,31 +736,43 @@
         if (!isRemote) return;
 
         var btn = document.getElementById('launchBtn');
-        var LS_KEY = 'murmur-tailscale-ip';
+        var LS_KEY = 'murmur-tailscale-host';
 
-        function buildUrl(ip) {
-          return 'https://' + ip + ':3458';
+        function buildUrl(host) {
+          return 'https://' + host + ':3458';
         }
 
-        // If we have a saved IP, update the button href immediately
+        // Migrate old IP key to new host key
+        var oldSaved = localStorage.getItem('murmur-tailscale-ip');
+        if (oldSaved && !localStorage.getItem(LS_KEY)) {
+          localStorage.setItem(LS_KEY, oldSaved);
+        }
+
+        // If we have a saved host, update the button href immediately
         var saved = localStorage.getItem(LS_KEY);
         if (saved) btn.href = buildUrl(saved);
 
         btn.addEventListener('click', function(e) {
           e.preventDefault();
           var current = localStorage.getItem(LS_KEY) || '';
-          var ip = window.prompt("Enter your Mac's Tailscale IP\n(run 'tailscale ip' on your Mac to find it):", current);
-          if (!ip) return;
-          ip = ip.trim();
-          localStorage.setItem(LS_KEY, ip);
-          btn.href = buildUrl(ip);
-          window.location.href = buildUrl(ip);
+          var host = window.prompt(
+            "Enter your Mac\u2019s Tailscale hostname (preferred) or IP\n\n" +
+            "Hostname: run \u2018tailscale status\u2019 on your Mac \u2014 looks like device.tailnet.ts.net\n" +
+            "IP: run \u2018tailscale ip\u2019 \u2014 looks like 100.x.x.x\n\n" +
+            "Use the hostname \u2014 it has a valid SSL cert so icons load correctly.",
+            current
+          );
+          if (!host) return;
+          host = host.trim().replace(/^https?:\/\//, '').replace(/:\d+$/, '').replace(/\/$/, '');
+          localStorage.setItem(LS_KEY, host);
+          btn.href = buildUrl(host);
+          window.location.href = buildUrl(host);
         });
 
         // Update hint text
         document.getElementById('launchHint').textContent = saved
-          ? 'Saved IP: ' + saved + ' — click Launch App to connect, or click again to change.'
-          : "On a remote device? Click Launch App and enter your Mac's Tailscale IP (https://<ip>:3458).";
+          ? 'Saved: ' + saved + ' \u2014 click Launch App to connect, or click again to change.'
+          : "On a remote device? Click Launch App and enter your Mac\u2019s Tailscale hostname or IP.";
       })();
     </script>
   </section>
@@ -933,9 +945,10 @@
           <ol style="list-style:decimal;padding-left:20px;display:flex;flex-direction:column;gap:10px;color:var(--text-muted);font-size:0.95rem">
             <li>Install <a href="https://tailscale.com/download" style="color:var(--blue)">Tailscale</a> on your Mac and iPhone</li>
             <li>Sign in with the same account on both devices</li>
-            <li>In Mac Terminal, run <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">tailscale ip</code> to get your Mac's Tailscale IP</li>
-            <li>On your iPhone, open Safari and go to <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">https://&lt;ip&gt;:3458</code></li>
-            <li>Or click <strong>Launch App</strong> above and enter your Tailscale IP when prompted — it's saved for next time</li>
+            <li>On your Mac, run <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">tailscale status</code> to get your hostname (e.g. <em>device.tailnet.ts.net</em>)</li>
+            <li>On your iPhone, open Safari and go to <code style="background:var(--bg-code);padding:2px 6px;border-radius:4px;font-size:0.9rem">https://&lt;hostname&gt;:3458</code></li>
+            <li>Or click <strong>Launch App</strong> above and enter your Tailscale hostname — it's saved for next time</li>
+            <li style="color:var(--text-muted);font-size:0.88rem">Use the hostname (not the IP) so the SSL cert matches and icons load correctly on iPhone</li>
           </ol>
         </div>
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:24px">

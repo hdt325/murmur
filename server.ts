@@ -2470,7 +2470,35 @@ function handleWsConnection(ws: WebSocket) {
     }
 
     // Replay: replay specific entry by ID, or last spoken speakable entry
-    if (msg === "replay" || msg.startsWith("replay:")) {
+    if (msg === "replay" || msg === "replay:all" || msg.startsWith("replay:")) {
+      // replay:all — replay every speakable assistant entry since the last user message
+      if (msg === "replay:all") {
+        // Find index of last user entry
+        let lastUserIdx = -1;
+        for (let i = conversationEntries.length - 1; i >= 0; i--) {
+          if (conversationEntries[i].role === "user") { lastUserIdx = i; break; }
+        }
+        const toReplay = conversationEntries
+          .slice(lastUserIdx + 1)
+          .filter(e => e.role === "assistant" && e.speakable && e.text.trim());
+        if (toReplay.length > 0) {
+          console.log(`[replay:all] Replaying ${toReplay.length} assistant entries`);
+          stopClientPlayback();
+          broadcast({ type: "voice_status", state: "speaking" });
+          currentTtsEntryId = toReplay[0].id;
+          broadcast({ type: "tts_highlight", entryId: toReplay[0].id });
+          // Queue all entries: first is spoken immediately, rest via ttsQueue
+          for (let i = 1; i < toReplay.length; i++) {
+            ttsQueue.push(toReplay[i].text);
+            ttsEntryIdQueue.push(toReplay[i].id);
+          }
+          speakText(toReplay[0].text);
+        } else {
+          console.log("[replay:all] Nothing to replay");
+        }
+        return;
+      }
+
       let replayText = "";
       let replayEntryId: number | null = null;
       if (msg.startsWith("replay:")) {

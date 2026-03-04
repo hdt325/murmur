@@ -1108,7 +1108,8 @@
   <button class="stop" id="stopBtn" data-tip="Stop voice playback">■</button>
   <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
   <button class="mode-btn" id="modeBtn" data-tip="Talk ↔ Talk">Talk</button>
-  <button class="replay-btn" id="replayBtn" data-tip="Replay last">↻</button>
+  <button class="replay-btn" id="replayBtn" data-tip="Replay last response">↻</button>
+  <button class="replay-btn" id="replayAllBtn" data-tip="Replay all since last message">↻↻</button>
   <button class="speed" id="speedBtn" data-tip="TTS speed">1x</button>
   <button class="voice-btn" id="voiceBtn" data-tip="Change voice">...</button>
 </div>
@@ -3079,6 +3080,7 @@
             if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
             ttsEndedAt = Date.now();
             idleFromTtsCompletion = true;
+            _msUpdate(false); // Update lock screen: done speaking
             advanceBubbleHighlight();
             if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
             if (pendingIdle) applyIdleState();
@@ -3092,6 +3094,7 @@
           }, Math.min(duration, 120000));
 
           source.start(0);
+          _msUpdate(true, null); // Signal iOS lock screen: playing
           rlog(`[tts] Playing via Web Audio API (${audioBuffer.duration.toFixed(1)}s)`);
         });
       }
@@ -3233,6 +3236,7 @@
     }
     ttsPlaying = false;
     ttsEndedAt = Date.now();
+    _msUpdate(false);
     if (sendDone && wasPlaying && ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
   }
 
@@ -3240,8 +3244,74 @@
     stopTtsPlaybackInternal(true);
   }
 
+  // =============================================
+  // iOS Background Audio Session
+  // A silent looping <audio> element keeps the iOS audio session alive
+  // when the app is backgrounded, so TTS can continue playing.
+  // Must be started from a user gesture (iOS security requirement).
+  // =============================================
+  let _bgAudio = null;
+  let _bgAudioStarted = false;
+
+  function _buildSilentWavUrl() {
+    // Minimal 1-sample silent 16-bit mono WAV at 8000 Hz (46 bytes total)
+    const buf = new ArrayBuffer(46);
+    const v = new DataView(buf);
+    const s = (o, str) => [...str].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    s(0, "RIFF"); v.setUint32(4, 38, true);
+    s(8, "WAVE"); s(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);  // PCM
+    v.setUint16(22, 1, true);  // mono
+    v.setUint32(24, 8000, true); v.setUint32(28, 16000, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    s(36, "data"); v.setUint32(40, 2, true); // 1 sample = 2 bytes, all zero
+    return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+  }
+
+  function _startBgAudioSession() {
+    if (_bgAudioStarted) return;
+    _bgAudioStarted = true;
+    try {
+      _bgAudio = new Audio(_buildSilentWavUrl());
+      _bgAudio.loop = true;
+      _bgAudio.volume = 0.001; // -60 dB: inaudible, but non-zero so iOS keeps session alive
+      _bgAudio.play().then(() => {
+        console.log("[bg-audio] iOS background audio session active");
+      }).catch(e => {
+        console.warn("[bg-audio] Could not start background session:", e.message);
+        _bgAudioStarted = false;
+      });
+    } catch (e) { _bgAudioStarted = false; }
+  }
+
+  // MediaSession: tells iOS lock screen to show "Murmur" instead of generic controls
+  function _msUpdate(playing, text) {
+    if (!("mediaSession" in navigator)) return;
+    if (playing && text) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: text.length > 60 ? text.slice(0, 57) + "…" : text,
+        artist: "Murmur · Claude",
+      });
+    }
+    navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  }
+
+  if ("mediaSession" in navigator) {
+    // Allow lock-screen pause to stop TTS; ignore play (keep session alive)
+    navigator.mediaSession.setActionHandler("pause", () => {
+      stopTtsPlayback();
+      if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
+    });
+    navigator.mediaSession.setActionHandler("stop", () => {
+      stopTtsPlayback();
+      if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
+    });
+    navigator.mediaSession.setActionHandler("play", () => {}); // no-op: keep session
+  }
+
   // Talk button click
   talkBtn.addEventListener("click", () => {
+    _startBgAudioSession(); // Start iOS background audio session on first user gesture
     // If Claude is speaking/thinking/responding, stop everything
     if (talkBtn.classList.contains("speaking") || talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
       stopTtsPlayback();
@@ -3446,6 +3516,13 @@
     }
   });
 
+  document.getElementById("replayAllBtn").addEventListener("click", () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send("replay:all");
+      rlog("[replay] Requested replay of all since last message");
+    }
+  });
+
   // Audio control dot — tap to claim audio when another device has it
   document.getElementById("svcAudio").addEventListener("click", () => {
     if (ws?.readyState === WebSocket.OPEN) ws.send("claim:audio");
@@ -3634,6 +3711,7 @@
   function sendTerminalInput() {
     const text = terminalInput.value.trim();
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    _startBgAudioSession(); // Activate iOS background audio on text submit too
     ws.send("text:" + text);
     terminalInput.value = "";
   }
