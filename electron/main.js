@@ -21,7 +21,9 @@ const GH_OWNER = "hdt325";
 const GH_REPO = "murmur";
 const GH_BRANCH = "main";
 const GH_RAW_BASE = `https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${GH_BRANCH}`;
-// Files to auto-update from GitHub (relative to repo root → relative to murmurDir)
+// Files to auto-update from GitHub.
+// String entries: same path in repo and murmurDir.
+// Object entries: { src: "repo/path", dest: "local/path in murmurDir" }
 const CONTENT_FILES = [
   "server.ts",
   "index.html",
@@ -31,6 +33,8 @@ const CONTENT_FILES = [
   "terminal/interface.ts",
   "terminal/tmux-backend.ts",
   "terminal/pty-backend.ts",
+  // Electron UI files — fetched from electron/ in repo, stored flat in murmurDir
+  { src: "electron/loading.html", dest: "loading.html" },
   // NOTE: settings.json excluded — it's per-user preferences
 ];
 
@@ -58,6 +62,16 @@ let win = null;
 let tray = null;
 let serverProcess = null;
 let startupComplete = false;
+
+// Returns the best available loading.html path:
+// murmurDir version (content-updatable) if it exists, else bundled asar version.
+function getLoadingPath() {
+  const murmurDir = app.isPackaged
+    ? path.join(process.resourcesPath, "murmur")
+    : path.resolve(__dirname, "..");
+  const fromMurmur = path.join(murmurDir, "loading.html");
+  return fs.existsSync(fromMurmur) ? fromMurmur : path.join(__dirname, "loading.html");
+}
 
 // Send status messages to the loading page renderer
 function sendStatus(msg, type = "info", extra = {}) {
@@ -217,11 +231,11 @@ async function ensureServer() {
       // Clean exit (restart requested from UI) — reload startup sequence
       console.log("Server exited cleanly — restarting...");
       startupComplete = false;
-      win.loadFile(path.join(__dirname, "loading.html"));
+      win.loadFile(getLoadingPath());
       setTimeout(() => startup(), 1000);
     } else if (code !== 0 && win && !win.isDestroyed()) {
       // Server crashed after startup — show loading page with error
-      win.loadFile(path.join(__dirname, "loading.html"));
+      win.loadFile(getLoadingPath());
       setTimeout(() => {
         sendStatus(`Server crashed (exit code ${code}). Click Retry to restart.`, "error", { check: "server", checkStatus: "fail" });
       }, 500);
@@ -276,18 +290,20 @@ function fileHash(filePath) {
 async function checkContentUpdates(murmurDir) {
   const updatedFiles = [];
 
-  for (const file of CONTENT_FILES) {
+  for (const entry of CONTENT_FILES) {
+    const src  = typeof entry === "string" ? entry : entry.src;
+    const dest = typeof entry === "string" ? entry : entry.dest;
     try {
-      const localPath = path.join(murmurDir, file);
+      const localPath = path.join(murmurDir, dest);
       const localHash = fileHash(localPath);
-      const remoteContent = await httpsGet(`${GH_RAW_BASE}/${file}`);
+      const remoteContent = await httpsGet(`${GH_RAW_BASE}/${src}`);
       const remoteHash = crypto.createHash("sha256").update(remoteContent).digest("hex");
 
       if (localHash !== remoteHash) {
-        updatedFiles.push({ file, localPath, content: remoteContent });
+        updatedFiles.push({ file: dest, localPath, content: remoteContent });
       }
     } catch (err) {
-      console.log(`[update] Skip ${file}: ${err.message}`);
+      console.log(`[update] Skip ${src}: ${err.message}`);
     }
   }
 
@@ -460,8 +476,9 @@ function createWindow() {
     return ALLOWED_PERMISSIONS.has(permission);
   });
 
-  // Load the startup diagnostics page first
-  win.loadFile(path.join(__dirname, "loading.html"));
+  // Load the startup diagnostics page — prefer murmurDir version (content-updatable),
+  // fall back to bundled asar version on first run before any content update.
+  win.loadFile(getLoadingPath());
 
   win.on("closed", () => {
     win = null;
