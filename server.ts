@@ -1985,7 +1985,26 @@ function handleVoiceModeExchange(exchange: {
 }) {
   const role = exchange.type === "stt" ? "user" : "assistant";
   const ts = new Date(exchange.timestamp).getTime();
-  broadcast({ type: "transcription", role, text: exchange.text, ts });
+
+  // Create a proper conversation entry so it appears in the UI
+  // (frontend ignores live `transcription` broadcasts — only entries are rendered)
+  if (role === "user") {
+    // New turn for each voice exchange cycle
+    currentTurn++;
+    addUserEntry(exchange.text);
+  } else {
+    const entry: ConversationEntry = {
+      id: ++entryIdCounter,
+      role: "assistant",
+      text: exchange.text,
+      speakable: true,
+      spoken: true, // Already spoken via VoiceMode TTS
+      ts,
+      turn: currentTurn,
+    };
+    conversationEntries.push(entry);
+    broadcast({ type: "entry", entries: conversationEntries, partial: false });
+  }
 }
 
 // --- File Watching ---
