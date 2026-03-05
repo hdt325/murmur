@@ -3240,13 +3240,16 @@
       mediaRecorder.onstop = () => {
         const recBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
 
-        // Pre-filter: skip sending to Whisper if audio was just noise
-        const energyThreshold = Math.max(AUDIO_ENERGY_THRESHOLD_MIN, ambientRmsBaseline * 2.5);
-        if (recordingPeakRms < energyThreshold) {
-          rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${energyThreshold.toFixed(4)} (baseline=${ambientRmsBaseline.toFixed(4)})`);
-          setTalkState("idle");
-          autoListenActive = false;
-          return;
+        // Pre-filter: skip sending to Whisper if audio was just noise.
+        // Think mode bypasses this — user explicitly tapped to submit so always send.
+        if (!thinkMode) {
+          const energyThreshold = Math.max(AUDIO_ENERGY_THRESHOLD_MIN, ambientRmsBaseline * 2.5);
+          if (recordingPeakRms < energyThreshold) {
+            rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${energyThreshold.toFixed(4)} (baseline=${ambientRmsBaseline.toFixed(4)})`);
+            setTalkState("idle");
+            autoListenActive = false;
+            return;
+          }
         }
 
         if (preBufferBlob) {
