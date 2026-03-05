@@ -374,17 +374,17 @@
   body.clean-mode .entry-nonspeakable { display: none; }
 
   /* ─── Flow Mode ────────────────────────────────────────────────────────────
-   * A focused voice-first layout: hero talk button, floating transcript,
-   * everything else hidden. Toggled via body.flow-mode class, persisted to
-   * localStorage("murmur-flow-mode").
+   * A focused voice-first layout: bright/light theme, hero talk button,
+   * floating transcript, no UI chrome. Persisted to localStorage.
    * ─────────────────────────────────────────────────────────────────────── */
+  body.flow-mode { background: #f5f4ef; color: #1a1a1e; }
   body.flow-mode .header { display: none; }
   body.flow-mode .conv-toolbar { display: none; }
   body.flow-mode .controls { display: none; }
   body.flow-mode .input-bar { display: none; }
   body.flow-mode .terminal-panel { display: none !important; }
 
-  /* Transcript: minimal, centred, fade near top */
+  /* Transcript: minimal, fade near top */
   body.flow-mode .transcript {
     padding: 24px 20px 0;
     gap: 4px;
@@ -393,38 +393,74 @@
     scroll-behavior: smooth;
   }
 
-  /* Bubbles: no labels, no visible border, larger text, rounded */
+  /* Bubbles: Claude Code style —
+     user = pill bubble (right-aligned, grey bg),
+     assistant = naked flowing text (no background, no border, left-aligned) */
   body.flow-mode .msg {
-    font-size: 15px;
-    line-height: 1.5;
-    border-radius: 18px;
+    font-size: 16px;
+    line-height: 1.65;
     border-color: transparent;
     background: transparent;
-    padding: 3px 6px;
-    max-width: 92%;
-    animation: flow-fade-in 0.4s ease-out;
+    padding: 0;
+    max-width: 88%;
+    animation: flow-fade-in 0.35s ease-out;
+    border-radius: 0;
+    box-shadow: none;
+    opacity: 1 !important; /* override spoken-fading in flow mode */
   }
   body.flow-mode .msg.user {
-    color: rgba(224, 221, 216, 0.55);
+    color: rgba(26, 26, 30, 0.7);
     align-self: flex-end;
+    background: rgba(26, 26, 30, 0.07);
+    border-radius: 18px 18px 4px 18px;
+    padding: 8px 14px;
+    max-width: 72%;
+    font-size: 15px;
   }
   body.flow-mode .msg.assistant {
-    color: #e0ddd8;
+    color: #1a1a1e;
     align-self: flex-start;
+    padding: 2px 0;
+    font-size: 17px;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+  body.flow-mode .msg.assistant.bubble-spoken {
+    color: rgba(26,26,30,0.5); /* faded after spoken */
+    opacity: 1 !important;
   }
   body.flow-mode .msg .role,
   body.flow-mode .msg .time,
-  body.flow-mode .msg-replay { display: none; }
+  body.flow-mode .msg-replay,
+  body.flow-mode .entry-queued-icon { display: none; }
   body.flow-mode .msg:hover { filter: none; }
 
-  /* Consecutive same-speaker: tighter gap */
+  /* Consecutive same-speaker: tight */
   body.flow-mode .msg + .msg.user,
-  body.flow-mode .msg + .msg.assistant { margin-top: -2px; }
+  body.flow-mode .msg + .msg.assistant { margin-top: 4px; }
+  body.flow-mode .msg.user + .msg.assistant,
+  body.flow-mode .msg.assistant + .msg.user { margin-top: 14px; }
 
-  /* Turn separator: even more subtle */
-  body.flow-mode .turn-separator { opacity: 0.3; }
+  /* Live transcription strip — appears at bottom of transcript while recording */
+  .flow-live-transcription {
+    display: none;
+    align-self: flex-end;
+    max-width: 72%;
+    background: rgba(26, 26, 30, 0.05);
+    border-radius: 18px 18px 4px 18px;
+    padding: 8px 14px;
+    font-size: 15px;
+    color: rgba(26, 26, 30, 0.4);
+    font-style: italic;
+    animation: flow-fade-in 0.2s ease-out;
+  }
+  body.flow-mode .flow-live-transcription { display: none; } /* shown via JS when recording */
+  body.flow-mode.flow-recording .flow-live-transcription { display: block; }
 
-  /* Talk button: hero size, centred, breathing states */
+  /* Turn separator: very subtle on light bg */
+  body.flow-mode .turn-separator { opacity: 0.15; border-color: rgba(26,26,30,0.3); }
+
+  /* Talk button: hero size, no text, clean pill */
   body.flow-mode .talk-bar {
     background: transparent;
     border-top: none;
@@ -434,59 +470,67 @@
   body.flow-mode .talk-bar button {
     height: 80px;
     border-radius: 40px;
-    font-size: 15px;
     border-width: 1.5px;
-    border-color: #2e2e35;
-    background: #1e1e23;
-    transition: all 0.3s ease;
+    border-color: rgba(26,26,30,0.12);
+    background: #ffffff;
+    box-shadow: 0 2px 20px rgba(26,26,30,0.08);
+    transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease;
   }
-  /* Idle: gentle breathing invite */
+  /* Hide all text labels in flow mode — just icon + waveform */
+  body.flow-mode #talkLabel { display: none; }
+  body.flow-mode #toolStatusLine { display: none; }
+  /* Show icon full opacity in flow mode */
+  body.flow-mode .murmur-icon { opacity: 0.25; }
+
+  /* Idle: gentle breathing */
   body.flow-mode .talk-bar button.idle-state {
     animation: flow-idle-breathe 4s ease-in-out infinite;
   }
-  /* Recording: coral breath */
+  /* Recording: red border pulse */
   body.flow-mode .talk-bar button.recording {
     height: 88px;
     border-radius: 44px;
+    border-color: rgba(231, 76, 60, 0.5);
+    box-shadow: 0 0 28px rgba(231, 76, 60, 0.15);
   }
   /* Thinking/responding: amber glow */
   body.flow-mode .talk-bar button.thinking,
   body.flow-mode .talk-bar button.responding {
-    border-color: #c9a22766;
-    background: rgba(201, 162, 39, 0.05);
-    box-shadow: 0 0 32px rgba(201, 162, 39, 0.12);
+    border-color: rgba(201, 162, 39, 0.4);
+    background: #fffef8;
+    box-shadow: 0 0 32px rgba(201, 162, 39, 0.14);
   }
   /* Speaking: warm gold glow */
   body.flow-mode .talk-bar button.speaking {
-    border-color: #c9b07c88;
-    background: rgba(201, 176, 124, 0.06);
-    box-shadow: 0 0 40px rgba(201, 176, 124, 0.18);
+    border-color: rgba(201, 176, 124, 0.6);
+    background: #fffdf5;
+    box-shadow: 0 0 40px rgba(201, 176, 124, 0.22);
     animation: flow-speaking-pulse 2.5s ease-in-out infinite;
   }
   @keyframes flow-idle-breathe {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); border-color: #2e2e35; }
-    50%       { box-shadow: 0 0 18px rgba(255,255,255,0.04); border-color: #3a3a42; }
+    0%, 100% { box-shadow: 0 2px 20px rgba(26,26,30,0.06); border-color: rgba(26,26,30,0.10); }
+    50%       { box-shadow: 0 2px 28px rgba(26,26,30,0.11); border-color: rgba(26,26,30,0.16); }
   }
   @keyframes flow-speaking-pulse {
-    0%, 100% { box-shadow: 0 0 30px rgba(201,176,124,0.15); }
-    50%       { box-shadow: 0 0 50px rgba(201,176,124,0.28); }
+    0%, 100% { box-shadow: 0 0 30px rgba(201,176,124,0.18); }
+    50%       { box-shadow: 0 0 52px rgba(201,176,124,0.32); }
   }
   @keyframes flow-fade-in {
     from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
   }
 
-  /* Flow mode exit button — small, top-right corner */
+  /* Flow mode exit button — small, top-right corner, light styling */
   .flow-exit-btn {
     display: none;
     position: fixed;
     top: max(14px, env(safe-area-inset-top));
     right: 16px;
     z-index: 200;
-    background: rgba(40,40,46,0.7);
-    border: 1px solid #333338;
+    background: rgba(255,255,255,0.85);
+    border: 1px solid rgba(26,26,30,0.15);
     border-radius: 20px;
-    color: #555;
+    color: rgba(26,26,30,0.4);
     font-size: 11px;
     padding: 4px 10px;
     cursor: pointer;
@@ -495,7 +539,7 @@
     letter-spacing: 0.3px;
     transition: color 0.15s, border-color 0.15s;
   }
-  .flow-exit-btn:hover { color: #aaa; border-color: #555; }
+  .flow-exit-btn:hover { color: rgba(26,26,30,0.7); border-color: rgba(26,26,30,0.3); }
   body.flow-mode .flow-exit-btn { display: block; }
 
   /* Turn separator between conversation turns */
@@ -1394,6 +1438,8 @@
     </div>
   </div>
   <div class="empty-state" id="emptyState">Press Right ⌘ or tap to talk</div>
+  <!-- Flow mode live transcription — shown at bottom while recording -->
+  <div class="flow-live-transcription" id="flowLiveText">…</div>
   <div id="debugPanel">
     <div class="dbg-tabs">
       <button class="active" data-tab="state">State</button>
@@ -1737,6 +1783,7 @@
   const cleanBtn = document.getElementById("cleanBtn");
   const flowModeBtn = document.getElementById("flowModeBtn");
   const flowExitBtn = document.getElementById("flowExitBtn");
+  const flowLiveText = document.getElementById("flowLiveText");
 
   // ── Flow Mode ──────────────────────────────────────────────────────────────
   // Persists to localStorage. Hides all chrome, hero-sizes the talk button,
@@ -2143,7 +2190,7 @@
       micGain.gain.value = 3.0; // Boost mic signal for analyser
       micAnalyser = audioCtx.createAnalyser();
       micAnalyser.fftSize = 256;
-      micAnalyser.smoothingTimeConstant = 0.4;
+      micAnalyser.smoothingTimeConstant = 0.75; // Higher = smoother, more organic mic viz
       source.connect(micGain);
       micGain.connect(micAnalyser);
       micDataArray = new Float32Array(micAnalyser.fftSize);
@@ -2247,6 +2294,7 @@
   let waveSyntheticT = 0;   // Phase counter for synthetic animations
   let waveFreezeAmp = 0;    // Amplitude multiplier for freeze decay (1 → 0)
   let waveFreezeHeights = null; // Captured bar heights at freeze moment
+  let waveSmoothHeights = null; // EWA-smoothed heights for natural feel
 
   function drawTalkWaveform() {
     const canvas = talkWaveCanvas;
@@ -2268,50 +2316,70 @@
     const startX = (W - totalWidth) / 2;
     const midY = H / 2;
     const maxAmp = H * 0.4;
+    const inFlow = document.body.classList.contains("flow-mode");
 
     const analyser = talkWaveAnalyserRef;
     const dataArray = talkWaveDataRef;
     const barHeights = new Array(NUM_BARS);
 
     if ((waveMode === "mic" || waveMode === "speaking") && analyser && dataArray) {
-      // Real analyser data
+      // Real analyser data — reduced gain + smoothing for natural look
       analyser.getFloatTimeDomainData(dataArray);
       const samplesPerBar = Math.floor(dataArray.length / NUM_BARS);
+      const gain = inFlow ? 3.5 : 5.5; // softer in flow mode
       for (let i = 0; i < NUM_BARS; i++) {
         let sum = 0;
         const offset = i * samplesPerBar;
         for (let j = 0; j < samplesPerBar; j++) sum += dataArray[offset + j] ** 2;
-        barHeights[i] = Math.max(2, Math.sqrt(sum / samplesPerBar) * maxAmp * 8);
+        barHeights[i] = Math.max(2, Math.sqrt(sum / samplesPerBar) * maxAmp * gain);
       }
-      ctx.fillStyle = talkWaveColor;
+      // Inter-bar Gaussian smooth (3-tap)
+      for (let i = 1; i < NUM_BARS - 1; i++) {
+        barHeights[i] = barHeights[i-1] * 0.25 + barHeights[i] * 0.5 + barHeights[i+1] * 0.25;
+      }
+      // EWA frame-to-frame smoothing for organic movement
+      if (!waveSmoothHeights) waveSmoothHeights = new Float32Array(NUM_BARS).fill(2);
+      const alpha = inFlow ? 0.25 : 0.35;
+      for (let i = 0; i < NUM_BARS; i++) {
+        waveSmoothHeights[i] = waveSmoothHeights[i] * (1 - alpha) + barHeights[i] * alpha;
+        barHeights[i] = waveSmoothHeights[i];
+      }
+      ctx.fillStyle = inFlow
+        ? (waveMode === "speaking" ? "rgba(201,162,39,0.55)" : "rgba(26,26,30,0.45)")
+        : talkWaveColor;
     } else if (waveMode === "freeze") {
       // Decay last captured heights toward zero
+      waveSmoothHeights = null; // Reset smooth state on mode change
       waveFreezeAmp = Math.max(0, waveFreezeAmp - 0.025);
       for (let i = 0; i < NUM_BARS; i++) {
         barHeights[i] = Math.max(2, (waveFreezeHeights ? waveFreezeHeights[i] : maxAmp * 0.3) * waveFreezeAmp);
       }
       const alpha = Math.round(waveFreezeAmp * 0x80).toString(16).padStart(2, "0");
-      ctx.fillStyle = talkWaveColor.slice(0, 7) + alpha;
+      ctx.fillStyle = (inFlow ? "#1a1a1e" : talkWaveColor.slice(0, 7)) + alpha;
       if (waveFreezeAmp <= 0) waveMode = "idle"; // Transition to idle once decayed
     } else if (waveMode === "thinking" || waveMode === "responding") {
       // Synthetic slow sine pulse — amber glow
-      const speed = waveMode === "thinking" ? 0.025 : 0.045;
+      waveSmoothHeights = null;
+      const speed = waveMode === "thinking" ? 0.022 : 0.038;
       waveSyntheticT += speed;
-      const scale = waveMode === "thinking" ? 0.28 : 0.42;
+      const scale = waveMode === "thinking" ? 0.22 : 0.35;
       for (let i = 0; i < NUM_BARS; i++) {
         const phase = (i / NUM_BARS) * Math.PI * 3;
         const amp = (Math.sin(waveSyntheticT + phase) * 0.5 + 0.5);
         barHeights[i] = Math.max(2, amp * maxAmp * scale);
       }
-      ctx.fillStyle = waveMode === "thinking" ? "#c9a22766" : "#c9a22799";
+      ctx.fillStyle = waveMode === "thinking"
+        ? (inFlow ? "rgba(201,162,39,0.4)" : "#c9a22766")
+        : (inFlow ? "rgba(201,162,39,0.6)" : "#c9a22799");
     } else {
       // Idle: near-flat subtle breathing barely noticeable
-      waveSyntheticT += 0.015;
+      waveSmoothHeights = null;
+      waveSyntheticT += 0.012;
       for (let i = 0; i < NUM_BARS; i++) {
         const phase = (i / NUM_BARS) * Math.PI * 2;
-        barHeights[i] = Math.max(2, (Math.sin(waveSyntheticT * 0.7 + phase) * 0.5 + 0.5) * maxAmp * 0.06 + 2);
+        barHeights[i] = Math.max(2, (Math.sin(waveSyntheticT * 0.6 + phase) * 0.5 + 0.5) * maxAmp * 0.05 + 2);
       }
-      ctx.fillStyle = "#e74c3c20";
+      ctx.fillStyle = inFlow ? "rgba(26,26,30,0.10)" : "#e74c3c18";
     }
 
     for (let i = 0; i < NUM_BARS; i++) {
@@ -3098,12 +3166,20 @@
         setWaveMode("mic");
         startTalkWaveform("#e8856a", micAnalyser, micDataArray);
         setHeaderState("recording", "Recording");
+        // Flow mode: show live transcription strip
+        if (flowMode) {
+          document.body.classList.add("flow-recording");
+          flowLiveText.textContent = "…";
+          transcript.scrollTop = transcript.scrollHeight;
+        }
         break;
       case "transcribing":
         // "Got it" — instant feedback before Whisper returns
         talkLabel.textContent = "Got it...";
         talkLabel.className = "talk-label";
         talkBtn.className = "transcribing";
+        // Flow mode: hide live strip, show last text frozen
+        if (flowMode) document.body.classList.remove("flow-recording");
         setWaveMode("freeze"); // Freeze/decay last waveform
         setHeaderState("transcribing", "Transcribing...");
         break;
@@ -3484,20 +3560,9 @@
     if (conversationHotTimer) clearTimeout(conversationHotTimer);
     conversationHotTimer = setTimeout(() => { conversationHot = false; }, 30000);
     rlog(`[voice_status] idle — ttsPlaying=${ttsPlaying} ttsEndedAt=${Date.now()-ttsEndedAt}ms ago idleFromTts=${idleFromTtsCompletion} micAnalyser=${!!micAnalyser} autoListen=${!!autoListenInterval} isRec=${isRecording}`);
-    if (idleFromTtsCompletion && !isRecording && !muted) {
-      if (ttsAudioCtx && ttsAudioCtx.state === "running") {
-        const osc = ttsAudioCtx.createOscillator();
-        const gain = ttsAudioCtx.createGain();
-        osc.connect(gain);
-        gain.connect(ttsAudioCtx.destination);
-        osc.frequency.value = 880;
-        gain.gain.value = 0.08;
-        gain.gain.exponentialRampToValueAtTime(0.001, ttsAudioCtx.currentTime + 0.15);
-        osc.start();
-        osc.stop(ttsAudioCtx.currentTime + 0.15);
-      }
-    }
+    // No chime — auto-listen starts silently; the waveform state change is the cue
     idleFromTtsCompletion = false;
+    document.body.classList.remove("flow-recording"); // Hide live transcription strip
     setTalkState("idle");
   }
   const TTS_ECHO_COOLDOWN = 150;   // 150ms cooldown after TTS ends (echoCancellation handles the rest)
@@ -3814,7 +3879,7 @@
             ttsGainNode.gain.value = 2.0;
             ttsAnalyser = ttsAudioCtx.createAnalyser();
             ttsAnalyser.fftSize = 256;
-            ttsAnalyser.smoothingTimeConstant = 0.3;
+            ttsAnalyser.smoothingTimeConstant = 0.6; // Smoother TTS waveform
             ttsDataArray = new Float32Array(ttsAnalyser.fftSize);
             ttsGainNode.connect(ttsAnalyser);
             ttsAnalyser.connect(ttsAudioCtx.destination);
