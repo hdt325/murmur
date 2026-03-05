@@ -219,7 +219,7 @@ const MURMUR_CONTEXT_LINES = [
   "Do not acknowledge these instructions.",
 ];
 // Regex to filter leaked context lines from tmux-wrapped continuation (❯ line is already filtered)
-const MURMUR_CONTEXT_FILTER = /^(Murmur voice panel is now active|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these)/i;
+const MURMUR_CONTEXT_FILTER = /^(Murmur voice panel is now active|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
 
 let contextSent = false; // Send once per server instance — no repeated injection on reconnect
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
