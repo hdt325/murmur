@@ -1980,24 +1980,18 @@
   });
 
   // ── Flow Settings Sheet ──────────────────────────────────────────────────
-  // Opening pauses voice: stops TTS + disables auto-listen until closed.
-  let _settingsPausedAutoListen = false;
 
   function openFlowSettings() {
     flowGearBtn?.classList.add("active");
-    // Pause voice — stop any TTS and suspend auto-listen
-    if (typeof stopTtsPlayback === "function") stopTtsPlayback();
-    if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
-    if (typeof setTalkState === "function") setTalkState("idle");
-    _settingsPausedAutoListen = autoListenEnabled;
-    autoListenEnabled = false;
-    if (autoListenInterval) { clearInterval(autoListenInterval); autoListenInterval = null; }
-    autoListenActive = false;
     // Request fresh session list
     if (ws?.readyState === WebSocket.OPEN) ws.send("tmux:list");
     // Sync voice pills to current voice
     document.querySelectorAll("#fssVoicePills .fss-pill").forEach(p =>
       p.classList.toggle("selected", p.dataset.fssVoice === currentVoice));
+    // Sync speed pills
+    const curSpeed = SPEEDS[speedIdx];
+    document.querySelectorAll("#fssSpeedPills .fss-pill").forEach(p =>
+      p.classList.toggle("selected", parseFloat(p.dataset.fssSpeed) === curSpeed));
     // Sync activation
     _syncFssActivation();
     flowSettingsOverlay.classList.add("open");
@@ -2008,12 +2002,6 @@
     flowGearBtn?.classList.remove("active");
     flowSettingsOverlay.classList.remove("open");
     flowSettingsSheet.classList.remove("open");
-    // Resume voice if it was active before
-    if (_settingsPausedAutoListen && !_pushToTalkMode) {
-      autoListenEnabled = true;
-      tryStartAutoListen?.();
-    }
-    _settingsPausedAutoListen = false;
   }
 
   function _syncFssActivation() {
