@@ -848,19 +848,19 @@
   .sopt:hover { background: #2a2a30; color: #888; }
   .sopt.selected { color: #c9a227; border-color: #c9a22744; background: rgba(201, 162, 39, 0.08); }
 
-  /* Think mode recording: amber slow pulse instead of red fast pulse */
+  /* Think mode recording: bright amber breathing pulse */
   .talk-bar button.recording.think-recording {
-    border-color: rgba(201, 162, 39, 0.6) !important;
-    background: rgba(201, 162, 39, 0.1) !important;
+    border-color: #c9a227 !important;
+    background: rgba(201, 162, 39, 0.12) !important;
     color: #c9a227 !important;
-    animation: pulse-border-amber 2.5s ease-in-out infinite !important;
+    animation: pulse-border-amber 2s ease-in-out infinite !important;
   }
   .talk-bar button.recording.think-recording .talk-wave-label {
     color: #c9a227 !important;
   }
   @keyframes pulse-border-amber {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.3); }
-    50% { box-shadow: 0 0 0 6px rgba(201, 162, 39, 0); }
+    0%, 100% { border-color: #c9a227; box-shadow: 0 0 0 0 rgba(201, 162, 39, 0.3); }
+    50% { border-color: #c9a22799; box-shadow: 0 0 0 6px rgba(201, 162, 39, 0); }
   }
 
   /* --- Terminal Panel --- */
