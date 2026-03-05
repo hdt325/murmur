@@ -346,6 +346,69 @@ async function testResponsiveLayout() {
   report("All critical elements visible at 320px", talkVisible && inputVisible && headerVisible);
 }
 
+async function testFlowMode() {
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+
+  // Ensure flow mode is off initially (reset localStorage)
+  await page.evaluate(() => localStorage.removeItem("murmur-flow-mode"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+
+  const flowBtn = page.locator("#flowModeBtn");
+  const flowBtnExists = await flowBtn.count() > 0;
+  report("Flow mode button exists in conv-toolbar", flowBtnExists);
+
+  const exitBtnExists = await page.locator(".flow-exit-btn").count() > 0;
+  report("Flow exit button exists", exitBtnExists);
+
+  // Activate flow mode
+  if (flowBtnExists) {
+    await flowBtn.click();
+    await page.waitForTimeout(400);
+    const bodyHasFlowMode = await page.evaluate(() => document.body.classList.contains("flow-mode"));
+    const localStorageSet = await page.evaluate(() => localStorage.getItem("murmur-flow-mode") === "1");
+    await screenshot("flow-mode-active");
+    report("Flow mode adds body.flow-mode on click", bodyHasFlowMode);
+    report("Flow mode persists to localStorage", localStorageSet);
+
+    // Check that talk button is enlarged in flow mode
+    const talkBtnHeight = await page.locator("#talkBtn").evaluate((el: HTMLElement) => el.getBoundingClientRect().height);
+    report("Flow mode enlarges talk button (>60px)", talkBtnHeight > 60, `${talkBtnHeight.toFixed(0)}px`);
+
+    // Deactivate via exit button
+    await page.locator(".flow-exit-btn").click();
+    await page.waitForTimeout(300);
+    const bodyExited = await page.evaluate(() => !document.body.classList.contains("flow-mode"));
+    await screenshot("flow-mode-exited");
+    report("Flow exit button removes body.flow-mode", bodyExited);
+  }
+}
+
+async function testContinuousWaveform() {
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(800);
+
+  // Canvas should always be visible (not display:none)
+  const canvasVisible = await page.locator("#talkWaveCanvas").evaluate((el: HTMLElement) => {
+    const s = window.getComputedStyle(el);
+    return s.display !== "none" && parseFloat(s.opacity) > 0;
+  });
+  report("Waveform canvas always visible (no display:none)", canvasVisible);
+
+  // Canvas should be drawing (width > 0)
+  const canvasHasSize = await page.locator("#talkWaveCanvas").evaluate((el: HTMLCanvasElement) => el.width > 0);
+  report("Waveform canvas has non-zero width after load", canvasHasSize);
+
+  // Tool status line element exists
+  const toolStatusExists = await page.locator("#toolStatusLine").count() > 0;
+  report("Tool status line element exists in talk button", toolStatusExists);
+
+  // talkLabel persistent element exists
+  const talkLabelExists = await page.locator("#talkLabel").count() > 0;
+  report("Persistent talkLabel element exists", talkLabelExists);
+}
+
 // ═══════════════════════════════════════
 // Runner
 // ═══════════════════════════════════════
@@ -373,6 +436,8 @@ async function main() {
     await testServiceDots();
     await testCleanVerboseToggle();
     await testResponsiveLayout();
+    await testFlowMode();
+    await testContinuousWaveform();
   } catch (err) {
     await screenshot("fatal-error").catch(() => {});
     console.error(`\n  ✗ Fatal: ${(err as Error).message}\n`);
