@@ -376,12 +376,43 @@ async function testFlowMode() {
     const talkBtnHeight = await page.locator("#talkBtn").evaluate((el: HTMLElement) => el.getBoundingClientRect().height);
     report("Flow mode enlarges talk button (>60px)", talkBtnHeight > 60, `${talkBtnHeight.toFixed(0)}px`);
 
+    // Check light background applied
+    const bodyBg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    report("Flow mode: light background (#f5f4ef)", bodyBg === "rgb(245, 244, 239)", bodyBg);
+
+    // Gear and stop pill visible
+    const gearVisible = await page.evaluate(() => getComputedStyle(document.querySelector(".flow-gear-btn")!).display !== "none");
+    const stopVisible = await page.evaluate(() => getComputedStyle(document.querySelector(".flow-stop-pill")!).display !== "none");
+    report("Flow mode: gear button visible", gearVisible);
+    report("Flow mode: stop pill visible", stopVisible);
+
+    // Stop pill should NOT be full-width (should be compact pill)
+    const stopWidth = await page.evaluate(() => document.querySelector(".flow-stop-pill")!.getBoundingClientRect().width);
+    const viewportWidth = await page.evaluate(() => window.innerWidth);
+    report("Flow mode: stop pill is compact (not full-width)", stopWidth < viewportWidth * 0.5, `${stopWidth.toFixed(0)}px / viewport ${viewportWidth}px`);
+
+    // Header/controls hidden
+    const headerHidden = await page.evaluate(() => getComputedStyle(document.querySelector(".header")!).display === "none");
+    const controlsHidden = await page.evaluate(() => getComputedStyle(document.querySelector(".controls")!).display === "none");
+    report("Flow mode: header hidden", headerHidden);
+    report("Flow mode: controls hidden", controlsHidden);
+
+    // Gear and stop NOT shown in normal mode (check after re-enabling flow mode then disabling)
+    await page.evaluate(() => document.getElementById("flowModeBtn")!.click()); // toggle off briefly
+    await page.waitForTimeout(200);
+    await page.evaluate(() => document.getElementById("flowModeBtn")!.click()); // toggle back on
+    await page.waitForTimeout(200);
+
     // Deactivate via exit button
     await page.locator(".flow-exit-btn").click();
     await page.waitForTimeout(300);
     const bodyExited = await page.evaluate(() => !document.body.classList.contains("flow-mode"));
+    const gearHiddenInNormal = await page.evaluate(() => getComputedStyle(document.querySelector(".flow-gear-btn")!).display === "none");
+    const stopHiddenInNormal = await page.evaluate(() => getComputedStyle(document.querySelector(".flow-stop-pill")!).display === "none");
     await screenshot("flow-mode-exited");
     report("Flow exit button removes body.flow-mode", bodyExited);
+    report("Gear hidden in normal mode", gearHiddenInNormal);
+    report("Stop pill hidden in normal mode", stopHiddenInNormal);
   }
 }
 
