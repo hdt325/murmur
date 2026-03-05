@@ -612,7 +612,7 @@
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: border-color 0.3s ease, background 0.3s ease, box-shadow 0.3s ease, color 0.2s ease;
     letter-spacing: 0.3px;
     display: flex;
     align-items: center;
@@ -629,10 +629,35 @@
     left: 0;
     width: 100%;
     height: 100%;
-    display: none;
     pointer-events: none;
+    opacity: 1;
+    transition: opacity 0.3s ease;
   }
 
+  /* Tool call status — subtle one-liner shown during thinking/responding */
+  .tool-status-line {
+    position: absolute;
+    bottom: 5px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 9px;
+    color: #c9a22766;
+    letter-spacing: 0.3px;
+    pointer-events: none;
+    transition: opacity 0.4s ease;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 0 12px;
+  }
+  body.flow-mode .tool-status-line { font-size: 11px; bottom: 8px; }
+
+  /* Persistent talk button label — replaces .talk-wave-label across all states */
+  .talk-label {
+    position: relative;
+    z-index: 1;
+    transition: color 0.25s ease, opacity 0.25s ease;
+  }
   .talk-wave-label {
     position: relative;
     z-index: 1;
@@ -702,10 +727,13 @@
     height: 48px;
     opacity: 0.08;
     pointer-events: none;
+    transition: opacity 0.3s ease, filter 0.3s ease;
   }
   .talk-bar button.idle-state .murmur-icon { opacity: 0.12; }
   .talk-bar button.recording .murmur-icon { opacity: 0.15; }
   .talk-bar button.speaking .murmur-icon { opacity: 0.1; }
+  .talk-bar button.thinking .murmur-icon,
+  .talk-bar button.responding .murmur-icon { opacity: 0.08; }
 
   .talk-bar button.recording {
     border-color: #e8856a;
@@ -1380,7 +1408,12 @@
 
 <!-- Section 4: Talk button -->
 <div class="talk-bar">
-  <button id="talkBtn" data-tip="Auto-listens when it detects your voice"><canvas id="talkWaveCanvas"></canvas><svg viewBox="0 0 80 24" class="murmur-icon"><polyline points="2.0,12.0 2.6,12.2 3.3,12.2 3.9,11.8 4.5,11.6 5.2,11.6 5.8,12.0 6.4,12.6 7.1,13.5 7.7,11.1 8.3,10.2 9.0,12.3 9.6,12.7 10.2,13.3 10.9,12.1 11.5,11.5 12.1,10.5 12.8,10.7 13.4,13.8 14.0,15.2 14.7,10.5 15.3,10.0 15.9,11.2 16.6,12.0 17.2,14.1 17.8,13.1 18.5,13.0 19.1,8.7 19.7,8.9 20.4,14.8 21.0,15.7 21.6,11.3 22.3,11.0 22.9,9.5 23.5,10.9 24.2,13.4 24.8,15.0 25.4,15.2 26.1,6.6 26.7,8.3 27.3,14.2 28.0,14.8 28.6,13.4 29.2,12.5 29.9,8.8 30.5,9.1 31.1,11.2 31.8,17.7 32.4,16.5 33.0,6.0 33.7,9.3 34.3,11.4 34.9,13.6 35.6,15.4 36.2,14.5 36.8,9.9 37.5,6.2 38.1,9.1 38.7,19.7 39.4,16.1 40.0,8.4 40.6,10.7 41.3,7.9 41.9,12.2 42.5,15.2 43.2,17.0 43.8,11.7 44.4,4.8 45.1,9.2 45.7,17.3 46.3,14.1 47.0,12.8 47.6,11.8 48.2,7.2 48.9,10.5 49.5,13.3 50.1,18.3 50.8,12.4 51.4,6.4 52.0,10.3 52.7,13.4 53.3,12.9 53.9,15.2 54.6,12.6 55.2,8.6 55.8,9.0 56.5,12.2 57.1,17.8 57.7,12.1 58.4,9.7 59.0,10.9 59.6,10.6 60.3,12.4 60.9,15.1 61.5,13.4 62.2,10.2 62.8,8.6 63.4,12.0 64.1,15.4 64.7,12.0 65.3,12.4 66.0,11.0 66.6,10.0 67.2,11.8 67.9,13.9 68.5,13.8 69.1,11.2 69.8,9.8 70.4,12.0 71.0,12.8 71.7,12.2 72.3,13.1 72.9,11.5 73.6,11.0 74.2,11.5 74.8,12.6 75.5,12.8 76.1,11.8 76.7,11.7 77.4,12.0 78.0,12.0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg> Press Right ⌘ or tap to talk</button>
+  <button id="talkBtn" data-tip="Auto-listens when it detects your voice">
+    <canvas id="talkWaveCanvas"></canvas>
+    <img src="/icon-256.png" class="murmur-icon" alt="" id="talkIcon">
+    <span class="talk-label" id="talkLabel">Tap or press Right ⌘ to talk</span>
+    <span class="tool-status-line" id="toolStatusLine"></span>
+  </button>
 </div>
 
 <!-- Section 5: Controls + Input -->
@@ -2209,26 +2242,25 @@
   let talkWaveColor = "#e74c3c";
   let talkWaveAnalyserRef = null;
   let talkWaveDataRef = null;
+  // Continuous waveform mode — canvas always animates, mode controls visual style
+  let waveMode = "idle";
+  let waveSyntheticT = 0;   // Phase counter for synthetic animations
+  let waveFreezeAmp = 0;    // Amplitude multiplier for freeze decay (1 → 0)
+  let waveFreezeHeights = null; // Captured bar heights at freeze moment
 
   function drawTalkWaveform() {
-    const analyser = talkWaveAnalyserRef;
-    const dataArray = talkWaveDataRef;
-    if (!analyser || !dataArray) { talkWaveFrame = null; return; }
     const canvas = talkWaveCanvas;
     const ctx = talkWaveCtx;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0) { talkWaveFrame = null; return; }
+    if (rect.width === 0) { talkWaveFrame = requestAnimationFrame(drawTalkWaveform); return; }
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
     ctx.scale(dpr, dpr);
     const W = rect.width;
     const H = rect.height;
-
-    analyser.getFloatTimeDomainData(dataArray);
     ctx.clearRect(0, 0, W, H);
 
-    // Compact centered waveform — similar style to the Murmur icon
     const NUM_BARS = 40;
     const barGap = 2;
     const barWidth = 2;
@@ -2236,21 +2268,55 @@
     const startX = (W - totalWidth) / 2;
     const midY = H / 2;
     const maxAmp = H * 0.4;
-    const samplesPerBar = Math.floor(dataArray.length / NUM_BARS);
 
-    ctx.fillStyle = talkWaveColor;
-    ctx.lineCap = "round";
+    const analyser = talkWaveAnalyserRef;
+    const dataArray = talkWaveDataRef;
+    const barHeights = new Array(NUM_BARS);
+
+    if ((waveMode === "mic" || waveMode === "speaking") && analyser && dataArray) {
+      // Real analyser data
+      analyser.getFloatTimeDomainData(dataArray);
+      const samplesPerBar = Math.floor(dataArray.length / NUM_BARS);
+      for (let i = 0; i < NUM_BARS; i++) {
+        let sum = 0;
+        const offset = i * samplesPerBar;
+        for (let j = 0; j < samplesPerBar; j++) sum += dataArray[offset + j] ** 2;
+        barHeights[i] = Math.max(2, Math.sqrt(sum / samplesPerBar) * maxAmp * 8);
+      }
+      ctx.fillStyle = talkWaveColor;
+    } else if (waveMode === "freeze") {
+      // Decay last captured heights toward zero
+      waveFreezeAmp = Math.max(0, waveFreezeAmp - 0.025);
+      for (let i = 0; i < NUM_BARS; i++) {
+        barHeights[i] = Math.max(2, (waveFreezeHeights ? waveFreezeHeights[i] : maxAmp * 0.3) * waveFreezeAmp);
+      }
+      const alpha = Math.round(waveFreezeAmp * 0x80).toString(16).padStart(2, "0");
+      ctx.fillStyle = talkWaveColor.slice(0, 7) + alpha;
+      if (waveFreezeAmp <= 0) waveMode = "idle"; // Transition to idle once decayed
+    } else if (waveMode === "thinking" || waveMode === "responding") {
+      // Synthetic slow sine pulse — amber glow
+      const speed = waveMode === "thinking" ? 0.025 : 0.045;
+      waveSyntheticT += speed;
+      const scale = waveMode === "thinking" ? 0.28 : 0.42;
+      for (let i = 0; i < NUM_BARS; i++) {
+        const phase = (i / NUM_BARS) * Math.PI * 3;
+        const amp = (Math.sin(waveSyntheticT + phase) * 0.5 + 0.5);
+        barHeights[i] = Math.max(2, amp * maxAmp * scale);
+      }
+      ctx.fillStyle = waveMode === "thinking" ? "#c9a22766" : "#c9a22799";
+    } else {
+      // Idle: near-flat subtle breathing barely noticeable
+      waveSyntheticT += 0.015;
+      for (let i = 0; i < NUM_BARS; i++) {
+        const phase = (i / NUM_BARS) * Math.PI * 2;
+        barHeights[i] = Math.max(2, (Math.sin(waveSyntheticT * 0.7 + phase) * 0.5 + 0.5) * maxAmp * 0.06 + 2);
+      }
+      ctx.fillStyle = "#e74c3c20";
+    }
 
     for (let i = 0; i < NUM_BARS; i++) {
-      let sum = 0;
-      const offset = i * samplesPerBar;
-      for (let j = 0; j < samplesPerBar; j++) {
-        const v = dataArray[offset + j];
-        sum += v * v;
-      }
-      let rms = Math.sqrt(sum / samplesPerBar);
-      let barH = Math.max(2, rms * maxAmp * 8);
       const x = startX + i * (barWidth + barGap);
+      const barH = barHeights[i];
       const y = midY - barH / 2;
       ctx.beginPath();
       ctx.roundRect(x, y, barWidth, barH, 1);
@@ -2260,20 +2326,51 @@
     talkWaveFrame = requestAnimationFrame(drawTalkWaveform);
   }
 
+  // Set waveform visual mode. Canvas loop runs permanently — this just changes behaviour.
+  function setWaveMode(mode) {
+    if (mode === "freeze" && waveMode !== "freeze") {
+      // Capture current bar heights for smooth decay
+      waveFreezeAmp = 1.0;
+      // Approximate frozen heights based on current analyser data
+      if (talkWaveAnalyserRef && talkWaveDataRef) {
+        talkWaveAnalyserRef.getFloatTimeDomainData(talkWaveDataRef);
+        const NUM_BARS = 40;
+        const samplesPerBar = Math.floor(talkWaveDataRef.length / NUM_BARS);
+        const rect = talkWaveCanvas.getBoundingClientRect();
+        const maxAmp = (rect.height || 52) * 0.4;
+        waveFreezeHeights = new Array(NUM_BARS);
+        for (let i = 0; i < NUM_BARS; i++) {
+          let sum = 0;
+          const offset = i * samplesPerBar;
+          for (let j = 0; j < samplesPerBar; j++) sum += talkWaveDataRef[offset + j] ** 2;
+          waveFreezeHeights[i] = Math.max(2, Math.sqrt(sum / samplesPerBar) * maxAmp * 8);
+        }
+      } else {
+        waveFreezeHeights = null;
+      }
+    } else if (mode === "thinking" || mode === "responding" || mode === "idle") {
+      waveSyntheticT = 0;
+    }
+    waveMode = mode;
+    // Loop runs permanently — no need to restart
+  }
+
   function startTalkWaveform(color, analyser, dataArray) {
     talkWaveColor = color || "#e74c3c";
     talkWaveAnalyserRef = analyser || micAnalyser;
     talkWaveDataRef = dataArray || micDataArray;
-    talkWaveCanvas.style.display = "block";
-    if (!talkWaveFrame) talkWaveFrame = requestAnimationFrame(drawTalkWaveform);
+    // Canvas stays visible always — no display toggle needed
   }
 
   function stopTalkWaveform() {
-    talkWaveCanvas.style.display = "none";
-    if (talkWaveFrame) { cancelAnimationFrame(talkWaveFrame); talkWaveFrame = null; }
+    // Clear analyser refs; canvas keeps running in idle mode
     talkWaveAnalyserRef = null;
     talkWaveDataRef = null;
+    setWaveMode("idle");
   }
+
+  // Start the waveform loop immediately — runs for the lifetime of the page
+  talkWaveFrame = requestAnimationFrame(drawTalkWaveform);
 
   // iOS audio unlock: create AudioContext on first user gesture so TTS works before mic is granted.
   // iOS requires a user gesture to start audio — this pre-unlocks it on the first tap/click.
@@ -2495,6 +2592,17 @@
       // Server-driven TTS highlight — replaces client-side bubble guesswork
       if (msg.type === "tts_highlight") {
         highlightEntry(msg.entryId);
+      }
+
+      // Tool call status — show current tool during thinking/responding
+      if (msg.type === "tool_status") {
+        if (msg.text && toolStatusLine) {
+          toolStatusLine.textContent = msg.text;
+          toolStatusLine.style.opacity = "1";
+        } else if (toolStatusLine) {
+          toolStatusLine.textContent = "";
+          toolStatusLine.style.opacity = "0";
+        }
       }
 
       // Local TTS — server sends text instead of audio when voice is _local
@@ -2937,32 +3045,38 @@
     }
   }
 
+  // Grab persistent talk button child elements (set up in HTML, never rebuilt)
+  const talkLabel = document.getElementById("talkLabel");
+  const talkIcon = document.getElementById("talkIcon");
+  const toolStatusLine = document.getElementById("toolStatusLine");
+
   // =============================================
   // Talk button state management
+  // Uses persistent inner elements — no innerHTML rebuild — so CSS transitions work.
   // =============================================
   function setTalkState(state) {
-    talkBtn.className = "";
-    stopTalkWaveform();
     clearBubbleHighlights();
+    // Apply state class with rAF so CSS transitions animate (class swap needs a frame gap)
+    const prevClasses = [...talkBtn.classList];
+    talkBtn.className = state === "idle" ? "" : state; // Set immediately for logic checks below
+    requestAnimationFrame(() => {
+      // Re-apply in next frame so transitions fire
+      talkBtn.className = state === "idle" ? "" : state;
+    });
+
+    toolStatusLine.textContent = ""; // Clear tool status on any state change
+    toolStatusLine.style.opacity = "0";
 
     switch (state) {
       case "idle": {
-        talkBtn.innerHTML = '';
-        talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentHTML('beforeend', MURMUR_SVG);
-        const hint = document.createElement("span");
-        hint.className = "talk-idle-hint";
         const mode = MODES[modeIdx];
-        if (mode.id === "text") {
-          hint.textContent = "Text mode — no audio";
-        } else if (mode.id === "type") {
-          hint.textContent = "Type mode — mic off";
-        } else if (mode.id === "listen") {
-          hint.textContent = "Read mode — voice in, text out";
-        } else {
-          hint.textContent = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
-        }
-        talkBtn.appendChild(hint);
+        let hint;
+        if (mode.id === "text") hint = "Text mode — no audio";
+        else if (mode.id === "type") hint = "Type mode — mic off";
+        else if (mode.id === "listen") hint = "Read mode — voice in, text out";
+        else hint = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
+        talkLabel.textContent = hint;
+        talkLabel.className = "talk-label talk-idle-hint";
         talkBtn.className = "idle-state";
         if (mode.id === "listen") talkBtn.classList.add("mode-read");
         if (mode.id === "type") talkBtn.classList.add("mode-type");
@@ -2970,56 +3084,53 @@
         if (thinkMode) talkBtn.classList.add("think-mode");
         talkBtn.setAttribute("data-tip", mode.tip);
         setHeaderState("ready", mode.id === "type" ? "Type mode" : "Ready");
-        // Show subtle mic level on idle button (red palette, low opacity)
+        setWaveMode("idle");
         if (mode.micOn && micAnalyser && micDataArray) {
           startTalkWaveform("#e74c3c44", micAnalyser, micDataArray);
         }
-        updateInterruptBtn(pendingVoiceCount); // Deactivate when idle
+        updateInterruptBtn(pendingVoiceCount);
         break;
       }
       case "recording":
-        talkBtn.innerHTML = '';
-        talkBtn.appendChild(talkWaveCanvas);
-        const label = document.createElement("span");
-        label.className = "talk-wave-label";
-        label.textContent = "Listening...";
-        talkBtn.appendChild(label);
+        talkLabel.textContent = "Listening...";
+        talkLabel.className = "talk-label talk-wave-label";
         talkBtn.className = "recording";
-        startTalkWaveform("#e74c3c", micAnalyser, micDataArray);
+        setWaveMode("mic");
+        startTalkWaveform("#e8856a", micAnalyser, micDataArray);
         setHeaderState("recording", "Recording");
         break;
       case "transcribing":
-        talkBtn.textContent = "";
-        talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentText('beforeend', "Transcribing...");
+        // "Got it" — instant feedback before Whisper returns
+        talkLabel.textContent = "Got it...";
+        talkLabel.className = "talk-label";
         talkBtn.className = "transcribing";
+        setWaveMode("freeze"); // Freeze/decay last waveform
         setHeaderState("transcribing", "Transcribing...");
         break;
       case "thinking":
-        talkBtn.textContent = "";
-        talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentText('beforeend', "Claude is thinking... (tap to queue voice)");
+        talkLabel.textContent = "Thinking... (tap to queue)";
+        talkLabel.className = "talk-label";
         talkBtn.className = "thinking";
+        setWaveMode("thinking");
+        startTalkWaveform("#c9a22766", null, null); // synthetic amber
         setHeaderState("thinking", "Claude is thinking...");
         showThinkingBubble();
         updateInterruptBtn(pendingVoiceCount);
         break;
       case "responding":
-        talkBtn.textContent = "";
-        talkBtn.appendChild(talkWaveCanvas);
-        talkBtn.insertAdjacentText('beforeend', "Claude is responding... (tap to queue voice)");
+        talkLabel.textContent = "Responding... (tap to queue)";
+        talkLabel.className = "talk-label";
         talkBtn.className = "responding";
+        setWaveMode("responding");
+        startTalkWaveform("#c9a22799", null, null); // synthetic amber, brighter
         setHeaderState("responding", "Claude is responding...");
         updateInterruptBtn(pendingVoiceCount);
         break;
       case "speaking": {
-        talkBtn.innerHTML = '';
-        talkBtn.appendChild(talkWaveCanvas);
-        const spkLabel = document.createElement("span");
-        spkLabel.className = "talk-wave-label";
-        spkLabel.textContent = "Speaking... (tap to stop)";
-        talkBtn.appendChild(spkLabel);
+        talkLabel.textContent = "Speaking... (tap to stop)";
+        talkLabel.className = "talk-label talk-wave-label";
         talkBtn.className = "speaking";
+        setWaveMode("speaking");
         // TTS analyser may not exist yet — retry briefly until it's created
         const tryStartTtsWave = (attempts) => {
           if (ttsAnalyser && ttsDataArray) {
@@ -3084,15 +3195,17 @@
       }
       applyIdleState();
     } else if (state === "blank") {
-      talkBtn.textContent = "No speech detected";
+      talkLabel.textContent = "No speech detected";
       talkBtn.className = "";
+      setWaveMode("idle");
       setTimeout(() => setTalkState("idle"), 1500);
     } else if (state === "wake_no_match") {
       setTalkState("idle");
     } else if (state === "error") {
       setHeaderState("error", "Voice error");
-      talkBtn.textContent = "Error";
+      talkLabel.textContent = "Error";
       talkBtn.className = "";
+      setWaveMode("idle");
       setTimeout(() => setTalkState("idle"), 3000);
     }
   }
@@ -3505,7 +3618,7 @@
       console.error("Mic access failed:", err);
       // Show settings button in Electron, plain message in browser
       if (window.murmurElectron?.openMicSettings) {
-        talkBtn.textContent = "🎙 Open Mic Settings";
+        talkLabel.textContent = "🎙 Open Mic Settings";
         talkBtn.className = "";
         talkBtn.onclick = () => {
           window.murmurElectron.openMicSettings();
@@ -3514,7 +3627,7 @@
         };
         return; // Leave button clickable — don't auto-reset
       }
-      talkBtn.textContent = "Mic access denied";
+      talkLabel.textContent = "Mic access denied";
       talkBtn.className = "";
       setTimeout(() => setTalkState("idle"), 3000);
     }
@@ -3612,7 +3725,7 @@
     console.log(`[send] Sending ${blob.size} bytes to server (direct)` + (preBufferBlob ? ` + ${preBufferBlob.size} pre-buffer` : ""));
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       console.error("[send] WebSocket not connected!");
-      talkBtn.textContent = "Not connected";
+      talkLabel.textContent = "Not connected";
       setTimeout(() => setTalkState("idle"), 1500);
       return;
     }

@@ -1279,6 +1279,16 @@ function broadcastCurrentOutput() {
     partial: true,
   });
 
+  // Extract current tool call for status line (e.g. "⏺ Bash(npm test)" → "Bash · npm test")
+  const toolMatch = pane.match(/⏺\s+(\w+)\(([^)]{0,60})\)/);
+  if (toolMatch) {
+    const toolName = toolMatch[1];
+    const toolArg = toolMatch[2].trim().replace(/\s+/g, " ");
+    broadcast({ type: "tool_status", text: `${toolName} · ${toolArg}` });
+  } else {
+    broadcast({ type: "tool_status", text: "" });
+  }
+
   // Trigger TTS for completed speakable entries (not the last one, which may still be growing)
   const currentAssistant = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
   for (let i = 0; i < currentAssistant.length - 1; i++) {
@@ -1568,6 +1578,9 @@ function handleStreamDone() {
     entries: conversationEntries,
     partial: false,
   });
+
+  // Clear tool status line when stream completes
+  broadcast({ type: "tool_status", text: "" });
 
   const totalEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn).length;
   console.log(`[stream] Final: ${totalEntries} assistant entries (turn ${currentTurn})`);
