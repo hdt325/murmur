@@ -485,7 +485,7 @@
   /* Turn separator: very subtle on light bg */
   body.flow-mode .turn-separator { opacity: 0.15; border-color: rgba(26,26,30,0.3); }
 
-  /* Talk button: 3-col strip in flow mode */
+  /* Talk button: gear pinned left, mic centered */
   body.flow-mode .talk-bar {
     background: transparent;
     border-top: none;
@@ -493,29 +493,15 @@
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     display: flex;
     align-items: center;
-    gap: 16px;
+    justify-content: center;
+    position: relative;
   }
-  body.flow-mode .talk-bar #talkBtn {
-    flex: 1;
-    height: 72px;
-    max-width: 72px;
-    border-radius: 36px;
-    border-width: 1.5px;
-    border-color: rgba(26,26,30,0.12);
-    background: #ffffff;
-    box-shadow: 0 2px 20px rgba(26,26,30,0.08);
-    transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease;
-  }
-
-  /* Flow gear + stop: hidden outside flow mode.
-     Must beat .talk-bar button { display: flex } (specificity 0,0,1,1)
-     so use two-class selector (specificity 0,0,2,0) */
-  .talk-bar .flow-gear-btn, .talk-bar .flow-stop-pill { display: none; }
   body.flow-mode .flow-gear-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
+    position: absolute;
+    left: 20px;
     width: 44px;
     height: 44px;
     min-height: 44px;
@@ -526,7 +512,7 @@
     cursor: pointer;
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
-    transition: background 0.2s, color 0.2s, border-color 0.2s;
+    transition: background 0.2s, color 0.2s;
   }
   body.flow-mode .flow-gear-btn:hover,
   body.flow-mode .flow-gear-btn.active {
@@ -534,37 +520,30 @@
     color: rgba(26,26,30,0.8);
     border-color: rgba(26,26,30,0.22);
   }
-  body.flow-mode .flow-stop-pill {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    width: auto;
-    height: 44px;
-    min-height: 44px;
-    padding: 0 18px;
-    border-radius: 22px;
-    border: 1.5px solid rgba(231,76,60,0.28);
-    background: rgba(255,255,255,0.75);
-    color: rgba(231,76,60,0.65);
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.2px;
-    cursor: pointer;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    transition: background 0.2s, color 0.2s, border-color 0.2s;
+  body.flow-mode .talk-bar #talkBtn {
+    width: 72px;
+    height: 72px;
+    flex: none;
+    border-radius: 36px;
+    border-width: 1.5px;
+    border-color: rgba(26,26,30,0.12);
+    background: #ffffff;
+    box-shadow: 0 2px 20px rgba(26,26,30,0.08);
+    transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease, transform 0.15s ease;
   }
-  body.flow-mode .flow-stop-pill:hover {
-    background: rgba(231,76,60,0.08);
-    color: rgba(231,76,60,0.9);
-    border-color: rgba(231,76,60,0.5);
+  /* Long-press feedback */
+  body.flow-mode .talk-bar #talkBtn.flow-long-press {
+    transform: scale(0.88);
+    border-color: rgba(231,76,60,0.5) !important;
+    background: #fff5f5 !important;
   }
-  /* Hide all text labels in flow mode — just icon + waveform */
+
+  /* Gear: hidden outside flow mode (must beat .talk-bar button specificity) */
+  .talk-bar .flow-gear-btn { display: none; }
+  /* Hide all text labels and icon in flow mode — waveform is the only visual */
   body.flow-mode #talkLabel { display: none; }
   body.flow-mode #toolStatusLine { display: none; }
-  /* Show icon full opacity in flow mode */
-  body.flow-mode .murmur-icon { opacity: 0.25; }
+  body.flow-mode .murmur-icon { display: none; }
 
   /* Idle: gentle breathing */
   body.flow-mode .talk-bar button.idle-state {
@@ -1620,7 +1599,6 @@
     <span class="talk-label" id="talkLabel">Tap or press Right ⌘ to talk</span>
     <span class="tool-status-line" id="toolStatusLine"></span>
   </button>
-  <button id="flowStopPill" class="flow-stop-pill">Stop</button>
 </div>
 
 <!-- Flow Settings Sheet -->
@@ -1982,7 +1960,6 @@
   const flowExitBtn = document.getElementById("flowExitBtn");
   const flowLiveText = document.getElementById("flowLiveText");
   const flowGearBtn = document.getElementById("flowGearBtn");
-  const flowStopPill = document.getElementById("flowStopPill");
   const flowSettingsSheet = document.getElementById("flowSettingsSheet");
   const flowSettingsOverlay = document.getElementById("flowSettingsOverlay");
 
@@ -2042,14 +2019,32 @@
   flowGearBtn?.addEventListener("click", openFlowSettings);
   flowSettingsOverlay?.addEventListener("click", closeFlowSettings);
 
-  // Flow stop pill — same action as main stop button
-  flowStopPill?.addEventListener("click", () => {
-    idleFromTtsCompletion = false;
-    stopTtsPlayback();
-    if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
-    setTalkState("idle");
-    updateInterruptBtn(0);
+  // Long press on talkBtn in flow mode = hard interrupt Claude
+  let _flowLongPressTimer = null;
+  let _flowLongPressFired = false;
+  talkBtn.addEventListener("pointerdown", () => {
+    if (!document.body.classList.contains("flow-mode")) return;
+    _flowLongPressFired = false;
+    talkBtn.classList.remove("flow-long-press");
+    _flowLongPressTimer = setTimeout(() => {
+      _flowLongPressFired = true;
+      _flowLongPressTimer = null;
+      talkBtn.classList.add("flow-long-press");
+      setTimeout(() => talkBtn.classList.remove("flow-long-press"), 400);
+      // Hard interrupt
+      idleFromTtsCompletion = false;
+      stopTtsPlayback();
+      if (isRecording) stopRecording();
+      if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
+      setTalkState("idle");
+      updateInterruptBtn(0);
+    }, 500);
   });
+  const _cancelFlowLongPress = () => {
+    if (_flowLongPressTimer) { clearTimeout(_flowLongPressTimer); _flowLongPressTimer = null; }
+  };
+  talkBtn.addEventListener("pointerup", _cancelFlowLongPress);
+  talkBtn.addEventListener("pointercancel", _cancelFlowLongPress);
 
   // Voice pill selection
   document.getElementById("fssVoicePills")?.addEventListener("click", e => {
@@ -2944,7 +2939,19 @@
 
       // Server-driven TTS highlight — replaces client-side bubble guesswork
       if (msg.type === "tts_highlight") {
-        highlightEntry(msg.entryId);
+        // Store pending highlight; word animation starts when audio actually plays (source.start)
+        _pendingHighlightEntryId = msg.entryId;
+        _pendingHighlightSpeakableText = msg.speakableText || null;
+        // Clear previous highlights immediately
+        clearWordHighlight();
+        document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+          el.classList.remove("bubble-active");
+          el.classList.add("bubble-spoken");
+        });
+        // Non-flow mode: apply whole-bubble highlight right away
+        if (!document.body.classList.contains("flow-mode") && msg.entryId != null) {
+          highlightEntry(msg.entryId);
+        }
       }
 
       // Tool call status — show current tool during thinking/responding
@@ -3403,6 +3410,8 @@
   // Word-by-word TTS highlight (flow mode only)
   let _wordHighlightTimer = null;
   let _wordHighlightEl = null;
+  let _pendingHighlightEntryId = null;
+  let _pendingHighlightSpeakableText = null;
 
   function clearWordHighlight() {
     if (_wordHighlightTimer) { clearTimeout(_wordHighlightTimer); _wordHighlightTimer = null; }
@@ -3415,27 +3424,31 @@
     }
   }
 
-  function startWordHighlight(entryEl) {
+  // Called from source.start() with the exact speakable text and audio duration.
+  // Timing = durationMs / wordCount ms per word — perfectly synced to actual audio.
+  function startWordHighlight(entryEl, speakableText, durationMs) {
     clearWordHighlight();
     const textEl = entryEl.querySelector(".entry-text");
     if (!textEl) return;
-    // Wrap words in spans if not already done (use textContent to avoid wrapping HTML tags)
-    if (!textEl.dataset.wordsWrapped) {
+    // Use the speakable text from the server (clean prose, exactly what's spoken)
+    // not the raw entry text (which may contain URLs, markdown, etc.)
+    const text = speakableText || textEl.textContent || "";
+    if (!textEl.dataset.wordsWrapped || textEl.dataset.wordsText !== text) {
       textEl.dataset.wordsWrapped = "1";
-      const plain = textEl.textContent || "";
-      textEl.innerHTML = plain.replace(/(\S+)/g, '<span class="tts-word">$1</span>');
+      textEl.dataset.wordsText = text;
+      textEl.innerHTML = text.replace(/(\S+)/g, '<span class="tts-word">$1</span>');
     }
     const words = Array.from(textEl.querySelectorAll(".tts-word"));
     if (!words.length) return;
     _wordHighlightEl = entryEl;
-    // ~200ms per word ≈ 300 wpm — fast enough to feel live
+    const msPerWord = durationMs ? durationMs / words.length : 200;
     let idx = 0;
     const advance = () => {
       if (idx > 0) { words[idx - 1].classList.remove("tts-word-active"); words[idx - 1].classList.add("tts-word-spoken"); }
       if (idx < words.length) {
         words[idx].classList.add("tts-word-active");
         idx++;
-        _wordHighlightTimer = setTimeout(advance, 200);
+        _wordHighlightTimer = setTimeout(advance, msPerWord);
       } else {
         _wordHighlightTimer = null;
       }
@@ -3443,32 +3456,45 @@
     advance();
   }
 
-  // Server-driven TTS highlight — replaces client-side startBubbleHighlight/advance
+  // Trigger word highlight from audio start (called at source.start() with audio duration)
+  function onTtsAudioStart(durationMs) {
+    if (!document.body.classList.contains("flow-mode")) return;
+    if (_pendingHighlightEntryId == null) return;
+    const entryId = _pendingHighlightEntryId;
+    const speakableText = _pendingHighlightSpeakableText;
+    _pendingHighlightEntryId = null;
+    _pendingHighlightSpeakableText = null;
+    const apply = (retries) => {
+      const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
+      if (el) {
+        startWordHighlight(el, speakableText, durationMs);
+        // Scroll to entry
+        const cR = transcript.getBoundingClientRect();
+        const eR = el.getBoundingClientRect();
+        transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 32), behavior: "smooth" });
+      } else if (retries > 0) {
+        setTimeout(() => apply(retries - 1), 50);
+      }
+    };
+    apply(10);
+  }
+
+  // Server-driven TTS highlight (non-flow mode only — flow mode uses onTtsAudioStart)
   function highlightEntry(entryId) {
-    // Clear word highlights and whole-bubble highlights
-    clearWordHighlight();
+    if (document.body.classList.contains("flow-mode")) return; // handled by onTtsAudioStart
     document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
       el.classList.remove("bubble-active");
       el.classList.add("bubble-spoken");
     });
-
     if (entryId != null) {
       const apply = (retries) => {
         const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
         if (el) {
-          const inFlow = document.body.classList.contains("flow-mode");
-          if (inFlow && el.classList.contains("assistant")) {
-            startWordHighlight(el);
-          } else {
-            el.classList.add("bubble-active");
-            el.classList.remove("bubble-spoken");
-          }
-          // Scroll so the entry appears near the top of the transcript
-          const containerRect = transcript.getBoundingClientRect();
-          const elRect = el.getBoundingClientRect();
-          const elRelTop = elRect.top - containerRect.top + transcript.scrollTop;
-          const targetScroll = elRelTop - 32;
-          transcript.scrollTo({ top: Math.max(0, targetScroll), behavior: "smooth" });
+          el.classList.add("bubble-active");
+          el.classList.remove("bubble-spoken");
+          const cR = transcript.getBoundingClientRect();
+          const eR = el.getBoundingClientRect();
+          transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 32), behavior: "smooth" });
         } else if (retries > 0) {
           setTimeout(() => apply(retries - 1), 50);
         }
@@ -4297,6 +4323,7 @@
           }, Math.min(duration, 120000));
 
           source.start(0);
+          onTtsAudioStart(audioBuffer.duration * 1000); // Start word highlight synced to audio
           _msUpdate(true, null); // Signal iOS lock screen: playing
           rlog(`[tts] Playing via Web Audio API (${audioBuffer.duration.toFixed(1)}s)`);
         });
@@ -4515,12 +4542,14 @@
 
   // Talk button click
   talkBtn.addEventListener("click", () => {
+    // Suppress click if long press just fired
+    if (_flowLongPressFired) { _flowLongPressFired = false; return; }
     _startBgAudioSession(); // Start iOS background audio session on first user gesture
 
-    // If Claude is speaking: stop TTS
+    // If Claude is speaking: stop TTS audio only (tap = polite stop, not interrupt)
+    // Long press (500ms) = hard interrupt that kills Claude's response entirely
     if (talkBtn.classList.contains("speaking")) {
       stopTtsPlayback();
-      if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
       setTalkState("idle");
       removeThinkingBubble();
       return;

@@ -404,9 +404,10 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     ttsEntryIdQueue = [];
   }
 
-  // Broadcast highlight for the entry we're about to speak
+  // Broadcast highlight + speakable text for the entry we're about to speak.
+  // The client uses the speakable text (not raw entry text) for word-by-word highlighting.
   if (currentTtsEntryId != null) {
-    broadcast({ type: "tts_highlight", entryId: currentTtsEntryId });
+    broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: text });
   }
 
   // Cancel any current TTS (generation counter ensures old callbacks are discarded)
