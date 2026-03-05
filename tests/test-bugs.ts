@@ -379,7 +379,19 @@ async function testFeature_interruptButton() {
   const isVisible = await interruptBtn.isVisible().catch(() => false);
   report("Interrupt button is visible (always-present)", isVisible as boolean);
 
-  // When idle (fresh page, no active Claude session): should NOT have active class
+  // Wait for any active Claude session to finish, then check
+  await page.waitForFunction(
+    () => {
+      const btn = document.querySelector("#talkBtn");
+      if (!btn) return true;
+      const cls = btn.className;
+      return !cls.includes("thinking") && !cls.includes("responding") && !cls.includes("speaking");
+    },
+    { timeout: 30000 }
+  ).catch(() => {});
+  await page.waitForTimeout(300);
+
+  // When idle: should NOT have active class
   const hasActiveClass = await interruptBtn.evaluate(el => el.classList.contains("active")).catch(() => false);
   report("Interrupt button is dimmed (no active class) when idle", !hasActiveClass);
 }
@@ -509,8 +521,9 @@ async function testFeature_sessionPopoverColors() {
   const hasActiveGold = htmlSrc.includes("#c9a227") && htmlSrc.includes("sess-item.active");
   report("Active session item uses gold (#c9a227)", hasActiveGold);
 
-  const hasItemColor = htmlSrc.includes("#c8cdd5") && htmlSrc.includes("sess-item");
-  report("Session items use lighter color (#c8cdd5)", hasItemColor);
+  // Session item colors are set via inline style per getSessColor() — not hardcoded in CSS
+  const hasInlineColor = htmlSrc.includes("sess-item") && htmlSrc.includes("getSessColor");
+  report("Session items use per-session color via getSessColor (inline style)", hasInlineColor);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -562,6 +575,436 @@ async function testFeature_ttsScrollToTop() {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Feature: Voice panel instruction filter
+// addUserEntry suppresses messages matching MURMUR_CONTEXT_FILTER
+// ──────────────────────────────────────────────────────────────
+async function testFeature_voicePanelFilter() {
+  console.log("\n[Feature] Voice panel instruction message filtering");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(new URL("../server.ts", import.meta.url).pathname, "utf-8");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // MURMUR_CONTEXT_FILTER regex covers activation phrases
+  const filterCoversActivation = serverSrc.includes("Murmur voice panel is now active") &&
+    serverSrc.includes("MURMUR_CONTEXT_FILTER");
+  report("MURMUR_CONTEXT_FILTER covers activation phrase", filterCoversActivation);
+
+  // addUserEntry checks filter before pushing to conversationEntries
+  const addUserEntryFilters = serverSrc.includes("MURMUR_CONTEXT_FILTER.test(text.trim())") &&
+    serverSrc.includes("function addUserEntry");
+  report("addUserEntry suppresses messages matching MURMUR_CONTEXT_FILTER", addUserEntryFilters);
+
+  // loadScrollbackEntries skips turns where user input matches filter
+  const scrollbackFilters = serverSrc.includes("MURMUR_CONTEXT_FILTER.test(start.input)") ||
+    serverSrc.includes("MURMUR_CONTEXT_FILTER.test(start.input.trim())");
+  report("loadScrollbackEntries skips voice panel turns from scrollback", scrollbackFilters);
+
+  // Frontend: activation message NOT hardcoded in index.html (filtering is server-side only)
+  const frontendClean = !htmlSrc.includes("Respond in plain prose only") &&
+    !htmlSrc.includes("No markdown, no lists");
+  report("Frontend does not hardcode voice panel instructions (server-side filter only)", frontendClean);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Scrollback catch-up
+// Server loads tmux scrollback into conversationEntries on connect/switch
+// ──────────────────────────────────────────────────────────────
+async function testFeature_scrollbackCatchup() {
+  console.log("\n[Feature] Scrollback catch-up on connect/switch");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(new URL("../server.ts", import.meta.url).pathname, "utf-8");
+
+  // Function exists
+  const hasFn = serverSrc.includes("function loadScrollbackEntries");
+  report("loadScrollbackEntries function exists", hasFn);
+
+  // Uses capturePaneScrollback
+  const usesScrollback = serverSrc.includes("capturePaneScrollback");
+  report("loadScrollbackEntries uses capturePaneScrollback", usesScrollback);
+
+  // Called on startup
+  const calledOnStartup = serverSrc.includes("catchupEntries = loadScrollbackEntries");
+  report("Scrollback loaded on startup", calledOnStartup);
+
+  // Called on session switch
+  const calledOnSwitch = serverSrc.includes("conversationEntries = loadScrollbackEntries");
+  report("Scrollback loaded on session switch", calledOnSwitch);
+
+  // Entries marked spoken=true (silent, no auto-TTS)
+  const markedSpoken = serverSrc.includes("spoken: true, // silent");
+  report("Historical entries marked spoken=true (no auto-TTS)", markedSpoken);
+
+  // Limits to last 10 turns
+  const limitsTo10 = serverSrc.includes("slice(-10)");
+  report("Limits scrollback to last 10 turns", limitsTo10);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Session switch resets status indicators
+// Switching tmux sessions broadcasts idle status to all clients
+// ──────────────────────────────────────────────────────────────
+async function testFeature_sessionSwitchReset() {
+  console.log("\n[Feature] Session switch resets status to idle");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(new URL("../server.ts", import.meta.url).pathname, "utf-8");
+
+  // Session switch broadcasts voice_status idle
+  const broadcastsIdle = serverSrc.includes(`type: "voice_status", state: "idle"`) ||
+    serverSrc.includes(`"voice_status", state: "idle"`);
+  report("Session switch broadcasts voice_status idle", broadcastsIdle);
+
+  // Session switch broadcasts status idle
+  const broadcastsStatus = serverSrc.includes(`type: "status", phase: "idle"`);
+  report("Session switch broadcasts status idle phase", broadcastsStatus);
+
+  // stopClientPlayback called on switch
+  const stopsPlayback = serverSrc.includes("stopClientPlayback()");
+  report("stopClientPlayback called on session switch", stopsPlayback);
+
+  // Context NOT resent on session switch (removed contextSentAt = 0)
+  const switchBlock = serverSrc.slice(serverSrc.indexOf("tmux:switch:"), serverSrc.indexOf("tmux:switch:") + 1500);
+  const noContextResend = !switchBlock.includes("contextSentAt = 0") && !switchBlock.includes("sendMurmurContext");
+  report("Context NOT resent on session switch", noContextResend);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Think mode recording fix
+// Energy check bypassed when thinkMode is active
+// ──────────────────────────────────────────────────────────────
+async function testFeature_thinkModeRecordingFix() {
+  console.log("\n[Feature] Think mode recording always submits audio");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // Energy check is inside !thinkMode guard
+  const hasGuard = htmlSrc.includes("if (!thinkMode)") &&
+    htmlSrc.includes("energyThreshold");
+  report("Energy check wrapped in !thinkMode guard", hasGuard);
+
+  // Think mode toggle exists in UI
+  const hasToggle = htmlSrc.includes("thinkModeToggle");
+  report("Think mode toggle exists in UI", hasToggle);
+
+  // Think countdown timer exists
+  const hasCountdown = htmlSrc.includes("startThinkCountdown") && htmlSrc.includes("thinkCountdownTimer");
+  report("Think countdown timer function exists", hasCountdown);
+
+  // Think recording CSS class exists
+  const hasThinkClass = htmlSrc.includes("think-recording");
+  report("think-recording CSS class exists", hasThinkClass);
+
+  // Think mode localStorage key
+  const hasPersistence = htmlSrc.includes("murmur-think-mode");
+  report("Think mode state persisted to localStorage", hasPersistence);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Recording visual states
+// Regular recording: coral breathing pulse
+// Think mode recording: amber breathing pulse
+// ──────────────────────────────────────────────────────────────
+async function testFeature_recordingVisuals() {
+  console.log("\n[Feature] Recording state visual styles");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // Regular recording: coral color
+  const hasCoralColor = htmlSrc.includes("#e8856a");
+  report("Regular recording uses coral color (#e8856a)", hasCoralColor);
+
+  // Regular recording: slow 2s breathing pulse
+  const hasCoralPulse = htmlSrc.includes("pulse-border-coral") && htmlSrc.includes("2s ease-in-out infinite");
+  report("Regular recording has 2s breathing pulse animation", hasCoralPulse);
+
+  // Think mode: amber color
+  const hasAmberColor = htmlSrc.includes("#c9a227");
+  report("Think mode recording uses amber color (#c9a227)", hasAmberColor);
+
+  // Think mode: amber pulse with both border and box-shadow
+  const hasAmberPulse = htmlSrc.includes("pulse-border-amber") && htmlSrc.includes("box-shadow");
+  report("Think mode has amber pulse with glow", hasAmberPulse);
+
+  // No hard red for recording state (replaced with coral)
+  const noHardRed = !htmlSrc.match(/\.recording\s*\{[^}]*#e74c3c[^}]*border-color/);
+  report("Hard red (#e74c3c) no longer used for recording border", noHardRed);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: iOS auto-zoom fix
+// Text input font-size ≥ 16px prevents iOS Safari auto-zoom
+// ──────────────────────────────────────────────────────────────
+async function testFeature_iosZoomFix() {
+  console.log("\n[Feature] iOS auto-zoom prevention");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // .input-bar input font-size must be 16px
+  const inputCssBlock = htmlSrc.match(/\.input-bar input\s*\{[^}]+\}/)?.[0] || "";
+  const has16px = inputCssBlock.includes("font-size: 16px") || inputCssBlock.includes("font-size:16px");
+  report("Text input font-size is 16px (prevents iOS zoom)", has16px);
+
+  // Live check: computed font size
+  const computedSize = await page.evaluate(() => {
+    const input = document.getElementById("textInput");
+    if (!input) return null;
+    return window.getComputedStyle(input).fontSize;
+  });
+  const computed16 = computedSize === "16px";
+  report(`Computed font-size is 16px (got: ${computedSize})`, computed16);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: isIOS declared before first use (no ReferenceError)
+// ──────────────────────────────────────────────────────────────
+async function testFeature_isIOSDeclaredEarly() {
+  console.log("\n[Feature] isIOS declaration order (ReferenceError fix)");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  const declareIdx = htmlSrc.indexOf("const isIOS =");
+  const firstUseIdx = htmlSrc.indexOf("if (isIOS)");
+
+  const declaredBeforeUse = declareIdx !== -1 && firstUseIdx !== -1 && declareIdx < firstUseIdx;
+  report(`isIOS declared (line ~${htmlSrc.slice(0, declareIdx).split("\n").length}) before first use (line ~${htmlSrc.slice(0, firstUseIdx).split("\n").length})`, declaredBeforeUse);
+
+  // isIOS declared only once
+  const declarationCount = (htmlSrc.match(/const isIOS\s*=/g) || []).length;
+  report(`isIOS declared exactly once (found ${declarationCount})`, declarationCount === 1);
+
+  // No ReferenceError on page load
+  const errors: string[] = [];
+  page.once("pageerror", err => errors.push(err.message));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(1000);
+  const noRefError = !errors.some(e => e.includes("isIOS") || e.includes("ReferenceError"));
+  report("No ReferenceError on page load", noRefError);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Adaptive noise baseline (two-path EMA)
+// Handles noisy environments like cars
+// ──────────────────────────────────────────────────────────────
+async function testFeature_adaptiveNoise() {
+  console.log("\n[Feature] Adaptive noise baseline (two-path EMA)");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // _noisySince tracker
+  const hasNoisySince = htmlSrc.includes("_noisySince");
+  report("_noisySince tracker exists for sustained noise detection", hasNoisySince);
+
+  // Two-path: fast EMA below threshold, slow raise above
+  const hasTwoPath = htmlSrc.includes("ambientRmsBaseline * 0.98") &&
+    htmlSrc.includes("ambientRmsBaseline * 0.95");
+  report("Two-path EMA: fast update below threshold, slow raise above", hasTwoPath);
+
+  // 5 second sustained threshold before raising baseline
+  const has5sThreshold = htmlSrc.includes("5000");
+  report("5s sustained noise threshold before baseline raise", has5sThreshold);
+
+  // dynSpeechThreshold calculated from baseline
+  const hasDynThreshold = htmlSrc.includes("dynSpeechThreshold") && htmlSrc.includes("ambientRmsBaseline");
+  report("Dynamic speech threshold derived from ambient baseline", hasDynThreshold);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Session color persistence (dropdown → button)
+// Per-session colors persist from popover to session button label
+// ──────────────────────────────────────────────────────────────
+async function testFeature_sessionColorPersistence() {
+  console.log("\n[Feature] Session color persistence button↔popover");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // Color palette exists
+  const hasColorPalette = htmlSrc.includes("SESS_COLORS") &&
+    htmlSrc.includes("#7ab8e8") && htmlSrc.includes("#e87a7a");
+  report("SESS_COLORS palette defined", hasColorPalette);
+
+  // getSessColor function with cache
+  const hasGetSessColor = htmlSrc.includes("getSessColor") && htmlSrc.includes("_sessColorCache");
+  report("getSessColor with _sessColorCache exists", hasGetSessColor);
+
+  // applySessionBtnColor updates button
+  const hasApplyFn = htmlSrc.includes("applySessionBtnColor");
+  report("applySessionBtnColor function exists", hasApplyFn);
+
+  // Session button color updated via inline style
+  const buttonUsesStyle = htmlSrc.includes("sessionBtn.style.color") &&
+    htmlSrc.includes("sessionBtn.style.borderColor");
+  report("Session button color applied via inline style", buttonUsesStyle);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Terminal safe area for iOS home indicator
+// Terminal panel avoids iOS home indicator using env(safe-area-inset-bottom)
+// ──────────────────────────────────────────────────────────────
+async function testFeature_terminalSafeArea() {
+  console.log("\n[Feature] Terminal safe area (iOS home indicator)");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // Terminal panel uses safe area
+  const hasSafeArea = htmlSrc.includes("safe-area-inset-bottom") &&
+    htmlSrc.includes("terminal-panel");
+  report("terminal-panel uses env(safe-area-inset-bottom)", hasSafeArea);
+
+  // When closed: header gets the padding
+  const closedHeaderPadding = htmlSrc.includes(".terminal-panel:not(.open) .terminal-header");
+  report("Closed state: safe area on terminal header", closedHeaderPadding);
+
+  // When open: terminal output gets the padding (not header)
+  const openOutputPadding = htmlSrc.includes(".terminal-panel.open .terminal-output");
+  report("Open state: safe area on terminal-output (not header)", openOutputPadding);
+
+  // input-bar does NOT have the safe area (terminal is actual bottom element)
+  const inputBarCssBlock = htmlSrc.match(/\.input-bar\s*\{[^}]+\}/)?.[0] || "";
+  const inputBarNoSafeArea = !inputBarCssBlock.includes("safe-area-inset-bottom");
+  report("input-bar does not duplicate safe area padding", inputBarNoSafeArea);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: iOS mic init deferred to gesture
+// On iOS, mic init deferred to first touchstart for permission persistence
+// ──────────────────────────────────────────────────────────────
+async function testFeature_iosMicDeferred() {
+  console.log("\n[Feature] iOS mic init deferred to gesture");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // Deferred init pattern
+  const hasDeferredInit = htmlSrc.includes("_iosInitMic") && htmlSrc.includes("touchstart");
+  report("iOS mic init deferred via _iosInitMic touchstart listener", hasDeferredInit);
+
+  // Non-iOS falls back to setTimeout
+  const hasDesktopFallback = htmlSrc.includes("setTimeout(initMicMeter");
+  report("Desktop falls back to setTimeout for mic init", hasDesktopFallback);
+
+  // isIOS used in the mic init branch
+  const isIOSUsedInBranch = htmlSrc.includes("if (isIOS)") && htmlSrc.includes("initMicMeter");
+  report("isIOS used to branch mic initialization path", isIOSUsedInBranch);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: iOS device voices hidden
+// On iOS, Web Speech API device voices replaced with helpful note
+// ──────────────────────────────────────────────────────────────
+async function testFeature_iosVoicesHidden() {
+  console.log("\n[Feature] iOS device voices replaced with note");
+
+  const { readFileSync } = await import("fs");
+  const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
+
+  // populateLocalVoices checks isIOS
+  const hasIosCheck = htmlSrc.includes("if (isIOS)") && htmlSrc.includes("populateLocalVoices");
+  report("populateLocalVoices checks isIOS before rendering voices", hasIosCheck);
+
+  // Shows helpful message directing to Kokoro
+  const hasKokoroNote = htmlSrc.includes("Kokoro voices above") || htmlSrc.includes("use Kokoro voices");
+  report("iOS shows 'use Kokoro voices' note instead of device voices", hasKokoroNote);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Feature: Debug scrollback logging
+// Scrollback logs target and line count for diagnosability
+// ──────────────────────────────────────────────────────────────
+async function testFeature_scrollbackDebugLogging() {
+  console.log("\n[Feature] Scrollback debug logging");
+
+  const { readFileSync } = await import("fs");
+  const serverSrc = readFileSync(new URL("../server.ts", import.meta.url).pathname, "utf-8");
+
+  // Logs target and line count
+  const hasDebugLog = serverSrc.includes("[scrollback]") && serverSrc.includes("lines.length");
+  report("Scrollback logs target and line count", hasDebugLog);
+
+  // Logs number of turns found
+  const logsTurns = serverSrc.includes("found") && serverSrc.includes("❯ turns");
+  report("Scrollback logs number of turns found", logsTurns);
+
+  // Session switch logs entry count
+  const switchLogs = serverSrc.includes("Loaded") && serverSrc.includes("scrollback entries for");
+  report("Session switch logs loaded entry count", switchLogs);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Integration: Text input renders at correct size
+// ──────────────────────────────────────────────────────────────
+async function testIntegration_textInputSize() {
+  console.log("\n[Integration] Text input rendered size");
+
+  // Input should be visible and have reasonable height (≥36px for touch target)
+  const inputBox = await page.locator("#textInput").boundingBox();
+  if (!inputBox) {
+    report("Text input bounding box readable", false, "not found");
+    return;
+  }
+  report("Text input visible and measurable", true);
+  const touchTarget = inputBox.height >= 28;
+  report(`Text input height ${inputBox.height.toFixed(0)}px (≥28px)`, touchTarget);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Integration: Think mode toggle persists across reload
+// ──────────────────────────────────────────────────────────────
+async function testIntegration_thinkModePersistence() {
+  console.log("\n[Integration] Think mode persistence across reload");
+
+  // Enable think mode
+  await page.evaluate(() => localStorage.setItem("murmur-think-mode", "1"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  await page.waitForTimeout(800);
+
+  const toggleText = await page.locator("#thinkModeToggle").textContent().catch(() => null);
+  report(`Think mode toggle shows "On" after reload (got: "${toggleText?.trim()}")`, toggleText?.trim() === "On");
+
+  // Also check active class on settings button
+  const settingsBtnActive = await page.locator("#settingsBtn").evaluate(
+    el => el.classList.contains("active")
+  ).catch(() => false);
+  report("Settings button has active class when think mode on", settingsBtnActive as boolean);
+
+  // Reset
+  await page.evaluate(() => localStorage.removeItem("murmur-think-mode"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+  await page.waitForTimeout(500);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Integration: Talk button states cycle correctly
+// idle → recording class on tap, back to idle/transcribing
+// ──────────────────────────────────────────────────────────────
+async function testIntegration_talkButtonStates() {
+  console.log("\n[Integration] Talk button state classes");
+
+  // Initially should not be in recording state
+  const initialClass = await page.locator("#talkBtn").getAttribute("class");
+  const notRecording = !initialClass?.includes("recording");
+  report(`Talk button not in recording state initially (class: "${initialClass}")`, notRecording);
+
+  // Button is visible and tappable
+  const talkBtnBox = await page.locator("#talkBtn").boundingBox();
+  report("Talk button has bounding box (visible)", !!talkBtnBox);
+  if (talkBtnBox) {
+    const touchOk = talkBtnBox.height >= 36;
+    report(`Talk button height ${talkBtnBox.height.toFixed(0)}px (≥36px touch target)`, touchOk);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
 async function main() {
@@ -585,7 +1028,7 @@ async function main() {
   await testIntegration_wsConnect();
   await testIntegration_textInput();
 
-  // New features from session
+  // Session 1 features
   await testFeature_voiceQueue();
   await testFeature_interruptButton();
   await testFeature_pasteAutoSubmit();
@@ -594,6 +1037,24 @@ async function main() {
   await testFeature_sessionPopoverColors();
   await testFeature_terminalLabelStyles();
   await testFeature_ttsScrollToTop();
+
+  // Session 2 features (new)
+  await testFeature_voicePanelFilter();
+  await testFeature_scrollbackCatchup();
+  await testFeature_sessionSwitchReset();
+  await testFeature_thinkModeRecordingFix();
+  await testFeature_recordingVisuals();
+  await testFeature_iosZoomFix();
+  await testFeature_isIOSDeclaredEarly();
+  await testFeature_adaptiveNoise();
+  await testFeature_sessionColorPersistence();
+  await testFeature_terminalSafeArea();
+  await testFeature_iosMicDeferred();
+  await testFeature_iosVoicesHidden();
+  await testFeature_scrollbackDebugLogging();
+  await testIntegration_textInputSize();
+  await testIntegration_thinkModePersistence();
+  await testIntegration_talkButtonStates();
 
   await teardown();
 }

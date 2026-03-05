@@ -221,21 +221,20 @@ const MURMUR_CONTEXT_LINES = [
 // Regex to filter leaked context lines from tmux-wrapped continuation (❯ line is already filtered)
 const MURMUR_CONTEXT_FILTER = /^(Murmur voice panel is now active|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these)/i;
 
-let contextSentAt = 0;
+let contextSent = false; // Send once per server instance — no repeated injection on reconnect
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
 let _isSystemContext = false; // true while system context is being sent — suppresses entry creation
 function sendMurmurContext(delayMs = 2000) {
-  // Debounce: only send once per 30s, cancel pending timers
-  if (Date.now() - contextSentAt < 30000) return;
+  if (contextSent) return; // Already sent this server run — don't repeat
   if (contextTimer) clearTimeout(contextTimer);
   contextTimer = setTimeout(() => {
     contextTimer = null;
-    if (Date.now() - contextSentAt < 30000) return;
+    if (contextSent) return;
     if (terminal.isSessionAlive()) {
       _isSystemContext = true;
       terminal.sendText(MURMUR_CONTEXT_LINES.join(" "));
-      contextSentAt = Date.now();
-      console.log("[context] Sent Murmur system context to Claude (suppressed from UI)");
+      contextSent = true;
+      console.log("[context] Sent Murmur system context to Claude (once per server run)");
       broadcast({ type: "context_sent" });
     }
   }, delayMs);
@@ -2224,11 +2223,7 @@ function handleWsConnection(ws: WebSocket) {
     setAudioClient(ws, "new-client");
   }
 
-  // First real (non-test) client connecting — send context (30s debounce built into sendMurmurContext)
-  // Test clients send "test:client" as their first message to skip context/exit
-  if (wasEmpty && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
-    sendMurmurContext();
-  }
+  // Context is sent once at server startup — no per-connection resend
 
   // Send current state
   ws.send(JSON.stringify({ type: "status", ...vmState }));
@@ -3071,7 +3066,7 @@ function handleWsConnection(ws: WebSocket) {
         // Only send if still no clients and not sent recently (30s debounce)
         if (clients.size === 0 && Date.now() - exitSentAt > 30000) {
           terminal.sendText(MURMUR_EXIT);
-          contextSentAt = 0; // Reset so next app open resends context
+          contextSent = false; // Allow context resend if server restarts fresh
           exitSentAt = Date.now();
           console.log("[context] Sent Murmur exit message to Claude");
         }

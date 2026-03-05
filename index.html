@@ -535,6 +535,14 @@
   }
   .talk-bar button.idle-state.mode-text .talk-idle-hint { color: #777; }
 
+  /* Think mode idle: amber tint so user always knows they're in think mode */
+  .talk-bar button.idle-state.think-mode {
+    border-color: #c9a22766;
+    background: rgba(201, 162, 39, 0.07);
+  }
+  .talk-bar button.idle-state.think-mode .talk-idle-hint { color: #c9a227; }
+  .talk-bar button.idle-state.think-mode .murmur-icon { filter: sepia(1) saturate(3) hue-rotate(10deg); opacity: 0.15; }
+
   .talk-idle-hint {
     font-size: 11px;
     color: #666;
@@ -652,10 +660,19 @@
 
   .controls button.stop { border-color: #333338; color: #e74c3c; font-size: 9px; }
   .controls button.stop:hover { background: #e74c3c22; border-color: #e74c3c88; }
-  .controls button.interrupt-btn { border-color: #222225; color: #444; font-size: 12px; cursor: default; }
+  .controls button.interrupt-btn { border-color: #222225; color: #444; font-size: 12px; cursor: pointer; }
   .controls button.interrupt-btn.active { border-color: #333338; color: #f39c12; cursor: pointer; }
   .controls button.interrupt-btn.active:hover { background: #f39c1222; border-color: #f39c1288; }
   .controls button.interrupt-btn.has-queue { color: #e67e22; border-color: #e67e2266; cursor: pointer; }
+  /* Armed mode: persistent amber glow — new input will auto-interrupt Claude */
+  .controls button.interrupt-btn.armed {
+    border-color: #c9a22799;
+    color: #c9a227;
+    background: rgba(201, 162, 39, 0.08);
+    cursor: pointer;
+    animation: pulse-border-amber 2s ease-in-out infinite;
+  }
+  .controls button.interrupt-btn.armed:hover { background: rgba(201, 162, 39, 0.16); }
 
   .controls button.mute-btn { color: #e74c3c; width: 28px; padding: 0; }
   .controls button.mute-btn svg { display: block; }
@@ -2766,13 +2783,14 @@
         } else if (mode.id === "listen") {
           hint.textContent = "Read mode — voice in, text out";
         } else {
-          hint.textContent = "Tap or press Right ⌘ to talk";
+          hint.textContent = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
         }
         talkBtn.appendChild(hint);
         talkBtn.className = "idle-state";
         if (mode.id === "listen") talkBtn.classList.add("mode-read");
         if (mode.id === "type") talkBtn.classList.add("mode-type");
         if (mode.id === "text") talkBtn.classList.add("mode-text");
+        if (thinkMode) talkBtn.classList.add("think-mode");
         talkBtn.setAttribute("data-tip", mode.tip);
         setHeaderState("ready", mode.id === "type" ? "Type mode" : "Ready");
         // Show subtle mic level on idle button (red palette, low opacity)
@@ -2908,13 +2926,25 @@
   // =============================================
   let pendingVoiceCount = 0;
 
+  // Interrupt-mode toggle: when armed, any new input auto-interrupts Claude instead of queuing
+  let interruptArmed = localStorage.getItem("murmur-interrupt-armed") === "1";
+  function applyInterruptArmed() {
+    interruptBtn.classList.toggle("armed", interruptArmed);
+    interruptBtn.setAttribute("data-tip", interruptArmed
+      ? "Auto-interrupt ON — new input interrupts Claude (tap to disarm)"
+      : "Interrupt mode off — tap to arm (new input will interrupt instead of queue)");
+  }
+  applyInterruptArmed();
+
   function updateInterruptBtn(count) {
     pendingVoiceCount = count;
     const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
     const enabled = isActive || count > 0;
-    interruptBtn.classList.toggle("active", enabled);
-    interruptBtn.classList.toggle("has-queue", count > 0);
-    interruptBtn.setAttribute("data-tip", enabled ? (count > 0 ? "Interrupt Claude & send queued voice" : "Interrupt Claude") : "Interrupt (inactive)");
+    interruptBtn.classList.toggle("active", enabled && !interruptArmed);
+    interruptBtn.classList.toggle("has-queue", count > 0 && !interruptArmed);
+    if (!interruptArmed) {
+      interruptBtn.setAttribute("data-tip", enabled ? (count > 0 ? "Interrupt Claude & send queued voice" : "Interrupt Claude") : "Interrupt mode off — tap to arm");
+    }
   }
 
   // =============================================
@@ -2929,9 +2959,18 @@
   });
 
   interruptBtn.addEventListener("click", () => {
-    if (!interruptBtn.classList.contains("active")) return;
-    if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
-    stopTtsPlayback();
+    const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
+    if (isActive) {
+      // Claude is active — immediate interrupt regardless of armed state
+      if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
+      stopTtsPlayback();
+    } else {
+      // Claude idle — toggle armed mode
+      interruptArmed = !interruptArmed;
+      localStorage.setItem("murmur-interrupt-armed", interruptArmed ? "1" : "0");
+      applyInterruptArmed();
+      updateInterruptBtn(pendingVoiceCount);
+    }
   });
 
   muteBtn.addEventListener("click", () => {
@@ -3012,6 +3051,16 @@
     settingsPopover.querySelectorAll(".sopt").forEach(btn => {
       btn.classList.toggle("selected", parseInt(btn.dataset.secs) === thinkTimeout);
     });
+    // Update talk button immediately if currently in idle state
+    if (talkBtn.classList.contains("idle-state")) {
+      talkBtn.classList.toggle("think-mode", thinkMode);
+      const hint = talkBtn.querySelector(".talk-idle-hint");
+      if (hint && !talkBtn.classList.contains("mode-type") &&
+          !talkBtn.classList.contains("mode-text") &&
+          !talkBtn.classList.contains("mode-read")) {
+        hint.textContent = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
+      }
+    }
   }
   applyThinkModeUI();
 
@@ -3389,6 +3438,12 @@
       talkBtn.textContent = "Not connected";
       setTimeout(() => setTalkState("idle"), 1500);
       return;
+    }
+    // If interrupt-armed and Claude is active, interrupt before sending audio
+    const claudeActiveNow = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
+    if (interruptArmed && claudeActiveNow) {
+      ws.send("stop");
+      stopTtsPlayback();
     }
     if (preBufferBlob) {
       // Signal pre-buffer, then send WAV pre-buffer, then main WebM audio
@@ -4216,6 +4271,12 @@
     const text = terminalInput.value.trim();
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
     _startBgAudioSession(); // Activate iOS background audio on text submit too
+    // If interrupt-armed and Claude is active, interrupt first then send
+    const claudeActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
+    if (interruptArmed && claudeActive) {
+      ws.send("stop"); // Interrupt + clear queue
+      stopTtsPlayback();
+    }
     ws.send("text:" + text);
     terminalInput.value = "";
   }
