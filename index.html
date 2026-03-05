@@ -3188,7 +3188,7 @@
   let silenceTimer = null;
   let silenceStart = 0;
   const SILENCE_THRESHOLD_MIN = 0.010;  // Hard floor — dynamic threshold applied at runtime
-  const SILENCE_DURATION = 1500;
+  const SILENCE_DURATION = 800;  // ms of silence before auto-stop (was 1500)
   const MIN_RECORDING_MS = 500;
   let recordingStartTime = 0;
 

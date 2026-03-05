@@ -341,23 +341,11 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
   }
 
   const uid = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  // Write audio directly — no ffmpeg normalization step.
+  // Whisper (ggml-small + CoreML) handles un-normalized webm/wav input fine.
+  // Removing loudnorm saves 1-3s of blocking ffmpeg execution per transcription.
   const tmpFile = join(TEMP_DIR, `murmur-audio-${uid}.webm`);
-  const normalizedFile = join(TEMP_DIR, `murmur-audio-${uid}-norm.wav`);
   writeFileSync(tmpFile, audioData);
-
-  // Normalize audio volume with ffmpeg before transcription
-  // loudnorm filter boosts quiet speech to a consistent level
-  try {
-    execSync(
-      `ffmpeg -y -i "${tmpFile}" -af "loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=80,lowpass=f=8000" -ar 16000 -ac 1 "${normalizedFile}"`,
-      { stdio: "ignore", timeout: 10000 }
-    );
-    console.log("[stt] Audio normalized for transcription");
-  } catch (err) {
-    console.warn("[stt] ffmpeg normalization failed, using raw audio:", (err as Error).message);
-    // Fall back to raw file
-    try { writeFileSync(normalizedFile, audioData); } catch {}
-  }
 
   try {
     plog("transcribe_start");
@@ -368,7 +356,7 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     const STT_PROMPT = "Claude, Murmur, tmux, TypeScript, JavaScript, npm, npx, Python, Git, terminal, code, function, variable, component, server, error, install, run, test, stop, yes, no, okay.";
     const result = execSync(
       `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
-        `-F "file=@${normalizedFile}" -F "model=whisper-1" -F "language=en" -F "prompt=${STT_PROMPT}"`,
+        `-F "file=@${tmpFile}" -F "model=whisper-1" -F "language=en" -F "prompt=${STT_PROMPT}"`,
       { encoding: "utf-8", timeout: 10000 }
     );
     const json = JSON.parse(result);
@@ -384,7 +372,6 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
     return "";
   } finally {
     try { unlinkSync(tmpFile); } catch {}
-    try { unlinkSync(normalizedFile); } catch {}
   }
 }
 
@@ -612,6 +599,7 @@ function stopClientPlayback() {
   ttsGeneration++;
   ttsQueue = []; // Clear pending queue
   ttsEntryIdQueue = [];
+  entryTtsCursor.clear(); // Reset sentence cursors so next turn starts fresh
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   broadcast({ type: "tts_stop" });
   ttsInProgress = false;
@@ -906,6 +894,9 @@ let entryIdCounter = 0;
 let currentTurn = 0;
 let currentTtsEntryId: number | null = null;
 let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
+// Tracks how many chars of each entry have already been queued for TTS.
+// Allows sentence-level TTS: speak complete sentences as they arrive mid-stream.
+let entryTtsCursor: Map<number, number> = new Map();
 
 // Add a user entry and broadcast the updated entry list
 function addUserEntry(text: string, queued = false) {
@@ -1301,20 +1292,50 @@ function broadcastCurrentOutput() {
     }
   }
 
-  // Schedule TTS for the last entry if it's been stable (not growing)
+  // Sentence-level TTS for the last (still-growing) entry.
+  // Speak each complete sentence as it arrives rather than waiting for the full entry.
+  // A sentence boundary is: [.!?] followed by whitespace + uppercase, or [.!?] + end of text.
   const lastEntry = currentAssistant[currentAssistant.length - 1];
   if (lastEntry && lastEntry.speakable && !lastEntry.spoken) {
+    const cursor = entryTtsCursor.get(lastEntry.id) ?? 0;
+    const remaining = lastEntry.text.slice(cursor);
+    // Match sentences: text ending in .!? followed by space+capital (mid-text) or end-of-string
+    const sentenceEnd = /[.!?](?=\s+[A-Z])/g;
+    let lastMatchEnd = 0;
+    let match: RegExpExecArray | null;
+    while ((match = sentenceEnd.exec(remaining)) !== null) {
+      lastMatchEnd = match.index + 1; // include the punctuation
+    }
+    if (lastMatchEnd > 0) {
+      const sentence = remaining.slice(0, lastMatchEnd).trim();
+      if (sentence.length > 10) { // skip trivially short fragments
+        const newCursor = cursor + lastMatchEnd;
+        entryTtsCursor.set(lastEntry.id, newCursor);
+        console.log(`[stream] Sentence TTS (id=${lastEntry.id}, cursor=${newCursor}): "${sentence.slice(0, 80)}"`);
+        plog("sentence_tts", `id=${lastEntry.id} "${sentence.slice(0, 80)}" (${sentence.length} chars)`);
+        currentTtsEntryId = lastEntry.id;
+        speakText(sentence);
+      }
+    }
+
+    // Also debounce-speak the tail once the entry stabilises (catches final sentence without trailing space)
     if (entryTtsTimer) clearTimeout(entryTtsTimer);
     entryTtsTimer = setTimeout(() => {
       entryTtsTimer = null;
       const freshAssistant = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
       const freshLast = freshAssistant[freshAssistant.length - 1];
       if (freshLast && freshLast.id === lastEntry.id && !freshLast.spoken) {
-        freshLast.spoken = true;
-        console.log(`[stream] Entry TTS delayed (id=${freshLast.id}, ${freshLast.text.length} chars)`);
-        plog("entry_tts_delayed", `id=${freshLast.id} "${freshLast.text.slice(0, 80)}" (${freshLast.text.length} chars)`);
-        currentTtsEntryId = freshLast.id;
-        speakText(freshLast.text);
+        const spokenSoFar = entryTtsCursor.get(freshLast.id) ?? 0;
+        const tail = freshLast.text.slice(spokenSoFar).trim();
+        if (tail.length > 0) {
+          freshLast.spoken = true;
+          console.log(`[stream] Entry tail TTS (id=${freshLast.id}, tail=${tail.length} chars): "${tail.slice(0, 80)}"`);
+          plog("entry_tts_tail", `id=${freshLast.id} "${tail.slice(0, 80)}" (${tail.length} chars)`);
+          currentTtsEntryId = freshLast.id;
+          speakText(tail);
+        } else {
+          freshLast.spoken = true; // All sentences already spoken mid-stream
+        }
       }
     }, ENTRY_TTS_DELAY_MS);
   }
@@ -1423,6 +1444,7 @@ function startTmuxStreaming(userInput: string) {
   lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
+  entryTtsCursor.clear(); // Reset sentence cursor for new turn
   // Start a new conversation turn — keep old entries for history
   currentTurn++;
   // Cap at ~200 entries to prevent unbounded memory growth (trim oldest turns)
