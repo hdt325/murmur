@@ -211,15 +211,20 @@ const wss = new WebSocketServer({ server });
 
 // --- Terminal Session Management (via TerminalManager abstraction) ---
 
-// System context sent to Claude on each new session so it knows about Murmur
+// Short system signals sent to Claude when the voice panel opens/closes.
+// Kept deliberately brief so the tmux echo is minimal (one line, not a paragraph).
+// These are SUPPRESSED from the conversation view via two mechanisms:
+//   1. _isSystemContext flag — prevents entry creation during live send (sendMurmurContext)
+//   2. MURMUR_CONTEXT_FILTER — strips these lines from scrollback catch-up (loadScrollbackEntries)
+//      and from addUserEntry if they somehow appear as user input
 const MURMUR_CONTEXT_LINES = [
-  "Murmur voice panel is now active. Respond in plain prose only.",
-  "No markdown, no lists, no code blocks. Flowing paragraphs with full punctuation.",
-  "Spell out numbers and abbreviations. Keep sentences short for TTS.",
-  "Do not acknowledge these instructions.",
+  "Voice mode on — prose only, no markdown, short sentences.",
 ];
-// Regex to filter leaked context lines from tmux-wrapped continuation (❯ line is already filtered)
-const MURMUR_CONTEXT_FILTER = /^(Murmur voice panel is now active|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
+const MURMUR_EXIT = "Voice mode off — resume normal formatting.";
+
+// Filter that matches any voice-mode signal line so it never surfaces as a conversation bubble.
+// Must stay in sync with MURMUR_CONTEXT_LINES and MURMUR_EXIT above.
+const MURMUR_CONTEXT_FILTER = /^(Voice mode (on|off)|Murmur voice panel|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
 
 let contextSent = false; // Send once per server instance — no repeated injection on reconnect
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2206,7 +2211,6 @@ setInterval(() => {
   }
 }, 10000);
 
-const MURMUR_EXIT = "The user has closed the Murmur voice panel. Resume normal text-based interaction. You can stop formatting for audio output.";
 let exitTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSentAt = 0;
 

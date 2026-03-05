@@ -91,9 +91,12 @@ Client records audio → sends binary WebSocket → server writes /tmp WAV → c
 
 ### System Context
 
-`MURMUR_CONTEXT_LINES` sent to Claude on session start via `sendMurmurContext()`.
-`MURMUR_CONTEXT_FILTER` regex catches leaked context lines in tmux output.
-`_isSystemContext` flag suppresses entry creation during context send.
+Short voice-mode signals sent to Claude — suppressed from conversation view via two mechanisms:
+1. `_isSystemContext` flag — blocks entry creation during live send (`sendMurmurContext`)
+2. `MURMUR_CONTEXT_FILTER` regex — strips matching lines from scrollback and `addUserEntry`
+
+- `MURMUR_CONTEXT_LINES` = `["Voice mode on — prose only, no markdown, short sentences."]`
+- `MURMUR_EXIT` = `"Voice mode off — resume normal formatting."`
 
 ### Passive Watcher
 

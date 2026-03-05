@@ -586,14 +586,14 @@ async function testFeature_voicePanelFilter() {
   const serverSrc = readFileSync(new URL("../server.ts", import.meta.url).pathname, "utf-8");
   const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
 
-  // MURMUR_CONTEXT_FILTER regex covers activation AND exit phrases
-  const filterCoversActivation = serverSrc.includes("Murmur voice panel is now active") &&
+  // MURMUR_CONTEXT_FILTER covers both the short on/off signals
+  const filterCoversActivation = serverSrc.includes("Voice mode on") &&
     serverSrc.includes("MURMUR_CONTEXT_FILTER");
-  report("MURMUR_CONTEXT_FILTER covers activation phrase", filterCoversActivation);
+  report("MURMUR_CONTEXT_FILTER covers voice-on signal", filterCoversActivation);
 
-  const filterCoversExit = serverSrc.includes("The user has closed the Murmur voice panel") &&
-    serverSrc.includes("Resume normal text-based interaction");
-  report("MURMUR_CONTEXT_FILTER covers exit phrase (panel closed message)", filterCoversExit);
+  const filterCoversExit = serverSrc.includes("Voice mode off") &&
+    serverSrc.includes("MURMUR_CONTEXT_FILTER");
+  report("MURMUR_CONTEXT_FILTER covers voice-off signal", filterCoversExit);
 
   // addUserEntry checks filter before pushing to conversationEntries
   const addUserEntryFilters = serverSrc.includes("MURMUR_CONTEXT_FILTER.test(text.trim())") &&
