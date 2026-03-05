@@ -272,6 +272,8 @@
   .conv-toolbar button:hover { color: #e5e5e5; border-color: #4b5263; background: #3e4451; }
   .conv-toolbar button#cleanBtn { color: #666; border-color: #333338; }
   .conv-toolbar button#cleanBtn.active { color: #e0d8d5; border-color: #555; background: #3e4451; }
+  .conv-toolbar button#flowModeBtn { color: #666; border-color: #333338; }
+  .conv-toolbar button#flowModeBtn.active { color: #c9b07c; border-color: #c9b07c66; background: rgba(201,176,124,0.08); }
   .conv-toolbar-spacer { flex: 1; }
 
   .msg {
@@ -370,6 +372,131 @@
 
   /* Entry-based clean mode: hide non-speakable entries via CSS */
   body.clean-mode .entry-nonspeakable { display: none; }
+
+  /* ─── Flow Mode ────────────────────────────────────────────────────────────
+   * A focused voice-first layout: hero talk button, floating transcript,
+   * everything else hidden. Toggled via body.flow-mode class, persisted to
+   * localStorage("murmur-flow-mode").
+   * ─────────────────────────────────────────────────────────────────────── */
+  body.flow-mode .header { display: none; }
+  body.flow-mode .conv-toolbar { display: none; }
+  body.flow-mode .controls { display: none; }
+  body.flow-mode .input-bar { display: none; }
+  body.flow-mode .terminal-panel { display: none !important; }
+
+  /* Transcript: minimal, centred, fade near top */
+  body.flow-mode .transcript {
+    padding: 24px 20px 0;
+    gap: 4px;
+    mask-image: linear-gradient(to bottom, transparent 0%, black 18%);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 18%);
+    scroll-behavior: smooth;
+  }
+
+  /* Bubbles: no labels, no visible border, larger text, rounded */
+  body.flow-mode .msg {
+    font-size: 15px;
+    line-height: 1.5;
+    border-radius: 18px;
+    border-color: transparent;
+    background: transparent;
+    padding: 3px 6px;
+    max-width: 92%;
+    animation: flow-fade-in 0.4s ease-out;
+  }
+  body.flow-mode .msg.user {
+    color: rgba(224, 221, 216, 0.55);
+    align-self: flex-end;
+  }
+  body.flow-mode .msg.assistant {
+    color: #e0ddd8;
+    align-self: flex-start;
+  }
+  body.flow-mode .msg .role,
+  body.flow-mode .msg .time,
+  body.flow-mode .msg-replay { display: none; }
+  body.flow-mode .msg:hover { filter: none; }
+
+  /* Consecutive same-speaker: tighter gap */
+  body.flow-mode .msg + .msg.user,
+  body.flow-mode .msg + .msg.assistant { margin-top: -2px; }
+
+  /* Turn separator: even more subtle */
+  body.flow-mode .turn-separator { opacity: 0.3; }
+
+  /* Talk button: hero size, centred, breathing states */
+  body.flow-mode .talk-bar {
+    background: transparent;
+    border-top: none;
+    padding: 16px 28px 28px;
+    padding-bottom: max(28px, env(safe-area-inset-bottom));
+  }
+  body.flow-mode .talk-bar button {
+    height: 80px;
+    border-radius: 40px;
+    font-size: 15px;
+    border-width: 1.5px;
+    border-color: #2e2e35;
+    background: #1e1e23;
+    transition: all 0.3s ease;
+  }
+  /* Idle: gentle breathing invite */
+  body.flow-mode .talk-bar button.idle-state {
+    animation: flow-idle-breathe 4s ease-in-out infinite;
+  }
+  /* Recording: coral breath */
+  body.flow-mode .talk-bar button.recording {
+    height: 88px;
+    border-radius: 44px;
+  }
+  /* Thinking/responding: amber glow */
+  body.flow-mode .talk-bar button.thinking,
+  body.flow-mode .talk-bar button.responding {
+    border-color: #c9a22766;
+    background: rgba(201, 162, 39, 0.05);
+    box-shadow: 0 0 32px rgba(201, 162, 39, 0.12);
+  }
+  /* Speaking: warm gold glow */
+  body.flow-mode .talk-bar button.speaking {
+    border-color: #c9b07c88;
+    background: rgba(201, 176, 124, 0.06);
+    box-shadow: 0 0 40px rgba(201, 176, 124, 0.18);
+    animation: flow-speaking-pulse 2.5s ease-in-out infinite;
+  }
+  @keyframes flow-idle-breathe {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); border-color: #2e2e35; }
+    50%       { box-shadow: 0 0 18px rgba(255,255,255,0.04); border-color: #3a3a42; }
+  }
+  @keyframes flow-speaking-pulse {
+    0%, 100% { box-shadow: 0 0 30px rgba(201,176,124,0.15); }
+    50%       { box-shadow: 0 0 50px rgba(201,176,124,0.28); }
+  }
+  @keyframes flow-fade-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Flow mode exit button — small, top-right corner */
+  .flow-exit-btn {
+    display: none;
+    position: fixed;
+    top: max(14px, env(safe-area-inset-top));
+    right: 16px;
+    z-index: 200;
+    background: rgba(40,40,46,0.7);
+    border: 1px solid #333338;
+    border-radius: 20px;
+    color: #555;
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    letter-spacing: 0.3px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .flow-exit-btn:hover { color: #aaa; border-color: #555; }
+  body.flow-mode .flow-exit-btn { display: block; }
 
   /* Turn separator between conversation turns */
   .turn-separator {
@@ -1185,6 +1312,9 @@
 </head>
 <body>
 
+<!-- Flow mode exit button — shown only in flow-mode via CSS -->
+<button class="flow-exit-btn" id="flowExitBtn" data-tip="Exit Flow Mode">flow ×</button>
+
 <!-- Update banner (hidden until electron-updater signals update-downloaded) -->
 <div class="update-banner" id="updateBanner">
   <span id="updateBannerText">Update ready</span>
@@ -1215,6 +1345,7 @@
 <div class="transcript" id="transcript">
   <div class="conv-toolbar" id="convToolbar">
     <button id="cleanBtn" class="active" data-tip="Toggle verbose streaming output">Clean</button>
+    <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
     <span class="conv-toolbar-spacer"></span>
     <span class="toolbar-brand"><img src="/icon-256.png" class="toolbar-brand-icon" alt="">MURMUR</span>
     <span class="conv-toolbar-spacer"></span>
@@ -1571,6 +1702,30 @@
   const terminalHeader = document.getElementById("terminalHeader");
   const modeBtn = document.getElementById("modeBtn");
   const cleanBtn = document.getElementById("cleanBtn");
+  const flowModeBtn = document.getElementById("flowModeBtn");
+  const flowExitBtn = document.getElementById("flowExitBtn");
+
+  // ── Flow Mode ──────────────────────────────────────────────────────────────
+  // Persists to localStorage. Hides all chrome, hero-sizes the talk button,
+  // and makes the transcript minimal. Exit via the small "flow ×" corner button.
+  let flowMode = localStorage.getItem("murmur-flow-mode") === "1";
+  function applyFlowMode() {
+    document.body.classList.toggle("flow-mode", flowMode);
+    flowModeBtn.classList.toggle("active", flowMode);
+  }
+  applyFlowMode();
+  flowModeBtn.addEventListener("click", () => {
+    flowMode = !flowMode;
+    localStorage.setItem("murmur-flow-mode", flowMode ? "1" : "0");
+    applyFlowMode();
+    if (flowMode) transcript.scrollTop = transcript.scrollHeight;
+  });
+  flowExitBtn.addEventListener("click", () => {
+    flowMode = false;
+    localStorage.setItem("murmur-flow-mode", "0");
+    applyFlowMode();
+  });
+  // ──────────────────────────────────────────────────────────────────────────
 
   // Steal focus from macOS window chrome (close button) on launch
   document.body.setAttribute("tabindex", "-1");
