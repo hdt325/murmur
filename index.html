@@ -353,6 +353,20 @@
     border-color: rgba(180, 140, 60, 0.4);
     background: rgba(180, 140, 60, 0.06);
   }
+  .queued-icon {
+    font-size: 0.85em;
+    cursor: default;
+    vertical-align: middle;
+  }
+  /* Flash green briefly when queued entry transitions to delivered */
+  @keyframes delivered-flash {
+    0%   { border-color: rgba(80, 200, 120, 0.8); background: rgba(80, 200, 120, 0.12); opacity: 1; }
+    60%  { border-color: rgba(80, 200, 120, 0.4); background: rgba(80, 200, 120, 0.06); opacity: 0.9; }
+    100% { border-color: rgba(180, 60, 60, 0.08); background: rgba(180, 60, 60, 0.05); opacity: 0.6; }
+  }
+  .msg.user.entry-delivered {
+    animation: delivered-flash 1.2s ease-out forwards;
+  }
 
   /* Entry-based clean mode: hide non-speakable entries via CSS */
   body.clean-mode .entry-nonspeakable { display: none; }
@@ -2678,15 +2692,23 @@
       // Queued voice styling — dashed border + faded + inline hourglass until sent
       if (entry.queued) {
         div.classList.add("entry-queued");
+        div.classList.remove("entry-delivered");
         const textEl = div.querySelector(".entry-text");
         if (textEl && !textEl.querySelector(".queued-icon")) {
           const icon = document.createElement("span");
           icon.className = "queued-icon";
+          icon.title = "Queued — will be sent to Claude when ready";
           icon.textContent = " ⏳";
           textEl.appendChild(icon);
         }
       } else {
-        div.classList.remove("entry-queued");
+        // Transition from queued → delivered: briefly flash green
+        if (div.classList.contains("entry-queued")) {
+          div.classList.remove("entry-queued");
+          div.classList.add("entry-delivered");
+          // Remove delivered class after animation finishes (so spoken dim can take over)
+          setTimeout(() => div.classList.remove("entry-delivered"), 1300);
+        }
         div.querySelector(".queued-icon")?.remove();
       }
 

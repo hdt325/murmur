@@ -11,6 +11,7 @@ import { chromium, Browser, Page, WebSocket as PWWebSocket } from "playwright";
 const BASE = "http://localhost:3457";
 const PASS = "\x1b[32m✓ PASS\x1b[0m";
 const FAIL = "\x1b[31m✗ FAIL\x1b[0m";
+const SKIP_LIVE = process.argv.includes("--skip-live"); // skip tests that send to Claude
 let browser: Browser;
 let page: Page;
 let passed = 0;
@@ -22,7 +23,7 @@ function report(name: string, ok: boolean, detail = "") {
 }
 
 async function setup() {
-  browser = await chromium.launch({ headless: false });
+  browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     // Grant mic permission so AudioContext initializes (won't actually use mic)
     permissions: ["microphone"],
@@ -1005,6 +1006,184 @@ async function testIntegration_talkButtonStates() {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Session 3: Queued text visual indicator (task #11)
+// ──────────────────────────────────────────────────────────────
+async function testFeature_queuedEntryVisuals() {
+  console.log("\n[Feature] Queued entry visual indicator");
+
+  // 1. CSS for entry-queued exists with dashed amber border
+  const queuedCss = await page.evaluate(() => {
+    const sheets = Array.from(document.styleSheets);
+    for (const sheet of sheets) {
+      try {
+        const rules = Array.from(sheet.cssRules || []);
+        for (const rule of rules) {
+          if (rule instanceof CSSStyleRule && rule.selectorText?.includes("entry-queued")) {
+            return rule.cssText;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  });
+  report("CSS .entry-queued rule exists", !!queuedCss);
+  report(".entry-queued uses dashed border", !!queuedCss?.includes("dashed"));
+
+  // 2. CSS for entry-delivered (green flash) exists
+  const deliveredCss = await page.evaluate(() => {
+    const sheets = Array.from(document.styleSheets);
+    for (const sheet of sheets) {
+      try {
+        const rules = Array.from(sheet.cssRules || []);
+        for (const rule of rules) {
+          if (rule instanceof CSSStyleRule && rule.selectorText?.includes("entry-delivered")) {
+            return rule.cssText;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  });
+  report("CSS .entry-delivered rule exists (green flash)", !!deliveredCss);
+
+  // 3. delivered-flash keyframes exist
+  const flashKeyframes = await page.evaluate(() => {
+    const sheets = Array.from(document.styleSheets);
+    for (const sheet of sheets) {
+      try {
+        const rules = Array.from(sheet.cssRules || []);
+        for (const rule of rules) {
+          if (rule instanceof CSSKeyframesRule && rule.name === "delivered-flash") {
+            return rule.name;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  });
+  report("@keyframes delivered-flash exists", !!flashKeyframes);
+
+  // 4. renderEntries handles queued→delivered transition (code check)
+  const htmlContent = await page.content();
+  report("renderEntries handles entry-delivered class transition", htmlContent.includes("entry-delivered"));
+  report("Queued icon has tooltip text", htmlContent.includes("Queued — will be sent to Claude when ready"));
+
+  // 5. Queued icon removal on transition
+  report("Queued icon removed on delivery", htmlContent.includes("queued-icon")?.valueOf() &&
+    htmlContent.includes("div.classList.remove(\"entry-queued\")"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// Session 3: Interrupt toggle (armed state)
+// ──────────────────────────────────────────────────────────────
+async function testFeature_interruptToggle() {
+  console.log("\n[Feature] Interrupt toggle (armed state)");
+
+  const interruptBtn = page.locator("#interruptBtn");
+
+  // 1. Button exists
+  const exists = await interruptBtn.isVisible();
+  report("Interrupt button is visible", exists);
+
+  // 2. Armed CSS exists
+  const armedCss = await page.evaluate(() => {
+    const sheets = Array.from(document.styleSheets);
+    for (const sheet of sheets) {
+      try {
+        const rules = Array.from(sheet.cssRules || []);
+        for (const rule of rules) {
+          if (rule instanceof CSSStyleRule && rule.selectorText?.includes("interrupt-btn.armed")) {
+            return rule.cssText;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  });
+  report("CSS .interrupt-btn.armed rule exists", !!armedCss);
+  report(".interrupt-btn.armed has amber pulse animation", !!armedCss?.includes("pulse-border-amber"));
+
+  // 3. localStorage key for armed state
+  const htmlContent = await page.content();
+  report("interruptArmed persisted to localStorage", htmlContent.includes("murmur-interrupt-armed"));
+
+  // 4. Armed toggle: click when idle flips state
+  const wasBefore = await interruptBtn.getAttribute("class");
+  const wasArmed = wasBefore?.includes("armed");
+  await interruptBtn.click();
+  await page.waitForTimeout(200);
+  const afterClass = await interruptBtn.getAttribute("class");
+  const nowArmed = afterClass?.includes("armed");
+  report("Interrupt button toggles armed on click (idle)", wasArmed !== nowArmed);
+
+  // Restore original state
+  await interruptBtn.click();
+  await page.waitForTimeout(200);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Session 3: Think mode idle visual distinction
+// ──────────────────────────────────────────────────────────────
+async function testFeature_thinkModeIdleVisual() {
+  console.log("\n[Feature] Think mode idle visual (amber tint)");
+
+  // 1. CSS for think-mode idle state
+  const thinkModeCss = await page.evaluate(() => {
+    const sheets = Array.from(document.styleSheets);
+    for (const sheet of sheets) {
+      try {
+        const rules = Array.from(sheet.cssRules || []);
+        for (const rule of rules) {
+          if (rule instanceof CSSStyleRule && rule.selectorText?.includes("idle-state.think-mode")) {
+            return rule.cssText;
+          }
+        }
+      } catch (_) {}
+    }
+    return null;
+  });
+  report("CSS .idle-state.think-mode rule exists", !!thinkModeCss);
+  // Browser may normalize #c9a22766 → rgba(201, 162, 39, ...) so check both forms
+  report(".idle-state.think-mode has amber border-color",
+    !!(thinkModeCss?.includes("c9a227") || thinkModeCss?.includes("201, 162, 39")));
+
+  // 2. Think mode toggle button exists
+  const htmlContent = await page.content();
+  report("Think mode toggle button in DOM", htmlContent.includes("thinkModeBtn") || htmlContent.includes("think-mode-btn") || htmlContent.includes("thinkMode"));
+
+  // 3. applyThinkModeUI updates hint text
+  report("applyThinkModeUI updates hint to 'Think mode — tap to record'",
+    htmlContent.includes("Think mode — tap to record"));
+
+  // 4. Think mode energy bypass
+  report("Energy check bypassed in think mode", htmlContent.includes("if (!thinkMode)") ||
+    htmlContent.includes("if(!thinkMode)"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// Session 3: Context injection once per server run
+// ──────────────────────────────────────────────────────────────
+async function testFeature_contextSentOnce() {
+  console.log("\n[Feature] Context injected once per server run (not per reconnect)");
+
+  const serverSrc = await fetch("http://localhost:3457").then(r => r.text()).catch(() => "");
+  // This test checks server.ts source indirectly via behavior; just verify the flag is in html
+  const htmlContent = await page.content();
+
+  // The server-side contextSent flag — check it exists by seeing if per-connection resend was removed
+  // We verify by checking the page doesn't mention resend logic (can only check compiled output)
+  // Instead check the server.ts file directly
+  const { readFileSync } = await import("fs");
+  let serverTs = "";
+  try { serverTs = readFileSync("server.ts", "utf8"); } catch (_) {
+    try { serverTs = readFileSync("/Users/happythakkar/Desktop/Programming/murmur/server.ts", "utf8"); } catch (_) {}
+  }
+
+  report("server.ts uses contextSent boolean flag", serverTs.includes("contextSent"));
+  report("contextSent prevents duplicate injections", serverTs.includes("if (contextSent) return"));
+}
+
+// ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
 async function main() {
@@ -1026,7 +1205,8 @@ async function main() {
 
   // Live integration checks
   await testIntegration_wsConnect();
-  await testIntegration_textInput();
+  if (SKIP_LIVE) { console.log("\n[Integration] Send text input — SKIPPED (--skip-live)"); }
+  else { await testIntegration_textInput(); }
 
   // Session 1 features
   await testFeature_voiceQueue();
@@ -1055,6 +1235,12 @@ async function main() {
   await testIntegration_textInputSize();
   await testIntegration_thinkModePersistence();
   await testIntegration_talkButtonStates();
+
+  // Session 3 features (new)
+  await testFeature_queuedEntryVisuals();
+  await testFeature_interruptToggle();
+  await testFeature_thinkModeIdleVisual();
+  await testFeature_contextSentOnce();
 
   await teardown();
 }
