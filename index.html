@@ -394,45 +394,51 @@
   }
 
   /* Bubbles: Claude Code style —
-     user = pill bubble (right-aligned, grey bg),
-     assistant = naked flowing text (no background, no border, left-aligned) */
+     user = pill bubble (right-aligned, subtle bg),
+     assistant = naked text, NO box/border/background ever */
   body.flow-mode .msg {
     font-size: 16px;
     line-height: 1.65;
-    border-color: transparent;
-    background: transparent;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
     padding: 0;
     max-width: 88%;
     animation: flow-fade-in 0.35s ease-out;
     border-radius: 0;
-    box-shadow: none;
-    opacity: 1 !important; /* override spoken-fading in flow mode */
+    opacity: 1 !important;
   }
   body.flow-mode .msg.user {
-    color: rgba(26, 26, 30, 0.65);
+    color: rgba(26, 26, 30, 0.7);
     align-self: flex-end;
-    background: rgba(26, 26, 30, 0.07);
-    border-radius: 16px; /* all corners equal */
+    background: rgba(26, 26, 30, 0.07) !important;
+    border-radius: 16px !important;
+    border: none !important;
     padding: 5px 11px;
     max-width: 72%;
-    font-size: 16px;
+    font-size: 15px;
+    line-height: 1.5;
   }
   body.flow-mode .msg.assistant {
-    color: rgba(26, 26, 30, 0.35); /* dim until spoken */
+    color: rgba(26, 26, 30, 0.3); /* dim until spoken */
     align-self: flex-start;
-    padding: 2px 0;
-    font-size: 16px;
+    padding: 1px 0;
+    font-size: 17px;
     font-weight: 400;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.015em;
+    line-height: 1.6;
   }
-  /* In flow mode: no box-glow for active — words light up individually */
-  body.flow-mode .msg.assistant.bubble-active {
+  /* ALL assistant states: never show a box */
+  body.flow-mode .msg.assistant,
+  body.flow-mode .msg.assistant.bubble-active,
+  body.flow-mode .msg.assistant.bubble-spoken,
+  body.flow-mode .msg.assistant.entry-nonspeakable {
     background: transparent !important;
-    border-color: transparent !important;
+    border: none !important;
     box-shadow: none !important;
   }
   body.flow-mode .msg.assistant.bubble-spoken {
-    color: rgba(26,26,30,0.28); /* fully faded after spoken */
+    color: rgba(26,26,30,0.22);
     opacity: 1 !important;
   }
 
@@ -483,11 +489,11 @@
   body.flow-mode .talk-bar {
     background: transparent;
     border-top: none;
-    padding: 12px 20px 28px;
-    padding-bottom: max(28px, env(safe-area-inset-bottom));
+    padding: 10px 20px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 16px;
   }
   body.flow-mode .talk-bar #talkBtn {
     flex: 1;
@@ -533,6 +539,7 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    width: auto;
     height: 44px;
     min-height: 44px;
     padding: 0 18px;
@@ -3288,6 +3295,7 @@
         const textEl = div.querySelector(".entry-text");
         const newText = entryTextToHtml(entry.text);
         if (textEl && textEl.innerHTML !== newText) {
+          delete textEl.dataset.wordsWrapped; // reset word-wrap when text changes
           textEl.innerHTML = newText;
         }
         existing.delete(idStr);
@@ -3411,10 +3419,11 @@
     clearWordHighlight();
     const textEl = entryEl.querySelector(".entry-text");
     if (!textEl) return;
-    // Wrap words in spans if not already done
+    // Wrap words in spans if not already done (use textContent to avoid wrapping HTML tags)
     if (!textEl.dataset.wordsWrapped) {
       textEl.dataset.wordsWrapped = "1";
-      textEl.innerHTML = textEl.innerHTML.replace(/(\S+)/g, '<span class="tts-word">$1</span>');
+      const plain = textEl.textContent || "";
+      textEl.innerHTML = plain.replace(/(\S+)/g, '<span class="tts-word">$1</span>');
     }
     const words = Array.from(textEl.querySelectorAll(".tts-word"));
     if (!words.length) return;

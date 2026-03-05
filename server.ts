@@ -424,6 +424,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
   // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
   const speakable = text
+    .replace(/\n*(?:Sources?|Citations?|References?|Further [Rr]eading):[\s\S]*/i, "") // strip sources section
     .replace(/```[\s\S]*?```/g, "... code block omitted ...")
     .replace(/`[^`]+`/g, (m) => m.slice(1, -1))         // inline code → just the word
     .replace(/https?:\/\/\S+/g, "")                      // URLs
@@ -432,6 +433,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     .replace(/[a-f0-9]{8,}/gi, "")                         // hex hashes/IDs
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")               // markdown links → just text
     .replace(/[#*_]{2,}/g, "")                             // markdown formatting
+    .replace(/^[-*•]\s*[,.;)]*\s*$/gm, "")                 // empty bullets (after URL removal)
     // Process paragraphs (double newline = real break, single newline = tmux wrap)
     .split(/\n\n+/)
     .map(paragraph => {
