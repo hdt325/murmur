@@ -460,21 +460,77 @@
   /* Turn separator: very subtle on light bg */
   body.flow-mode .turn-separator { opacity: 0.15; border-color: rgba(26,26,30,0.3); }
 
-  /* Talk button: hero size, no text, clean pill */
+  /* Talk button: 3-col strip in flow mode */
   body.flow-mode .talk-bar {
     background: transparent;
     border-top: none;
-    padding: 16px 28px 28px;
+    padding: 12px 20px 28px;
     padding-bottom: max(28px, env(safe-area-inset-bottom));
+    display: flex;
+    align-items: center;
+    gap: 14px;
   }
-  body.flow-mode .talk-bar button {
-    height: 80px;
-    border-radius: 40px;
+  body.flow-mode .talk-bar #talkBtn {
+    flex: 1;
+    height: 72px;
+    max-width: 72px;
+    border-radius: 36px;
     border-width: 1.5px;
     border-color: rgba(26,26,30,0.12);
     background: #ffffff;
     box-shadow: 0 2px 20px rgba(26,26,30,0.08);
     transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease;
+  }
+
+  /* Flow gear + stop: hidden outside flow mode */
+  .flow-gear-btn, .flow-stop-pill { display: none; }
+  body.flow-mode .flow-gear-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
+    border-radius: 22px;
+    border: 1.5px solid rgba(26,26,30,0.12);
+    background: rgba(255,255,255,0.75);
+    color: rgba(26,26,30,0.45);
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
+  }
+  body.flow-mode .flow-gear-btn:hover,
+  body.flow-mode .flow-gear-btn.active {
+    background: rgba(255,255,255,1);
+    color: rgba(26,26,30,0.8);
+    border-color: rgba(26,26,30,0.22);
+  }
+  body.flow-mode .flow-stop-pill {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    height: 44px;
+    min-height: 44px;
+    padding: 0 18px;
+    border-radius: 22px;
+    border: 1.5px solid rgba(231,76,60,0.28);
+    background: rgba(255,255,255,0.75);
+    color: rgba(231,76,60,0.65);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: background 0.2s, color 0.2s, border-color 0.2s;
+  }
+  body.flow-mode .flow-stop-pill:hover {
+    background: rgba(231,76,60,0.08);
+    color: rgba(231,76,60,0.9);
+    border-color: rgba(231,76,60,0.5);
   }
   /* Hide all text labels in flow mode — just icon + waveform */
   body.flow-mode #talkLabel { display: none; }
@@ -541,6 +597,79 @@
   }
   .flow-exit-btn:hover { color: rgba(26,26,30,0.7); border-color: rgba(26,26,30,0.3); }
   body.flow-mode .flow-exit-btn { display: block; }
+
+  /* ─── Flow Settings Sheet ─────────────────────────────────────────────── */
+  .flow-settings-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 299;
+    background: rgba(26,26,30,0.18);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+  }
+  .flow-settings-overlay.open { display: block; }
+  .flow-settings-sheet {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 300;
+    background: #f9f8f4;
+    border-radius: 22px 22px 0 0;
+    padding: 12px 22px 36px;
+    padding-bottom: max(36px, env(safe-area-inset-bottom));
+    box-shadow: 0 -6px 40px rgba(26,26,30,0.16);
+    transform: translateY(100%);
+    transition: transform 0.3s cubic-bezier(0.32,0.72,0,1);
+  }
+  .flow-settings-sheet.open { transform: translateY(0); }
+  .fss-handle {
+    width: 36px; height: 4px;
+    border-radius: 2px;
+    background: rgba(26,26,30,0.18);
+    margin: 0 auto 20px;
+  }
+  .fss-section-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: rgba(26,26,30,0.38);
+    margin: 18px 0 8px;
+  }
+  .fss-pills { display: flex; gap: 8px; flex-wrap: wrap; }
+  .fss-pill {
+    padding: 7px 16px;
+    border-radius: 20px;
+    border: 1.5px solid rgba(26,26,30,0.14);
+    background: rgba(255,255,255,0.85);
+    color: rgba(26,26,30,0.6);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .fss-pill:hover { background: #fff; color: rgba(26,26,30,0.85); }
+  .fss-pill.selected {
+    background: rgba(26,26,30,0.85);
+    color: #f5f4ef;
+    border-color: rgba(26,26,30,0.85);
+  }
+  .fss-rows { display: flex; flex-direction: column; }
+  .fss-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 0;
+    border-bottom: 1px solid rgba(26,26,30,0.07);
+    cursor: pointer;
+    color: rgba(26,26,30,0.8);
+  }
+  .fss-row:last-child { border-bottom: none; }
+  .fss-row-title { font-size: 15px; }
+  .fss-row-desc { font-size: 12px; color: rgba(26,26,30,0.38); margin-top: 1px; }
+  .fss-row-muted { color: rgba(26,26,30,0.32); font-size: 13px; cursor: default; padding: 10px 0; }
+  .fss-row.fss-row-active .fss-row-title { font-weight: 600; }
+  .fss-check { font-size: 16px; color: rgba(26,26,30,0.7); min-width: 22px; text-align: right; }
 
   /* Turn separator between conversation turns */
   .turn-separator {
@@ -1454,12 +1583,52 @@
 
 <!-- Section 4: Talk button -->
 <div class="talk-bar">
+  <button id="flowGearBtn" class="flow-gear-btn" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </button>
   <button id="talkBtn" data-tip="Auto-listens when it detects your voice">
     <canvas id="talkWaveCanvas"></canvas>
     <img src="/icon-256.png" class="murmur-icon" alt="" id="talkIcon">
     <span class="talk-label" id="talkLabel">Tap or press Right ⌘ to talk</span>
     <span class="tool-status-line" id="toolStatusLine"></span>
   </button>
+  <button id="flowStopPill" class="flow-stop-pill">Stop</button>
+</div>
+
+<!-- Flow Settings Sheet -->
+<div class="flow-settings-overlay" id="flowSettingsOverlay"></div>
+<div class="flow-settings-sheet" id="flowSettingsSheet">
+  <div class="fss-handle"></div>
+  <div class="fss-section-label">Voice</div>
+  <div class="fss-pills" id="fssVoicePills">
+    <button class="fss-pill" data-fss-voice="af_sky">Sky</button>
+    <button class="fss-pill" data-fss-voice="af_heart">Heart</button>
+    <button class="fss-pill" data-fss-voice="af_nova">Nova</button>
+    <button class="fss-pill" data-fss-voice="am_adam">Adam</button>
+    <button class="fss-pill" data-fss-voice="am_echo">Echo</button>
+    <button class="fss-pill" data-fss-voice="bf_emma">Emma</button>
+  </div>
+  <div class="fss-section-label">Speed</div>
+  <div class="fss-pills" id="fssSpeedPills">
+    <button class="fss-pill" data-fss-speed="0.8">Slow</button>
+    <button class="fss-pill selected" data-fss-speed="1">Normal</button>
+    <button class="fss-pill" data-fss-speed="1.5">Fast</button>
+  </div>
+  <div class="fss-section-label">Activation</div>
+  <div class="fss-rows">
+    <div class="fss-row" id="fssRowHandsFree">
+      <div><div class="fss-row-title">Hands free</div><div class="fss-row-desc">Auto-listens after each response</div></div>
+      <span class="fss-check" id="fssCheckHandsFree">✓</span>
+    </div>
+    <div class="fss-row" id="fssRowPushToTalk">
+      <div><div class="fss-row-title">Push to talk</div><div class="fss-row-desc">Tap button to speak</div></div>
+      <span class="fss-check" id="fssCheckPushToTalk"></span>
+    </div>
+  </div>
+  <div class="fss-section-label">Session</div>
+  <div class="fss-rows" id="fssSessionRows">
+    <div class="fss-row fss-row-muted">Loading…</div>
+  </div>
 </div>
 
 <!-- Section 5: Controls + Input -->
@@ -1784,6 +1953,10 @@
   const flowModeBtn = document.getElementById("flowModeBtn");
   const flowExitBtn = document.getElementById("flowExitBtn");
   const flowLiveText = document.getElementById("flowLiveText");
+  const flowGearBtn = document.getElementById("flowGearBtn");
+  const flowStopPill = document.getElementById("flowStopPill");
+  const flowSettingsSheet = document.getElementById("flowSettingsSheet");
+  const flowSettingsOverlay = document.getElementById("flowSettingsOverlay");
 
   // ── Flow Mode ──────────────────────────────────────────────────────────────
   // Persists to localStorage. Hides all chrome, hero-sizes the talk button,
@@ -1805,6 +1978,102 @@
     localStorage.setItem("murmur-flow-mode", "0");
     applyFlowMode();
   });
+
+  // ── Flow Settings Sheet ──────────────────────────────────────────────────
+  // Opening pauses voice: stops TTS + disables auto-listen until closed.
+  let _settingsPausedAutoListen = false;
+
+  function openFlowSettings() {
+    flowGearBtn?.classList.add("active");
+    // Pause voice — stop any TTS and suspend auto-listen
+    if (typeof stopTtsPlayback === "function") stopTtsPlayback();
+    if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
+    if (typeof setTalkState === "function") setTalkState("idle");
+    _settingsPausedAutoListen = autoListenEnabled;
+    autoListenEnabled = false;
+    if (autoListenInterval) { clearInterval(autoListenInterval); autoListenInterval = null; }
+    autoListenActive = false;
+    // Request fresh session list
+    if (ws?.readyState === WebSocket.OPEN) ws.send("tmux:list");
+    // Sync voice pills to current voice
+    document.querySelectorAll("#fssVoicePills .fss-pill").forEach(p =>
+      p.classList.toggle("selected", p.dataset.fssVoice === currentVoice));
+    // Sync activation
+    _syncFssActivation();
+    flowSettingsOverlay.classList.add("open");
+    flowSettingsSheet.classList.add("open");
+  }
+
+  function closeFlowSettings() {
+    flowGearBtn?.classList.remove("active");
+    flowSettingsOverlay.classList.remove("open");
+    flowSettingsSheet.classList.remove("open");
+    // Resume voice if it was active before
+    if (_settingsPausedAutoListen && !_pushToTalkMode) {
+      autoListenEnabled = true;
+      tryStartAutoListen?.();
+    }
+    _settingsPausedAutoListen = false;
+  }
+
+  function _syncFssActivation() {
+    document.getElementById("fssCheckHandsFree").textContent = !_pushToTalkMode ? "✓" : "";
+    document.getElementById("fssCheckPushToTalk").textContent = _pushToTalkMode ? "✓" : "";
+    document.getElementById("fssRowHandsFree")?.classList.toggle("fss-row-active", !_pushToTalkMode);
+    document.getElementById("fssRowPushToTalk")?.classList.toggle("fss-row-active", _pushToTalkMode);
+  }
+
+  flowGearBtn?.addEventListener("click", openFlowSettings);
+  flowSettingsOverlay?.addEventListener("click", closeFlowSettings);
+
+  // Flow stop pill — same action as main stop button
+  flowStopPill?.addEventListener("click", () => {
+    idleFromTtsCompletion = false;
+    stopTtsPlayback();
+    if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
+    setTalkState("idle");
+    updateInterruptBtn(0);
+  });
+
+  // Voice pill selection
+  document.getElementById("fssVoicePills")?.addEventListener("click", e => {
+    const pill = e.target.closest(".fss-pill[data-fss-voice]");
+    if (!pill) return;
+    const voice = pill.dataset.fssVoice;
+    currentVoice = voice;
+    voiceBtn.textContent = friendlyVoice(voice);
+    updateVoiceSelection?.();
+    if (ws?.readyState === WebSocket.OPEN) ws.send("voice:" + voice);
+    document.querySelectorAll("#fssVoicePills .fss-pill").forEach(p =>
+      p.classList.toggle("selected", p.dataset.fssVoice === voice));
+  });
+
+  // Speed pill selection
+  document.getElementById("fssSpeedPills")?.addEventListener("click", e => {
+    const pill = e.target.closest(".fss-pill[data-fss-speed]");
+    if (!pill) return;
+    const spd = parseFloat(pill.dataset.fssSpeed);
+    let best = 0, bestDist = Infinity;
+    SPEEDS.forEach((s, i) => { const d = Math.abs(s - spd); if (d < bestDist) { bestDist = d; best = i; } });
+    speedIdx = best;
+    speedBtn.textContent = SPEEDS[speedIdx] + "x";
+    if (ws?.readyState === WebSocket.OPEN) ws.send("speed:" + SPEEDS[speedIdx]);
+    document.querySelectorAll("#fssSpeedPills .fss-pill").forEach(p =>
+      p.classList.toggle("selected", parseFloat(p.dataset.fssSpeed) === spd));
+  });
+
+  // Activation rows
+  document.getElementById("fssRowHandsFree")?.addEventListener("click", () => {
+    _pushToTalkMode = false;
+    localStorage.setItem("murmur-ptt-mode", "0");
+    _syncFssActivation();
+  });
+  document.getElementById("fssRowPushToTalk")?.addEventListener("click", () => {
+    _pushToTalkMode = true;
+    localStorage.setItem("murmur-ptt-mode", "1");
+    _syncFssActivation();
+  });
+
   // ──────────────────────────────────────────────────────────────────────────
 
   // Steal focus from macOS window chrome (close button) on launch
@@ -2727,6 +2996,35 @@
         if (msg.type === "tmux_sessions" && window._onTmuxSessions) {
           window._onTmuxSessions(msg);
         }
+        // Populate flow settings session list
+        if (msg.type === "tmux_sessions") {
+          const sessRows = document.getElementById("fssSessionRows");
+          if (sessRows) {
+            const sessions = msg.sessions || [];
+            const current = msg.current || "";
+            if (!sessions.length) {
+              sessRows.innerHTML = '<div class="fss-row fss-row-muted">No tmux sessions found</div>';
+            } else {
+              sessRows.innerHTML = "";
+              sessions.forEach(sess => {
+                (sess.windows || []).forEach(win => {
+                  const target = win.index >= 0 ? `${sess.name}:${win.index}` : sess.name;
+                  const isActive = target === current || sess.name === current;
+                  const row = document.createElement("div");
+                  row.className = "fss-row" + (isActive ? " fss-row-active" : "");
+                  row.innerHTML = `<div><div class="fss-row-title">${sess.name}</div><div class="fss-row-desc">${win.name || ""}</div></div><span class="fss-check">${isActive ? "✓" : ""}</span>`;
+                  row.addEventListener("click", () => {
+                    if (ws?.readyState === WebSocket.OPEN) {
+                      ws.send("tmux:switch:" + encodeURIComponent(sess.name) + ":" + win.index);
+                    }
+                    closeFlowSettings();
+                  });
+                  sessRows.appendChild(row);
+                });
+              });
+            }
+          }
+        }
         if (msg.current || msg.session) {
           const target = msg.current || msg.session;
           _currentTmuxTarget = target;
@@ -3538,7 +3836,8 @@
 
 
   // Auto-listen
-  let autoListenEnabled = true;
+  let _pushToTalkMode = localStorage.getItem("murmur-ptt-mode") === "1";
+  let autoListenEnabled = !_pushToTalkMode;
   let autoListenActive = false;
   let speechConfirmStart = 0;
   const SPEECH_THRESHOLD_MIN = 0.012;  // Hard floor — dynamic threshold adapts to ambient noise
@@ -3548,6 +3847,28 @@
   let ttsEndedAt = 0;
   let idleFromTtsCompletion = false; // Track whether idle came from successful TTS completion
   let pendingIdle = false; // Deferred idle — waiting for TTS to finish
+
+  // Soft two-tone ascending chime — signals auto-listen is ready (like CC's audible cue)
+  function playReadyChime() {
+    try {
+      const ctx = ttsAudioCtx;
+      if (!ctx || ctx.state !== "running") return;
+      const now = ctx.currentTime;
+      [[660, 0], [880, 0.11]].forEach(([freq, delay]) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, now + delay);
+        gain.gain.setValueAtTime(0, now + delay);
+        gain.gain.linearRampToValueAtTime(0.055, now + delay + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.13);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + delay);
+        osc.stop(now + delay + 0.15);
+      });
+    } catch (_) {}
+  }
 
   function applyIdleState() {
     pendingIdle = false;
@@ -3560,7 +3881,8 @@
     if (conversationHotTimer) clearTimeout(conversationHotTimer);
     conversationHotTimer = setTimeout(() => { conversationHot = false; }, 30000);
     rlog(`[voice_status] idle — ttsPlaying=${ttsPlaying} ttsEndedAt=${Date.now()-ttsEndedAt}ms ago idleFromTts=${idleFromTtsCompletion} micAnalyser=${!!micAnalyser} autoListen=${!!autoListenInterval} isRec=${isRecording}`);
-    // No chime — auto-listen starts silently; the waveform state change is the cue
+    // Soft chime when auto-listen becomes ready (mirrors Claude Code's audible cue)
+    if (autoListenEnabled && idleFromTtsCompletion) playReadyChime();
     idleFromTtsCompletion = false;
     document.body.classList.remove("flow-recording"); // Hide live transcription strip
     setTalkState("idle");
