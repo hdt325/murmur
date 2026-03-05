@@ -502,7 +502,7 @@
     border-radius: 8px;
     pointer-events: none;
   }
-  .talk-bar button.recording .talk-wave-label { color: #e74c3c; }
+  .talk-bar button.recording .talk-wave-label { color: #e8856a; }
   .talk-bar button.speaking .talk-wave-label { color: #c9b07c; }
 
   .talk-bar button.idle-state {
@@ -559,11 +559,11 @@
   .talk-bar button.speaking .murmur-icon { opacity: 0.1; }
 
   .talk-bar button.recording {
-    border-color: #e74c3c;
-    background: #e74c3c18;
-    color: #e74c3c;
+    border-color: #e8856a;
+    background: #e8856a18;
+    color: #e8856a;
     font-weight: 600;
-    animation: pulse-border 1s ease-in-out infinite;
+    animation: pulse-border-coral 2s ease-in-out infinite;
   }
 
   .talk-bar button.transcribing {
@@ -604,6 +604,10 @@
   @keyframes pulse-border {
     0%, 100% { border-color: #e74c3c; }
     50% { border-color: #e74c3c55; }
+  }
+  @keyframes pulse-border-coral {
+    0%, 100% { border-color: #e8856a; box-shadow: 0 0 0 0 rgba(232, 133, 106, 0.25); }
+    50% { border-color: #e8856a88; box-shadow: 0 0 0 6px rgba(232, 133, 106, 0); }
   }
 
   @keyframes pulse-border-yellow {
