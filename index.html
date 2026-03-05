@@ -409,25 +409,44 @@
     opacity: 1 !important; /* override spoken-fading in flow mode */
   }
   body.flow-mode .msg.user {
-    color: rgba(26, 26, 30, 0.7);
+    color: rgba(26, 26, 30, 0.65);
     align-self: flex-end;
     background: rgba(26, 26, 30, 0.07);
-    border-radius: 18px 18px 4px 18px;
-    padding: 8px 14px;
+    border-radius: 16px; /* all corners equal */
+    padding: 5px 11px;
     max-width: 72%;
-    font-size: 15px;
+    font-size: 16px;
   }
   body.flow-mode .msg.assistant {
-    color: #1a1a1e;
+    color: rgba(26, 26, 30, 0.35); /* dim until spoken */
     align-self: flex-start;
     padding: 2px 0;
-    font-size: 17px;
+    font-size: 16px;
     font-weight: 400;
     letter-spacing: -0.01em;
   }
+  /* In flow mode: no box-glow for active — words light up individually */
+  body.flow-mode .msg.assistant.bubble-active {
+    background: transparent !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+  }
   body.flow-mode .msg.assistant.bubble-spoken {
-    color: rgba(26,26,30,0.5); /* faded after spoken */
+    color: rgba(26,26,30,0.28); /* fully faded after spoken */
     opacity: 1 !important;
+  }
+
+  /* Word-by-word TTS highlight */
+  body.flow-mode .msg.assistant .tts-word {
+    color: rgba(26,26,30,0.35);
+    transition: color 0.08s ease;
+  }
+  body.flow-mode .msg.assistant .tts-word-active {
+    color: #1a1a1e;
+    font-weight: 500;
+  }
+  body.flow-mode .msg.assistant .tts-word-spoken {
+    color: rgba(26,26,30,0.5);
   }
   body.flow-mode .msg .role,
   body.flow-mode .msg .time,
@@ -482,8 +501,10 @@
     transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease;
   }
 
-  /* Flow gear + stop: hidden outside flow mode */
-  .flow-gear-btn, .flow-stop-pill { display: none; }
+  /* Flow gear + stop: hidden outside flow mode.
+     Must beat .talk-bar button { display: flex } (specificity 0,0,1,1)
+     so use two-class selector (specificity 0,0,2,0) */
+  .talk-bar .flow-gear-btn, .talk-bar .flow-stop-pill { display: none; }
   body.flow-mode .flow-gear-btn {
     display: flex;
     align-items: center;
@@ -3181,6 +3202,7 @@
       el.classList.remove("bubble-active");
       el.classList.add("bubble-spoken");
     });
+    if (typeof clearWordHighlight === "function") clearWordHighlight();
     activeSpeakBubbles = [];
     activeSpeakIdx = 0;
   }
@@ -3370,9 +3392,52 @@
     }
   }
 
+  // Word-by-word TTS highlight (flow mode only)
+  let _wordHighlightTimer = null;
+  let _wordHighlightEl = null;
+
+  function clearWordHighlight() {
+    if (_wordHighlightTimer) { clearTimeout(_wordHighlightTimer); _wordHighlightTimer = null; }
+    if (_wordHighlightEl) {
+      _wordHighlightEl.querySelectorAll(".tts-word-active").forEach(w => {
+        w.classList.remove("tts-word-active");
+        w.classList.add("tts-word-spoken");
+      });
+      _wordHighlightEl = null;
+    }
+  }
+
+  function startWordHighlight(entryEl) {
+    clearWordHighlight();
+    const textEl = entryEl.querySelector(".entry-text");
+    if (!textEl) return;
+    // Wrap words in spans if not already done
+    if (!textEl.dataset.wordsWrapped) {
+      textEl.dataset.wordsWrapped = "1";
+      textEl.innerHTML = textEl.innerHTML.replace(/(\S+)/g, '<span class="tts-word">$1</span>');
+    }
+    const words = Array.from(textEl.querySelectorAll(".tts-word"));
+    if (!words.length) return;
+    _wordHighlightEl = entryEl;
+    // ~200ms per word ≈ 300 wpm — fast enough to feel live
+    let idx = 0;
+    const advance = () => {
+      if (idx > 0) { words[idx - 1].classList.remove("tts-word-active"); words[idx - 1].classList.add("tts-word-spoken"); }
+      if (idx < words.length) {
+        words[idx].classList.add("tts-word-active");
+        idx++;
+        _wordHighlightTimer = setTimeout(advance, 200);
+      } else {
+        _wordHighlightTimer = null;
+      }
+    };
+    advance();
+  }
+
   // Server-driven TTS highlight — replaces client-side startBubbleHighlight/advance
   function highlightEntry(entryId) {
-    // Clear all active highlights, mark them as spoken
+    // Clear word highlights and whole-bubble highlights
+    clearWordHighlight();
     document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
       el.classList.remove("bubble-active");
       el.classList.add("bubble-spoken");
@@ -3382,16 +3447,20 @@
       const apply = (retries) => {
         const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
         if (el) {
-          el.classList.add("bubble-active");
-          el.classList.remove("bubble-spoken");
-          // Scroll so the entry appears near the top of the transcript (not just barely in view)
+          const inFlow = document.body.classList.contains("flow-mode");
+          if (inFlow && el.classList.contains("assistant")) {
+            startWordHighlight(el);
+          } else {
+            el.classList.add("bubble-active");
+            el.classList.remove("bubble-spoken");
+          }
+          // Scroll so the entry appears near the top of the transcript
           const containerRect = transcript.getBoundingClientRect();
           const elRect = el.getBoundingClientRect();
           const elRelTop = elRect.top - containerRect.top + transcript.scrollTop;
-          const targetScroll = elRelTop - 32; // 32px padding from top of container
+          const targetScroll = elRelTop - 32;
           transcript.scrollTo({ top: Math.max(0, targetScroll), behavior: "smooth" });
         } else if (retries > 0) {
-          // Entry DOM may not exist yet (broadcast arrives before render) — retry
           setTimeout(() => apply(retries - 1), 50);
         }
       };
