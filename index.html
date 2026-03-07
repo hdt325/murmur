@@ -5082,8 +5082,19 @@
     // Talk button state management
     // Uses persistent inner elements — no innerHTML rebuild — so CSS transitions work.
     // =============================================
+    let _thinkingGlowTimer = null;
     function setTalkState(state) {
       clearBubbleHighlights();
+      // Safety: auto-reset glow after 2 min if stuck in thinking/responding
+      if (_thinkingGlowTimer) { clearTimeout(_thinkingGlowTimer); _thinkingGlowTimer = null; }
+      if (state === "thinking" || state === "responding") {
+        _thinkingGlowTimer = setTimeout(() => {
+          if (talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding")) {
+            rlog("[glow] Safety timeout: 2min in thinking/responding — resetting to idle");
+            setTalkState("idle");
+          }
+        }, 120000);
+      }
       // Apply state class with rAF so CSS transitions animate (class swap needs a frame gap)
       const prevClasses = [...talkBtn.classList];
       talkBtn.className = state === "idle" ? "" : state; // Set immediately for logic checks below
