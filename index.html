@@ -7168,6 +7168,95 @@
       if (!silent) localStorage.setItem("murmur-tour-done", "1");
     }
 
+    // ── Flow Mode Tour ──────────────────────────────────────────────────────
+    const FLOW_TOUR_STEPS = [
+      { target: "#talkBtn", title: "Mic Button", text: "Tap to record your voice. Tap again to stop. Double-tap cancels without sending.", pos: "above" },
+      { target: "#talkBtn", title: "Amber Glow", text: "When the button glows amber and pulses, Claude is thinking or working. No need to watch the terminal.", pos: "above" },
+      { target: "#talkBtn", title: "Hands-Free", text: "After Claude speaks, it auto-listens for your reply. Just start talking — no tap needed.", pos: "above" },
+      { target: "#flowGearBtn", title: "Settings", text: "Change voice, speed, switch tmux sessions, or toggle between hands-free and push-to-talk.", pos: "above" },
+      { target: "#flowModeBtn", title: "Exit Flow", text: "Tap to switch back to the full interface with terminal, controls, and text input.", pos: "below" },
+      { target: "#transcript", title: "Conversation", text: "Your words appear as bubbles on the right. Claude\u2019s responses fade in as they\u2019re spoken. Red text means audio was dropped and not played.", pos: "above" },
+    ];
+
+    let _flowTourActive = false;
+    function startFlowTour() {
+      _flowTourActive = true;
+      // Reuse the main tour infrastructure with flow steps
+      endTour(true);
+      _tourStep = 0;
+      _tourOverlay = document.createElement("div");
+      _tourOverlay.className = "tour-overlay";
+      _tourOverlay.style.background = "rgba(245, 244, 239, 0.7)"; // Match flow bg
+      _tourSpotlight = document.createElement("div");
+      _tourSpotlight.className = "tour-spotlight";
+      _tourTip = document.createElement("div");
+      _tourTip.className = "tour-tip";
+      document.body.append(_tourOverlay, _tourSpotlight, _tourTip);
+      showFlowTourStep();
+    }
+
+    function showFlowTourStep() {
+      const s = FLOW_TOUR_STEPS[_flowTourStep ?? _tourStep];
+      const el = document.querySelector(s.target);
+      if (!el) { advanceFlowTour(); return; }
+      const rect = el.getBoundingClientRect();
+      const pad = 6;
+      _tourSpotlight.style.left = (rect.left - pad) + "px";
+      _tourSpotlight.style.top = (rect.top - pad) + "px";
+      _tourSpotlight.style.width = (rect.width + pad * 2) + "px";
+      _tourSpotlight.style.height = (rect.height + pad * 2) + "px";
+
+      const isLast = _tourStep === FLOW_TOUR_STEPS.length - 1;
+      _tourTip.innerHTML =
+        '<h4>' + s.title + '</h4>' +
+        '<p>' + s.text + '</p>' +
+        '<div class="tour-footer">' +
+        '<span class="tour-step">' + (_tourStep + 1) + ' / ' + FLOW_TOUR_STEPS.length + '</span>' +
+        '<div class="tour-btns">' +
+        '<button class="tour-skip">Skip</button>' +
+        '<button class="tour-next">' + (isLast ? "Done" : "Next") + '</button>' +
+        '</div>' +
+        '</div>';
+      _tourTip.querySelector(".tour-skip").addEventListener("click", (e) => { e.stopPropagation(); endFlowTour(); });
+      _tourTip.querySelector(".tour-next").addEventListener("click", (e) => { e.stopPropagation(); advanceFlowTour(); });
+
+      _tourTip.classList.remove("visible");
+      requestAnimationFrame(() => {
+        const tipRect = _tourTip.getBoundingClientRect();
+        let top, left;
+        if (s.pos === "above") {
+          top = rect.top - tipRect.height - 12;
+          if (top < 8) top = rect.bottom + 12;
+        } else {
+          top = rect.bottom + 12;
+          if (top + tipRect.height > window.innerHeight - 8) top = rect.top - tipRect.height - 12;
+        }
+        left = Math.max(8, Math.min(rect.left, window.innerWidth - tipRect.width - 8));
+        _tourTip.style.top = top + "px";
+        _tourTip.style.left = left + "px";
+        _tourTip.classList.add("visible");
+      });
+    }
+
+    function advanceFlowTour() {
+      _tourStep++;
+      if (_tourStep >= FLOW_TOUR_STEPS.length) { endFlowTour(); return; }
+      showFlowTourStep();
+    }
+
+    function endFlowTour() {
+      _flowTourActive = false;
+      if (_tourOverlay) { _tourOverlay.remove(); _tourOverlay = null; }
+      if (_tourSpotlight) { _tourSpotlight.remove(); _tourSpotlight = null; }
+      if (_tourTip) { _tourTip.remove(); _tourTip = null; }
+      localStorage.setItem("murmur-flow-tour-done", "1");
+    }
+
+    // Auto-start flow tour on first flow mode visit
+    if (flowMode && !localStorage.getItem("murmur-flow-tour-done")) {
+      setTimeout(startFlowTour, 1500);
+    }
+
     // Auto-start on first visit — defer if in flow mode (tour targets are hidden)
     if (!localStorage.getItem("murmur-tour-done")) {
       if (!flowMode) {
