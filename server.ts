@@ -716,7 +716,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     console.log(`[tts] Estimated playback: ${(estimatedDurationMs/1000).toFixed(1)}s`);
     ttsClientTimeout = setTimeout(() => {
       if (myGen !== ttsGeneration) return;
-      console.log("[tts] Client playback timeout — assuming done");
+      console.warn(`[tts] Client playback timeout after ${(estimatedDurationMs/1000).toFixed(1)}s (gen=${myGen}) — assuming done`);
       handleTtsDone();
     }, estimatedDurationMs);
   });
@@ -747,8 +747,13 @@ function handleTtsDone() {
     console.log(`[tts] Ignoring stale tts_done (active=${ttsActiveGen} current=${ttsGeneration})`);
     return;
   }
+  // Prevent double-drain: timeout + late client tts_done for the same chunk.
+  // Bump activeGen so the second call fails the stale check above.
+  const drainGen = ttsActiveGen;
+  ttsActiveGen = -1; // Invalidate — next speakText will set it fresh
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   ttsInProgress = false;
+  console.log(`[tts] handleTtsDone (gen=${drainGen}, queue=${ttsQueue.length})`);
 
   // Play next queued text if available
   if (ttsQueue.length > 0) {
@@ -775,7 +780,9 @@ function handleTtsDone() {
           broadcast({ type: "voice_status", state: "speaking" });
           const estimatedMs = Math.max(5000, (buf.length / 16000) * 1000 + 3000);
           ttsClientTimeout = setTimeout(() => {
-            if (newGen === ttsGeneration) handleTtsDone();
+            if (newGen !== ttsGeneration) return;
+            console.warn(`[tts] Pre-gen playback timeout after ${(estimatedMs/1000).toFixed(1)}s (gen=${newGen}) — assuming done`);
+            handleTtsDone();
           }, estimatedMs);
         } else {
           ttsInProgress = false;
@@ -2829,7 +2836,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         console.log("[tts] Ignoring tts_done from non-audio client");
         return;
       }
-      console.log(`[tts] Received tts_done from client (activeGen=${ttsActiveGen} gen=${ttsGeneration})`);
+      console.log(`[tts] Received tts_done from client (activeGen=${ttsActiveGen} gen=${ttsGeneration} inProgress=${ttsInProgress} queue=${ttsQueue.length})`);
       handleTtsDone();
       return;
     }
