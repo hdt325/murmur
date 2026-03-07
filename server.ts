@@ -1995,6 +1995,11 @@ function startPassiveWatcher() {
     // This runs even during cooldown — auto-dismiss doesn't re-trigger streaming
     if (detectInteractivePrompt(pane)) return;
 
+    // Detect "Interrupted" prompt — Claude is waiting for user direction
+    if (/Interrupted\s*[·—]\s*What should Claude do/i.test(pane)) {
+      broadcast({ type: "tool_status", text: "Interrupted — waiting for direction" });
+    }
+
     // Cooldown: don't trigger streaming if it just ended (prevents re-triggering on same session)
     if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
 
