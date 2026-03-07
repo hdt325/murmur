@@ -12,22 +12,44 @@ const DEFAULT_SESSION = "claude-voice";
 export class TmuxBackend implements TerminalManager {
   private _session: string;
   private _window: number; // -1 = use active window
+  private _paneId: string | null = null; // Pinned pane ID (e.g. "%3") — prevents agent panes stealing focus
 
   get sessionName(): string { return this._session; }
 
   get currentTarget(): string {
+    // Prefer pinned pane ID — immune to active-pane changes when agents spawn
+    if (this._paneId) return this._paneId;
     return this._window >= 0 ? `${this._session}:${this._window}` : this._session;
   }
 
   constructor(session = DEFAULT_SESSION) {
     this._session = session;
     this._window = -1;
+    // Pin the current active pane ID so it doesn't shift when sub-agents spawn new panes
+    this._pinCurrentPane();
+  }
+
+  /** Capture and lock the current active pane ID for this session */
+  private _pinCurrentPane(): void {
+    try {
+      const paneId = execFileSync("tmux", [
+        "display-message", "-t", this._session, "-p", "#{pane_id}"
+      ], { encoding: "utf-8", timeout: 3000 }).trim();
+      if (paneId && paneId.startsWith("%")) {
+        this._paneId = paneId;
+        console.log(`[tmux] Pinned to pane ${paneId} in session "${this._session}"`);
+      }
+    } catch {
+      console.log(`[tmux] Could not pin pane — will use session target`);
+    }
   }
 
   /** Switch target to a different session and optional window index. */
   switchTarget(session: string, window = -1): void {
     this._session = session;
     this._window = window;
+    this._paneId = null; // Clear pinned pane — re-pin to new target
+    this._pinCurrentPane();
   }
 
   /** List all tmux sessions and their windows. */

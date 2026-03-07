@@ -576,7 +576,25 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
   if (!speakable) {
     ttsInProgress = false;
-    broadcastIdleIfSafe();
+    // Mark entry as spoken even though text was empty — it was processed
+    if (currentTtsEntryId != null) {
+      const emptyEntry = conversationEntries.find(e => e.id === currentTtsEntryId);
+      if (emptyEntry && !emptyEntry.spoken) {
+        emptyEntry.spoken = true;
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
+    }
+    // Continue draining queue instead of stalling — the next queued item may have valid text
+    if (ttsQueue.length > 0) {
+      const next = ttsQueue.shift()!;
+      const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+      ttsPregenPromises.shift(); // Discard pregen for skipped empty entry
+      currentTtsEntryId = nextEntryId;
+      console.log(`[tts] Empty after cleaning — playing next in queue (${ttsQueue.length} remaining)`);
+      speakText(next);
+    } else {
+      broadcastIdleIfSafe();
+    }
     return;
   }
 
@@ -598,6 +616,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
       console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to audio client`);
       ttsActiveGen = myGen;
+      _playingTtsEntryId = currentTtsEntryId;
       sendToAudioClient({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
       broadcast({ type: "voice_status", state: "speaking" });
       // Safety timeout — proportional to text length so long passages don't fall back to Kokoro.
@@ -707,6 +726,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     plog("tts_audio_sent", `${audioData.length} bytes`);
     slog("tts", "sent", { bytes: audioData.length, durationMs: Date.now() - ttsStartTime });
     ttsActiveGen = myGen;
+    _playingTtsEntryId = currentTtsEntryId;
     broadcastBinary(audioData);
     broadcast({ type: "voice_status", state: "speaking" });
 
@@ -734,6 +754,7 @@ function stopClientPlayback() {
   ttsQueue = []; // Clear pending queue
   ttsEntryIdQueue = [];
   ttsPregenPromises = [];
+  _playingTtsEntryId = null;
   entryTtsCursor.clear(); // Reset sentence cursors so next turn starts fresh
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   broadcast({ type: "tts_stop" });
@@ -754,6 +775,17 @@ function handleTtsDone() {
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   ttsInProgress = false;
   console.log(`[tts] handleTtsDone (gen=${drainGen}, queue=${ttsQueue.length})`);
+
+  // Mark the entry that just finished playing as spoken and re-broadcast
+  if (_playingTtsEntryId != null) {
+    const justSpoken = conversationEntries.find(e => e.id === _playingTtsEntryId);
+    if (justSpoken && !justSpoken.spoken) {
+      justSpoken.spoken = true;
+      console.log(`[tts] Marked entry ${_playingTtsEntryId} as spoken`);
+      broadcast({ type: "entry", entries: conversationEntries, partial: false });
+    }
+    _playingTtsEntryId = null;
+  }
 
   // Play next queued text if available
   if (ttsQueue.length > 0) {
@@ -776,6 +808,7 @@ function handleTtsDone() {
           if (currentTtsEntryId != null) {
             broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: next });
           }
+          _playingTtsEntryId = currentTtsEntryId;
           broadcastBinary(buf);
           broadcast({ type: "voice_status", state: "speaking" });
           const estimatedMs = Math.max(5000, (buf.length / 16000) * 1000 + 3000);
@@ -808,11 +841,10 @@ function handleTtsDone() {
   if (unspoken.length > 0) {
     console.log(`[tts] Queue empty but ${unspoken.length} unspoken entries remain — speaking them`);
     for (const entry of unspoken) {
-      entry.spoken = true;
+      // Don't mark spoken here — handleTtsDone will mark each entry when audio completes
       currentTtsEntryId = entry.id;
       speakText(entry.text);
     }
-    broadcast({ type: "entry", entries: conversationEntries, partial: false });
     return;
   }
 
@@ -1148,6 +1180,7 @@ let conversationEntries: ConversationEntry[] = [];
 let entryIdCounter = 0;
 let currentTurn = 0;
 let currentTtsEntryId: number | null = null;
+let _playingTtsEntryId: number | null = null; // Entry whose audio is currently playing on client
 let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 // Tracks how many chars of each entry have already been queued for TTS.
 // Allows sentence-level TTS: speak complete sentences as they arrive mid-stream.
@@ -1195,6 +1228,7 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
   let currentSpeakable = true;
   let inToolBlock = false;
   let foundContent = false;
+  let inAgentBlock = false; // true while inside <teammate-message>, <task-notification>, <system-reminder> blocks
 
   function flushParagraph() {
     const text = reflowText(currentLines.join("\n").trim());
@@ -1221,8 +1255,12 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (/auto-compact/i.test(trimmed)) continue;
     // Filter leaked system context lines (wrapped tmux continuation lines)
     if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
-    // Filter Claude Code team/agent messages (teammate-message, idle_notification, task-notification, etc.)
-    if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification|^<\/?system-reminder/.test(trimmed)) continue;
+    // Filter Claude Code team/agent messages — stateful block filter
+    // Skips ALL lines between opening and closing tags, not just the tags themselves
+    if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock = true; continue; }
+    if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock = false; continue; }
+    if (inAgentBlock) continue;
+    if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) continue;
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
@@ -1423,14 +1461,19 @@ function loadScrollbackEntries(): ConversationEntry[] {
 
     // Collect and filter assistant response lines
     const responseLines: string[] = [];
+    let inAgentBlock2 = false;
     for (let i = start.lineIdx + 1; i < endLineIdx; i++) {
       const trimmed = lines[i].trim();
-      if (!trimmed) { responseLines.push(""); continue; }
+      if (!trimmed) { if (!inAgentBlock2) responseLines.push(""); continue; }
       if (/^[─━═]{3,}/.test(trimmed)) continue;
       if (/^❯/.test(trimmed)) continue;
       if (isSpinnerLine(trimmed)) continue;
       if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
-      if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification|^<\/?system-reminder/.test(trimmed)) continue;
+      // Stateful agent block filter
+      if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock2 = true; continue; }
+      if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock2 = false; continue; }
+      if (inAgentBlock2) continue;
+      if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) continue;
       if (/bypass\s+permissions/i.test(trimmed)) continue;
       if (/context left until/i.test(trimmed)) continue;
       if (/auto-compact/i.test(trimmed)) continue;
@@ -1598,11 +1641,27 @@ function broadcastCurrentOutput() {
   for (let i = 0; i < currentAssistant.length - 1; i++) {
     const entry = currentAssistant[i];
     if (entry.speakable && !entry.spoken) {
-      entry.spoken = true;
-      console.log(`[stream] Entry TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
-      plog("entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
-      currentTtsEntryId = entry.id;
-      speakText(entry.text);
+      // Check if sentence TTS already partially spoke this entry
+      const cursor = entryTtsCursor.get(entry.id) ?? 0;
+      if (cursor > 0) {
+        // Sentence TTS already spoke part of this entry — only speak the remaining tail
+        const tail = entry.text.slice(cursor).trim();
+        entry.spoken = true;
+        if (tail.length > 0) {
+          console.log(`[stream] Entry tail TTS (id=${entry.id}, cursor=${cursor}, tail=${tail.length} chars): "${tail.slice(0, 80)}"`);
+          plog("entry_tts_tail", `id=${entry.id} "${tail.slice(0, 80)}" (${tail.length} chars)`);
+          currentTtsEntryId = entry.id;
+          speakText(tail);
+        } else {
+          console.log(`[stream] Entry fully spoken by sentence TTS (id=${entry.id})`);
+        }
+      } else {
+        entry.spoken = true;
+        console.log(`[stream] Entry TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
+        plog("entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
+        currentTtsEntryId = entry.id;
+        speakText(entry.text);
+      }
     }
   }
 
@@ -1890,21 +1949,36 @@ function handleStreamDone() {
   const totalEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn).length;
   console.log(`[stream] Final: ${totalEntries} assistant entries (turn ${currentTurn})`);
 
-  // Mark spoken flags BEFORE broadcasting final entries — prevents client from
-  // briefly seeing spoken=false on a non-partial broadcast and marking entries as dropped (red)
+  // Queue unspoken entries for TTS but do NOT mark spoken=true yet.
+  // Entries are marked spoken in handleTtsDone when audio actually completes,
+  // then re-broadcast so the client sees accurate spoken flags.
   let spokeAnything = false;
   for (const entry of conversationEntries) {
     if (entry.role === "assistant" && entry.turn === currentTurn && entry.speakable && !entry.spoken) {
-      entry.spoken = true;
-      console.log(`[stream] Final TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
-      plog("final_entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
-      currentTtsEntryId = entry.id;
-      speakText(entry.text);
+      // Check if sentence TTS already partially spoke this entry during streaming
+      const cursor = entryTtsCursor.get(entry.id) ?? 0;
+      if (cursor > 0) {
+        const tail = entry.text.slice(cursor).trim();
+        if (tail.length > 0) {
+          console.log(`[stream] Final tail TTS (id=${entry.id}, cursor=${cursor}, tail=${tail.length} chars): "${tail.slice(0, 80)}"`);
+          plog("final_entry_tts_tail", `id=${entry.id} "${tail.slice(0, 80)}" (${tail.length} chars)`);
+          currentTtsEntryId = entry.id;
+          speakText(tail);
+        } else {
+          console.log(`[stream] Entry fully spoken by sentence TTS (id=${entry.id})`);
+          entry.spoken = true; // All sentences already spoken — mark immediately
+        }
+      } else {
+        console.log(`[stream] Final TTS (id=${entry.id}, ${entry.text.length} chars): "${entry.text.slice(0, 80)}..."`);
+        plog("final_entry_tts", `id=${entry.id} "${entry.text.slice(0, 80)}" (${entry.text.length} chars)`);
+        currentTtsEntryId = entry.id;
+        speakText(entry.text);
+      }
       spokeAnything = true;
     }
   }
 
-  // Broadcast final entries with correct spoken flags
+  // Broadcast final entries — spoken flags reflect actual TTS state (not preemptive)
   broadcast({
     type: "entry",
     entries: conversationEntries,
