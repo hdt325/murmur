@@ -721,9 +721,9 @@
       display: none;
     }
 
-    /* Visible during recording in flow mode */
+    /* Hidden — prelim bubble in transcript replaces this */
     body.flow-mode.flow-recording .flow-live-transcription {
-      display: block;
+      display: none;
       position: fixed;
       bottom: calc(96px + env(safe-area-inset-bottom, 0px));
       right: 20px;
@@ -798,7 +798,7 @@
     }
 
     body.flow-mode .flow-live-transcript.active {
-      display: block; /* visible as fallback — prelim bubble also shows in transcript */
+      display: none; /* hidden in flow mode — prelim bubble in transcript replaces this */
     }
 
     /* Each word fades in individually */
