@@ -942,12 +942,18 @@
       box-shadow: 0 0 28px rgba(231, 76, 60, 0.15);
     }
 
-    /* Thinking/responding: amber glow */
+    /* Thinking/responding: amber glow with pulse */
     body.flow-mode .talk-bar button.thinking,
     body.flow-mode .talk-bar button.responding {
-      border-color: rgba(201, 162, 39, 0.4);
-      background: #fffef8;
-      box-shadow: 0 0 32px rgba(201, 162, 39, 0.14);
+      border-color: rgba(201, 162, 39, 0.6);
+      background: #fffbee;
+      box-shadow: 0 0 24px rgba(201, 162, 39, 0.25), 0 0 48px rgba(201, 162, 39, 0.12);
+      animation: flow-thinking-pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes flow-thinking-pulse {
+      0%, 100% { box-shadow: 0 0 24px rgba(201, 162, 39, 0.25), 0 0 48px rgba(201, 162, 39, 0.12); }
+      50% { box-shadow: 0 0 32px rgba(201, 162, 39, 0.4), 0 0 64px rgba(201, 162, 39, 0.2); }
     }
 
     /* Speaking: subtle warm gold border, no glow/pulse */
