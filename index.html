@@ -5545,6 +5545,13 @@
       _recordingStarting = true;
       haptic(30); // short pulse on mic start
       console.log(`[rec] Starting recording (autoListen=${isAutoListen})`);
+      // Show prelim bubble immediately in flow mode (don't wait for SpeechRecognition)
+      if (flowMode) {
+        const bubble = _ensurePrelimBubble();
+        const textEl = bubble.querySelector(".entry-text");
+        if (textEl) textEl.textContent = "...";
+        scrollTranscript();
+      }
       startLiveTranscription();
 
       // Grab pre-buffer snapshot before recording starts
