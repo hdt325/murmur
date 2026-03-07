@@ -3217,7 +3217,11 @@
       }
       flowMode = !flowMode;
       localStorage.setItem("murmur-flow-mode", flowMode ? "1" : "0");
-      if (!flowMode) { document.body.classList.remove("flow-recording"); stopBargeIn(); flowModeBtn.style.removeProperty("--flow-btn-top"); flowModeBtn.style.removeProperty("--flow-btn-left"); }
+      if (!flowMode) {
+        document.body.classList.remove("flow-recording"); stopBargeIn(); flowModeBtn.style.removeProperty("--flow-btn-top"); flowModeBtn.style.removeProperty("--flow-btn-left");
+        // Start deferred tour on first exit from flow mode
+        if (window._tourPendingOnFlowExit) { window._tourPendingOnFlowExit = false; setTimeout(startTour, 800); }
+      }
       applyFlowMode();
       // Delay scroll to let CSS layout settle after flow mode transition
       requestAnimationFrame(() => { requestAnimationFrame(() => scrollTranscript(flowMode)); });
@@ -7027,9 +7031,13 @@
       if (!silent) localStorage.setItem("murmur-tour-done", "1");
     }
 
-    // Auto-start on first visit (1.5s delay for UI to settle)
+    // Auto-start on first visit — defer if in flow mode (tour targets are hidden)
     if (!localStorage.getItem("murmur-tour-done")) {
-      setTimeout(startTour, 1500);
+      if (!flowMode) {
+        setTimeout(startTour, 1500);
+      } else {
+        window._tourPendingOnFlowExit = true;
+      }
     }
 
     // Test hook — exposes internal functions for automated tests (localhost only)
