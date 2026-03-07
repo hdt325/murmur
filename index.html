@@ -394,12 +394,34 @@
       background: #3e4451;
     }
 
-    .conv-toolbar button#flowModeBtn {
+    /* Flow button: lives outside conv-toolbar so it survives flow-mode hiding */
+    #flowModeBtn {
+      background: #2c2c32;
+      border: 1px solid #333338;
+      border-radius: 4px;
       color: #666;
-      border-color: #333338;
+      font-size: 9px;
+      font-weight: 600;
+      padding: 2px 8px;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      position: sticky;
+      top: 0;
+      z-index: 11;
+      align-self: flex-start;
+      margin: 0 -12px 0;
+      margin-left: -6px;
+      margin-bottom: -4px;
     }
 
-    .conv-toolbar button#flowModeBtn.active {
+    #flowModeBtn:hover {
+      color: #e5e5e5;
+      border-color: #4b5263;
+      background: #3e4451;
+    }
+
+    #flowModeBtn.active {
       color: #c9b07c;
       border-color: #c9b07c66;
       background: rgba(201, 176, 124, 0.08);
@@ -2596,8 +2618,8 @@
 
   <!-- Section 3: Transcript -->
   <div class="transcript" id="transcript">
+    <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
     <div class="conv-toolbar" id="convToolbar">
-      <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
       <span class="conv-toolbar-spacer"></span>
       <span class="toolbar-brand"><img src="/icon-256.png" class="toolbar-brand-icon" alt="">MURMUR</span>
       <span class="conv-toolbar-spacer"></span>
