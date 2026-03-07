@@ -1985,20 +1985,29 @@ const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
 function startPassiveWatcher() {
   if (passiveWatcher) return;
   passiveWatcher = setInterval(() => {
-    if (streamState !== "IDLE" && streamState !== "DONE") return;
     if (!terminal.isSessionAlive()) return;
 
     const pane = captureTmuxPane();
     if (!pane) return;
 
+    // Detect "Interrupted" prompt — runs in ANY state since interrupts happen mid-stream
+    if (/Interrupted\s*[·—]\s*What should Claude do/i.test(pane)) {
+      broadcast({ type: "tool_status", text: "Interrupted — waiting for direction" });
+      // Also end the stream if still active
+      if (streamState !== "IDLE" && streamState !== "DONE") {
+        console.log("[passive] Interrupted prompt detected — ending stream");
+        streamState = "DONE";
+        lastStreamEndTime = Date.now();
+        stopClientPlayback();
+        broadcast({ type: "voice_status", state: "idle" });
+      }
+    }
+
     // Check for interactive prompts during idle (e.g. "How is Claude?" feedback)
     // This runs even during cooldown — auto-dismiss doesn't re-trigger streaming
     if (detectInteractivePrompt(pane)) return;
 
-    // Detect "Interrupted" prompt — Claude is waiting for user direction
-    if (/Interrupted\s*[·—]\s*What should Claude do/i.test(pane)) {
-      broadcast({ type: "tool_status", text: "Interrupted — waiting for direction" });
-    }
+    if (streamState !== "IDLE" && streamState !== "DONE") return;
 
     // Cooldown: don't trigger streaming if it just ended (prevents re-triggering on same session)
     if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
