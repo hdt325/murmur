@@ -3188,7 +3188,7 @@
     // ── Flow Mode ──────────────────────────────────────────────────────────────
     // Persists to localStorage. Hides all chrome, hero-sizes the talk button,
     // and makes the transcript minimal. Exit via the small "flow ×" corner button.
-    let flowMode = localStorage.getItem("murmur-flow-mode") === "1";
+    let flowMode = localStorage.getItem("murmur-flow-mode") !== "0";
     function applyFlowMode() {
       document.body.classList.toggle("flow-mode", flowMode);
       flowModeBtn.classList.toggle("active", flowMode);
