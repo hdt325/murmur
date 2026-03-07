@@ -1491,7 +1491,13 @@ function broadcastCurrentOutput() {
     const toolArg = toolMatch[2].trim().replace(/\s+/g, " ");
     broadcast({ type: "tool_status", text: `${toolName} · ${toolArg}` });
   } else {
-    broadcast({ type: "tool_status", text: "" });
+    // Detect activity status messages (compacting, updating, etc.)
+    const activityMatch = pane.match(/(Compacting conversation|Updating memory|Checking for updates|Searching|Indexing)[….]*/i);
+    if (activityMatch) {
+      broadcast({ type: "tool_status", text: activityMatch[1] + "…" });
+    } else {
+      broadcast({ type: "tool_status", text: "" });
+    }
   }
 
   // Trigger TTS for completed speakable entries (not the last one, which may still be growing)
