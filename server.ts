@@ -576,7 +576,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
 
   if (!speakable) {
     ttsInProgress = false;
-    broadcast({ type: "voice_status", state: "idle" });
+    broadcastIdleIfSafe();
     return;
   }
 
@@ -685,7 +685,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
         ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
         ttsPregenPromises.splice(0, ttsPregenPromises.length);
         serviceStatus.kokoro = false; // Force re-check on next call
-        broadcast({ type: "voice_status", state: "idle" });
+        broadcastIdleIfSafe();
       }
       return;
     }
@@ -695,7 +695,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       console.error("[tts] Produced empty/missing file");
       ttsRetryCount = 0; // Reset retry counter on empty file (curl succeeded but output bad)
       ttsInProgress = false;
-      broadcast({ type: "voice_status", state: "idle" });
+      broadcastIdleIfSafe();
       return;
     }
 
@@ -725,7 +725,7 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     if (myGen !== ttsGeneration) return;
     console.error("[tts] curl spawn error:", err.message);
     ttsInProgress = false;
-    broadcast({ type: "voice_status", state: "idle" });
+    broadcastIdleIfSafe();
   });
 }
 
@@ -847,6 +847,16 @@ function broadcastBinary(data: Buffer) {
 type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "DONE";
 
 let streamState: StreamState = "IDLE";
+
+// Broadcast idle only when stream is not active (prevents mic button glow flicker)
+function broadcastIdleIfSafe() {
+  if (streamState === "WAITING" || streamState === "THINKING" || streamState === "RESPONDING") {
+    const voiceState = streamState === "RESPONDING" ? "responding" : "thinking";
+    broadcast({ type: "voice_status", state: voiceState });
+  } else {
+    broadcast({ type: "voice_status", state: "idle" });
+  }
+}
 let streamWatcher: ReturnType<typeof setInterval> | null = null;
 let streamTimeout: ReturnType<typeof setTimeout> | null = null;
 let contentCheckTimer: ReturnType<typeof setTimeout> | null = null;
