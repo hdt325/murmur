@@ -835,3 +835,27 @@ A log of bugs found, root cause, fix, and test coverage.
 **Proposed fix**: Tighten wake word matching or add confirmation step.
 
 ---
+
+## BUG-073: Duplicate conversation bubbles from history + entry overlap
+
+**Status**: Fixed
+**Severity**: Critical
+**Found**: 2026-03-07
+**Symptom**: Same Claude message appears multiple times in the conversation view. Duplicates appear on every page load.
+**Root cause**: Two independent rendering paths coexist: `restoreHistory()` creates `.msg` elements from localStorage, then `renderEntries()` creates `.entry-bubble` elements from server data. The `renderEntries` cleanup only removes stale `.entry-bubble` elements — it never touches the legacy `.msg` bubbles from `restoreHistory`. Both show the same content.
+**Fix** (`index.html`): `renderEntries()` now clears all `.msg:not(.entry-bubble)` elements at the start of each call, removing legacy history bubbles when the entry system takes over.
+**Test**: Smoke + E2E pass (40/43, 100/105 — no regressions).
+
+---
+
+## BUG-074: Positional paragraph shift creates duplicate entries during streaming
+
+**Status**: Fixed
+**Severity**: High
+**Found**: 2026-03-07
+**Symptom**: During long Claude responses, the same text appears in multiple entry bubbles.
+**Root cause**: `broadcastCurrentOutput()` matches extracted paragraphs to existing entries by array index. During long responses, early content scrolls off the tmux pane, reducing the paragraph count. The positional match then shifts — paragraph 3 overwrites entry 1, paragraph 4 overwrites entry 2, etc. — while the original entries 3+ retain their old text. Result: same text in multiple entries.
+**Fix** (`server.ts`): (1) During RESPONDING, skip positional update if the first 20 chars don't match (detects shifted content). (2) Dedup new assistant entries against existing same-turn entries by exact text match. Applied in both `broadcastCurrentOutput` and `handleStreamDone`.
+**Test**: Smoke + E2E pass — no regressions.
+
+---

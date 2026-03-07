@@ -38,6 +38,9 @@ async function setup() {
   page = await ctx.newPage();
   // Suppress dialog popups
   page.on("dialog", d => d.dismiss());
+  // Default to normal mode — flow mode hides controls needed by tests
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
   await page.goto(BASE, { waitUntil: "networkidle" });
   // Wait for WebSocket connection
   await page.waitForFunction(() => (window as any).__wsConnected !== undefined || document.querySelector(".status-dot.green") !== null, { timeout: 5000 }).catch(() => {});

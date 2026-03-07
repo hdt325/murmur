@@ -946,6 +946,7 @@ function findUserInputLine(lines: string[], userInput: string): number {
 
 // Detect interactive prompts (plan approval, permission requests) and notify client
 let interactivePromptActive = false;
+let _feedbackDismissed = false; // Prevent auto-dismiss loop for feedback prompt
 function detectInteractivePrompt(pane: string): boolean {
   const lines = pane.split("\n");
   const tail = lines.slice(-15).join("\n");
@@ -959,10 +960,17 @@ function detectInteractivePrompt(pane: string): boolean {
   if (hasNumberedMenu || hasNumberedChoices || hasQuestion) {
     // Auto-dismiss Claude's session feedback prompt ("1: Bad  2: Fine  3: Good  0: Dismiss")
     if (/\b0:\s*Dismiss\b/i.test(tail)) {
-      console.log("[interactive] Auto-dismissing session feedback prompt");
-      terminal.sendText("0");
+      if (!_feedbackDismissed) {
+        _feedbackDismissed = true;
+        console.log("[interactive] Auto-dismissing session feedback prompt");
+        // Send raw keystroke "0" (not sendText which uses -l literal mode)
+        try {
+          execFileSync("tmux", ["send-keys", "-t", terminal.currentTarget!, "0"], { stdio: "ignore", timeout: 3000 });
+        } catch {}
+      }
       return true;
     }
+    _feedbackDismissed = false; // Reset for non-feedback prompts
     if (!interactivePromptActive) {
       interactivePromptActive = true;
       console.log("[interactive] Prompt detected — notifying client");
@@ -1151,6 +1159,19 @@ function addUserEntry(text: string, queued = false) {
   if (MURMUR_CONTEXT_FILTER.test(text.trim())) {
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
+  // Suppress Claude Code team/agent messages
+  if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification/.test(text.trim())) {
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
+  // Dedup: skip if an identical user entry already exists in the current or recent turn
+  // (prevents passive watcher re-adding text that was already added by text:/voice handler)
+  const normalized = text.trim().toLowerCase();
+  const recent = conversationEntries.filter(e => e.role === "user" && e.turn >= currentTurn - 1);
+  const dup = recent.find(e => e.text.trim().toLowerCase() === normalized);
+  if (dup) {
+    console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}"`);
+    return dup;
+  }
   const entry: ConversationEntry = {
     id: ++entryIdCounter,
     role: "user",
@@ -1200,6 +1221,8 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (/auto-compact/i.test(trimmed)) continue;
     // Filter leaked system context lines (wrapped tmux continuation lines)
     if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
+    // Filter Claude Code team/agent messages (teammate-message, idle_notification, task-notification, etc.)
+    if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification|^<\/?system-reminder/.test(trimmed)) continue;
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
@@ -1407,6 +1430,7 @@ function loadScrollbackEntries(): ConversationEntry[] {
       if (/^❯/.test(trimmed)) continue;
       if (isSpinnerLine(trimmed)) continue;
       if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
+      if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification|^<\/?system-reminder/.test(trimmed)) continue;
       if (/bypass\s+permissions/i.test(trimmed)) continue;
       if (/context left until/i.test(trimmed)) continue;
       if (/auto-compact/i.test(trimmed)) continue;
@@ -1505,21 +1529,33 @@ function broadcastCurrentOutput() {
       // Existing entry — update text if changed
       const existing = assistantEntries[i];
       if (existing.text !== para.text) {
-        existing.text = para.text;
-        existing.speakable = para.speakable;
+        // During streaming, if paragraphs shrunk (content scrolled off tmux top),
+        // positional matching shifts — don't overwrite entries with unrelated text.
+        // Only update if the new text is a growth/continuation of the existing text
+        // (shares at least the first 20 chars), or if we're not mid-stream.
+        const minLen = Math.min(20, existing.text.length, para.text.length);
+        const isGrowth = minLen === 0 ||
+          para.text.slice(0, minLen) === existing.text.slice(0, minLen);
+        if (streamState !== "RESPONDING" || isGrowth || paragraphs.length >= assistantEntries.length) {
+          existing.text = para.text;
+          existing.speakable = para.speakable;
+        }
       }
     } else {
-      // New paragraph — create entry
-      const entry: ConversationEntry = {
-        id: ++entryIdCounter,
-        role: "assistant",
-        text: para.text,
-        speakable: para.speakable,
-        spoken: false,
-        ts: Date.now(),
-        turn: currentTurn,
-      };
-      conversationEntries.push(entry);
+      // New paragraph — create entry (but skip if identical text already exists in this turn)
+      const isDup = assistantEntries.some(e => e.text === para.text);
+      if (!isDup) {
+        const entry: ConversationEntry = {
+          id: ++entryIdCounter,
+          role: "assistant",
+          text: para.text,
+          speakable: para.speakable,
+          spoken: false,
+          ts: Date.now(),
+          turn: currentTurn,
+        };
+        conversationEntries.push(entry);
+      }
     }
   }
 
@@ -1832,24 +1868,21 @@ function handleStreamDone() {
       assistantEntries[i].text = para.text;
       assistantEntries[i].speakable = para.speakable;
     } else {
-      conversationEntries.push({
-        id: ++entryIdCounter,
-        role: "assistant",
-        text: para.text,
-        speakable: para.speakable,
-        spoken: false,
-        ts: Date.now(),
-        turn: currentTurn,
-      });
+      // Skip if identical text already exists in this turn (positional shift dedup)
+      const isDup = assistantEntries.some(e => e.text === para.text);
+      if (!isDup) {
+        conversationEntries.push({
+          id: ++entryIdCounter,
+          role: "assistant",
+          text: para.text,
+          speakable: para.speakable,
+          spoken: false,
+          ts: Date.now(),
+          turn: currentTurn,
+        });
+      }
     }
   }
-
-  // Broadcast final entries
-  broadcast({
-    type: "entry",
-    entries: conversationEntries,
-    partial: false,
-  });
 
   // Clear tool status line when stream completes
   broadcast({ type: "tool_status", text: "" });
@@ -1857,7 +1890,8 @@ function handleStreamDone() {
   const totalEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn).length;
   console.log(`[stream] Final: ${totalEntries} assistant entries (turn ${currentTurn})`);
 
-  // Speak any remaining unspoken speakable entries (current turn only)
+  // Mark spoken flags BEFORE broadcasting final entries — prevents client from
+  // briefly seeing spoken=false on a non-partial broadcast and marking entries as dropped (red)
   let spokeAnything = false;
   for (const entry of conversationEntries) {
     if (entry.role === "assistant" && entry.turn === currentTurn && entry.speakable && !entry.spoken) {
@@ -1870,10 +1904,12 @@ function handleStreamDone() {
     }
   }
 
-  // Re-broadcast with final spoken states so client has correct fading
-  if (spokeAnything) {
-    broadcast({ type: "entry", entries: conversationEntries, partial: false });
-  }
+  // Broadcast final entries with correct spoken flags
+  broadcast({
+    type: "entry",
+    entries: conversationEntries,
+    partial: false,
+  });
 
   if (!spokeAnything) {
     const hasSpeakable = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.speakable);
@@ -2042,6 +2078,7 @@ function stopTmuxStreaming() {
 // Polls tmux pane every 2s while IDLE. If spinner detected, starts streaming.
 let passiveWatcher: ReturnType<typeof setInterval> | null = null;
 let lastPassiveSnapshot: string = "";
+let _cooldownThinking = false; // Track if we sent thinking state during cooldown
 let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
 const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
 
@@ -2074,7 +2111,24 @@ function startPassiveWatcher() {
     if (streamState !== "IDLE" && streamState !== "DONE") return;
 
     // Cooldown: don't trigger streaming if it just ended (prevents re-triggering on same session)
-    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) return;
+    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) {
+      // Even during cooldown, show amber glow + activity status for system tasks
+      // (e.g. "Compacting conversation", "Updating memory") so the UI isn't stuck on idle
+      if (hasSpinnerChars(pane)) {
+        _cooldownThinking = true;
+        broadcast({ type: "voice_status", state: "thinking" });
+        const activityMatch = pane.match(/(Compacting conversation|Updating memory|Checking for updates|Searching|Indexing)[….]*/i);
+        if (activityMatch) {
+          broadcast({ type: "tool_status", text: activityMatch[1] + "…" });
+        }
+      } else if (_cooldownThinking) {
+        // Spinner gone — system task finished, return to idle
+        _cooldownThinking = false;
+        broadcast({ type: "voice_status", state: "idle" });
+        broadcast({ type: "tool_status", text: "" });
+      }
+      return;
+    }
 
     if (hasSpinnerChars(pane)) {
       console.log("[passive] Spinner detected — native CLI input");
@@ -2090,8 +2144,8 @@ function startPassiveWatcher() {
           const parts = [trimmed.slice(2).trim()];
           for (let j = i + 1; j < lines.length; j++) {
             const next = lines[j].trim();
-            // Stop at empty lines, spinner lines, or new prompt lines
-            if (!next || next.startsWith("❯") || /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next)) break;
+            // Stop at empty lines, spinner lines, separator lines, or new prompt lines
+            if (!next || next.startsWith("❯") || /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next) || /^[─━═]{3,}/.test(next)) break;
             parts.push(next);
           }
           userInput = parts.join(" ");
@@ -2100,7 +2154,13 @@ function startPassiveWatcher() {
       }
 
       // Take pre-snapshot from saved state (before spinner appeared)
-      const snapshot = lastPassiveSnapshot || pane;
+      // If no saved snapshot, strip user input + spinner from current pane to synthesize a clean pre-state
+      let snapshot = lastPassiveSnapshot;
+      if (!snapshot) {
+        const paneLines = pane.split("\n");
+        const promptIdx = paneLines.findIndex(l => l.trim().startsWith("❯ ") && l.trim().length > 3);
+        snapshot = promptIdx >= 0 ? paneLines.slice(0, promptIdx).join("\n") : pane;
+      }
 
       // Start streaming just like a Murmur-initiated input
       if (streamState === "DONE" || streamState === "IDLE") {
@@ -2623,8 +2683,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   }
 
   // Send conversation entries so reconnecting clients see the full history
+  // Cap to last 80 entries to avoid overwhelming mobile clients on reconnect
   if (conversationEntries.length > 0) {
-    ws.send(JSON.stringify({ type: "entry", entries: conversationEntries, partial: streamState === "RESPONDING" }));
+    const recentEntries = conversationEntries.length > 80
+      ? conversationEntries.slice(-80)
+      : conversationEntries;
+    ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: streamState === "RESPONDING" }));
   }
 
   // Send current panel settings (prefer persistent file, fall back to signal files)

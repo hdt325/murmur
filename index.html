@@ -394,37 +394,33 @@
       background: #3e4451;
     }
 
-    /* Flow button: lives outside conv-toolbar so it survives flow-mode hiding */
+    /* Flow button: normal toolbar button, or fixed when in flow mode */
     #flowModeBtn {
-      background: #2c2c32;
-      border: 1px solid #333338;
-      border-radius: 4px;
       color: #666;
-      font-size: 9px;
-      font-weight: 600;
-      padding: 2px 8px;
-      cursor: pointer;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      position: sticky;
-      top: 0;
-      z-index: 11;
-      align-self: flex-start;
-      margin: 0 -12px 0;
-      margin-left: -6px;
-      margin-bottom: -4px;
-    }
-
-    #flowModeBtn:hover {
-      color: #e5e5e5;
-      border-color: #4b5263;
-      background: #3e4451;
+      border-color: #333338;
     }
 
     #flowModeBtn.active {
       color: #c9b07c;
       border-color: #c9b07c66;
       background: rgba(201, 176, 124, 0.08);
+    }
+
+    /* When reparented to body for flow mode */
+    #flowModeBtn.flow-fixed {
+      position: fixed;
+      top: calc(env(safe-area-inset-top, 0px) + 8px);
+      left: 12px;
+      z-index: 300;
+      background: #2c2c32;
+      border: 1px solid #3e4451;
+      border-radius: 4px;
+      font-size: 9px;
+      font-weight: 600;
+      padding: 2px 8px;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
     }
 
     .conv-toolbar-spacer {
@@ -577,13 +573,16 @@
     body.flow-mode {
       background: #f5f4ef;
       color: #1a1a1e;
-      /* Use 100% of html's -webkit-fill-available — more reliable than 100dvh on iOS */
-      height: 100%;
-      min-height: -webkit-fill-available;
+      height: auto;
+      min-height: 100vh;
+      min-height: 100dvh;
       padding-top: 0;
       box-sizing: border-box;
       /* Safe area top: at least 20px, more on notched devices */
       --flow-safe-top: max(env(safe-area-inset-top, 0px), 20px);
+      /* Let the page itself scroll — iOS Safari handles this reliably */
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
     }
 
     body.flow-mode .header {
@@ -592,27 +591,6 @@
 
     body.flow-mode .conv-toolbar {
       display: none;
-    }
-
-    /* Flow button stays visible in flow mode as toggle-off control */
-    body.flow-mode #flowModeBtn {
-      display: block;
-      position: fixed;
-      top: var(--flow-btn-top, max(14px, env(safe-area-inset-top)));
-      left: var(--flow-btn-left, 16px);
-      margin: 0;
-      z-index: 200;
-      background: rgba(255, 255, 255, 0.7);
-      border: 1px solid rgba(26, 26, 30, 0.15);
-      color: rgba(26, 26, 30, 0.45);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-    }
-
-    body.flow-mode #flowModeBtn:hover {
-      color: rgba(26, 26, 30, 0.7);
-      border-color: rgba(26, 26, 30, 0.3);
-      background: rgba(255, 255, 255, 0.85);
     }
 
     body.flow-mode .controls {
@@ -635,11 +613,14 @@
     body.flow-mode .transcript {
       min-height: 0;
       /* override 20vh min so flex can shrink to fit talk-bar */
-      padding: 20px 20px 0;
-      /* top padding: just clearance — notch area covered by .flow-top-shield overlay */
+      padding: calc(env(safe-area-inset-top, 0px) + 44px) 20px 0;
+      /* top padding: clears the top shield gradient so first bubble is fully visible */
       padding-bottom: calc(100vh + env(safe-area-inset-bottom, 0px));
       /* bottom padding ensures transcript is always scrollable enough to snap user entry to top */
       gap: 4px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      /* iOS Safari: enable momentum scrolling on the transcript */
       overflow-anchor: none;
       /* prevent browser scroll anchoring from fighting JS-driven scrolls */
       scroll-behavior: auto;
@@ -711,8 +692,9 @@
       opacity: 1 !important;
     }
 
-    /* Unspoken/dropped entry — red tint so user knows TTS was skipped */
-    body.flow-mode .msg.assistant.bubble-dropped {
+    /* Unspoken/dropped entry — red tint so user knows TTS was skipped.
+       bubble-spoken overrides: once TTS plays, entry is no longer dropped. */
+    body.flow-mode .msg.assistant.bubble-dropped:not(.bubble-spoken):not(.bubble-active) {
       color: #c0392b !important;
       opacity: 0.7 !important;
     }
@@ -756,7 +738,8 @@
       margin-top: 14px;
     }
 
-    body.flow-mode .entry-bubble.user {
+    body.flow-mode .entry-bubble.user,
+    body.flow-mode .msg.user {
       scroll-margin-top: 0;
     }
 
@@ -1117,8 +1100,8 @@
       top: 0;
       left: 0;
       right: 0;
-      height: calc(env(safe-area-inset-top, 0px) + 20px);
-      min-height: 20px;
+      height: calc(env(safe-area-inset-top, 0px) + 36px);
+      min-height: 36px;
       background: linear-gradient(to bottom, #f5f4ef 60%, transparent);
       z-index: 100;
       pointer-events: none;
@@ -1155,6 +1138,9 @@
       box-shadow: 0 -6px 40px rgba(26, 26, 30, 0.16);
       transform: translateY(100%);
       transition: transform 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+      max-height: 70vh;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
     }
 
     .flow-settings-sheet.open {
@@ -2707,8 +2693,8 @@
 
   <!-- Section 3: Transcript -->
   <div class="transcript" id="transcript">
-    <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
     <div class="conv-toolbar" id="convToolbar">
+      <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
       <span class="conv-toolbar-spacer"></span>
       <span class="toolbar-brand"><img src="/icon-256.png" class="toolbar-brand-icon" alt="">MURMUR</span>
       <span class="conv-toolbar-spacer"></span>
@@ -3177,59 +3163,25 @@
         transcript.scrollTop = transcript.scrollHeight;
         return;
       }
-      // Account for fixed talk-bar overlapping transcript bottom on mobile
+
+      // Flow mode scroll: let content fill the viewport naturally.
+      // Only scroll when the last entry goes below the talk bar (viewport full).
       const talkBar = document.querySelector(".talk-bar");
-      const barH = talkBar ? talkBar.getBoundingClientRect().height : 0;
+      const barTop = talkBar ? talkBar.getBoundingClientRect().top : window.innerHeight;
 
-      // If TTS is actively speaking, scroll to the active entry instead of the user bubble
-      const activeEntry = transcript.querySelector(".msg.bubble-active");
-      if (activeEntry && typeof ttsPlaying !== "undefined" && ttsPlaying && !forceUserSnap) {
-        const cR = transcript.getBoundingClientRect();
-        const eR = activeEntry.getBoundingClientRect();
-        const visibleBottom = cR.bottom - barH;
-        if (eR.top < cR.top || eR.bottom > visibleBottom) {
-          transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 96), behavior: "smooth" });
-        }
-        return;
-      }
-      const userBubbles = transcript.querySelectorAll(".msg.user");
-      const lastUser = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
+      // Find the bottom-most entry
+      const allMsgs = transcript.querySelectorAll(".msg");
+      const lastMsg = allMsgs.length ? allMsgs[allMsgs.length - 1] : null;
+      if (!lastMsg) return;
 
-      if (transcript.scrollHeight <= transcript.clientHeight + 10) {
-        transcript.scrollTop = 0;
-      } else if (lastUser) {
-        // Snap last user message to near top
-        transcript.scrollTop = 0;
-        void transcript.getBoundingClientRect();
-        const cR = transcript.getBoundingClientRect();
-        const eR = lastUser.getBoundingClientRect();
-        const userSnapScroll = Math.max(0, eR.top - cR.top - 20);
+      const lastBottom = lastMsg.getBoundingClientRect().bottom;
 
-        if (forceUserSnap) {
-          // Opening flow mode — position last exchange around mid-viewport so bottom half is empty
-          const visibleH = cR.height - barH;
-          const midSnap = Math.max(0, eR.top - cR.top + transcript.scrollTop - visibleH * 0.4);
-          transcript.scrollTop = midSnap;
-        } else {
-          const allEntries = transcript.querySelectorAll(".msg.assistant, .msg.user");
-          const lastEntry = allEntries.length ? allEntries[allEntries.length - 1] : null;
+      // If the last entry's bottom is above the talk bar, content fits — no scroll needed
+      if (lastBottom <= barTop) return;
 
-          if (lastEntry && lastEntry !== lastUser) {
-            transcript.scrollTop = userSnapScroll;
-            void transcript.getBoundingClientRect();
-            const lastR = lastEntry.getBoundingClientRect();
-            const tR = transcript.getBoundingClientRect();
-            const visibleH = tR.height - barH;
-            if (lastR.bottom > tR.top + visibleH + 20) {
-              transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - visibleH + 40);
-            }
-          } else {
-            transcript.scrollTop = userSnapScroll;
-          }
-        }
-      } else {
-        transcript.scrollTop = transcript.scrollHeight;
-      }
+      // Content overflows: scroll just enough to bring the last entry's bottom above the talk bar
+      const delta = lastBottom - barTop + 16;
+      window.scrollTo(0, window.scrollY + delta);
     }
 
     // Event delegation for transcript — handles click-to-copy and replay for all bubbles
@@ -3294,21 +3246,23 @@
       document.body.classList.toggle("flow-mode", flowMode);
       flowModeBtn.classList.toggle("active", flowMode);
       if (flowMode) {
+        // Move button to body so it's fixed and independent of toolbar/scroll
+        document.body.appendChild(flowModeBtn);
+        flowModeBtn.classList.add("flow-fixed");
         _flowInitialRender = false; // reset so bubble-spoken class applies to history entries
+      } else {
+        // Move button back into toolbar as first child
+        const toolbar = document.getElementById("convToolbar");
+        if (toolbar) toolbar.insertBefore(flowModeBtn, toolbar.firstChild);
+        flowModeBtn.classList.remove("flow-fixed");
       }
     }
     applyFlowMode();
     flowModeBtn.addEventListener("click", () => {
-      // Capture exact position before toggling so flow mode can match it
-      if (!flowMode) {
-        const r = flowModeBtn.getBoundingClientRect();
-        flowModeBtn.style.setProperty("--flow-btn-top", r.top + "px");
-        flowModeBtn.style.setProperty("--flow-btn-left", r.left + "px");
-      }
       flowMode = !flowMode;
       localStorage.setItem("murmur-flow-mode", flowMode ? "1" : "0");
       if (!flowMode) {
-        document.body.classList.remove("flow-recording"); stopBargeIn(); flowModeBtn.style.removeProperty("--flow-btn-top"); flowModeBtn.style.removeProperty("--flow-btn-left");
+        document.body.classList.remove("flow-recording"); stopBargeIn();
         // Start deferred tour on first exit from flow mode
         if (window._tourPendingOnFlowExit) { window._tourPendingOnFlowExit = false; setTimeout(startTour, 800); }
       }
@@ -4329,15 +4283,30 @@
             if (msg.entryId !== null && msg.entryId !== undefined) {
               _pendingHighlightEntryId = msg.entryId;
               _pendingHighlightSpeakableText = msg.speakableText || null;
+              // Remove bubble-dropped — this entry is about to be spoken
+              const targetEl = document.querySelector(`.entry-bubble[data-entry-id="${msg.entryId}"]`);
+              if (targetEl) {
+                targetEl.classList.remove("bubble-dropped");
+                targetEl.classList.add("bubble-active");
+              }
             }
             // Move previous active → spoken immediately so already-spoken entries stay dark
             document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+              if (msg.entryId != null && el.dataset.entryId === String(msg.entryId)) return;
               el.classList.remove("bubble-active");
               el.classList.add("bubble-spoken");
             });
           } else {
             // Normal mode: apply whole-bubble highlight right away
-            if (msg.entryId != null) highlightEntry(msg.entryId);
+            if (msg.entryId != null) {
+              highlightEntry(msg.entryId);
+            } else {
+              // Null highlight = TTS chain done — mark last active as spoken
+              document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+                el.classList.remove("bubble-active");
+                el.classList.add("bubble-spoken");
+              });
+            }
           }
         }
 
@@ -4468,6 +4437,11 @@
         if (msg.type === "tts_stop") {
           stopTtsPlayback();
           resetFlowWordHighlight(); // clear per-entry word positions for next response
+          // Clear entry-bubble highlights (clearBubbleHighlights skips these)
+          document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+            el.classList.remove("bubble-active");
+            el.classList.add("bubble-spoken");
+          });
         }
 
         if (msg.type === "restarting") {
@@ -4691,6 +4665,14 @@
     let _prevUserEntryIds = new Set(); // Track user entry IDs to detect genuinely new entries
 
     function renderEntries(entries, partial) {
+      // Clear legacy history bubbles (from restoreHistory/addMessage) that lack entry-bubble class.
+      // The entry system is the single source of truth — legacy bubbles cause duplicates.
+      transcript.querySelectorAll(".msg:not(.entry-bubble)").forEach(el => {
+        const wrap = el.closest(".msg-wrap");
+        if (wrap) wrap.remove();
+        else el.remove();
+      });
+
       // Capture before any mutation: is this the initial history render in flow mode?
       const isInitialFlowRender = document.body.classList.contains("flow-mode") && !_flowInitialRender;
       // Build map of existing entry bubbles and turn separators
@@ -4809,6 +4791,15 @@
         // Don't un-gray entries that were already spoken client-side
         // (server may re-broadcast with spoken:false during streaming updates)
 
+        // Mark speakable entries as dropped ONLY on final (non-partial) broadcast
+        // when server confirms spoken=false — meaning TTS completed and skipped this entry.
+        // Never mark during partial (streaming) since TTS hasn't had a chance yet.
+        if (!partial && entry.role === "assistant" && entry.speakable && !entry.spoken
+            && !div.classList.contains("bubble-spoken") && !div.classList.contains("bubble-active")
+            && document.body.classList.contains("flow-mode")) {
+          div.classList.add("bubble-dropped");
+        }
+
         // Partial opacity on last entry when streaming
         if (partial && i === entries.length - 1 && entry.role === "assistant") {
           div.style.opacity = "0.8";
@@ -4845,7 +4836,16 @@
       // Mark initial render done — subsequent renderEntries calls are live streaming, not history restore
       if (!_flowInitialRender) _flowInitialRender = true;
 
-      scrollTranscript();
+      // iOS Safari needs layout to settle before scroll takes effect
+      if (isIOS && document.body.classList.contains("flow-mode")) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            setTimeout(() => scrollTranscript(), 100);
+          });
+        });
+      } else {
+        scrollTranscript();
+      }
 
       // Save to history when not partial — only save current turn entries
       if (!partial && entries.length > 0) {
@@ -4916,6 +4916,7 @@
         });
         el.classList.add("bubble-active");
         el.classList.remove("bubble-spoken");
+        el.classList.remove("bubble-dropped"); // Entry is being spoken — not dropped
 
         // Scroll speaking entry to near top of transcript
         void transcript.getBoundingClientRect();
@@ -5098,10 +5099,12 @@
       // Apply state class with rAF so CSS transitions animate (class swap needs a frame gap)
       const prevClasses = [...talkBtn.classList];
       talkBtn.className = state === "idle" ? "" : state; // Set immediately for logic checks below
-      requestAnimationFrame(() => {
-        // Re-apply in next frame so transitions fire
-        talkBtn.className = state === "idle" ? "" : state;
-      });
+      if (state !== "idle") {
+        requestAnimationFrame(() => {
+          // Re-apply in next frame so transitions fire (skip idle — switch case sets idle-state)
+          talkBtn.className = state;
+        });
+      }
 
       toolStatusLine.textContent = ""; // Clear tool status on any state change
       toolStatusLine.style.opacity = "0";
@@ -5558,7 +5561,7 @@
         const textEl = bubble.querySelector(".entry-text");
         if (textEl) textEl.textContent = trimmed;
         console.log(`[lt] prelim bubble created/updated, parent=${!!bubble.parentNode}`);
-        // Scroll to keep the prelim bubble visible
+        // Scroll to keep the prelim bubble visible (debounced via rAF in scrollTranscript)
         scrollTranscript();
       }
 
@@ -5697,13 +5700,9 @@
       if (autoListenEnabled && idleFromTtsCompletion) playReadyChime();
       idleFromTtsCompletion = false;
       document.body.classList.remove("flow-recording"); // Hide live transcription strip
-      // Mark any assistant entries that were never spoken (no bubble-spoken/bubble-active) as dropped
-      if (flowMode) {
-        transcript.querySelectorAll(".msg.assistant:not(.bubble-spoken):not(.bubble-active):not(.bubble-dropped):not(.entry-nonspeakable)").forEach(el => {
-          el.classList.add("bubble-dropped");
-          rlog(`[tts] Marking entry as dropped (never spoken): ${el.textContent?.slice(0, 40)}`);
-        });
-      }
+      // Don't mark entries as dropped here — idle fires before TTS audio arrives.
+      // Instead, renderEntries handles dropped state using the server's spoken flag
+      // on non-partial (final) broadcasts. See renderEntries bubble-dropped logic.
       setTalkState("idle");
     }
     const TTS_ECHO_COOLDOWN = 150;   // 150ms cooldown after TTS ends (echoCancellation handles the rest)
@@ -5761,7 +5760,8 @@
       if (flowMode) {
         const bubble = _ensurePrelimBubble();
         const textEl = bubble.querySelector(".entry-text");
-        if (textEl) textEl.textContent = "...";
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (textEl) textEl.textContent = SR ? "..." : "Listening…";
         scrollTranscript();
       }
       startLiveTranscription();
@@ -7269,9 +7269,10 @@
       localStorage.setItem("murmur-flow-tour-done", "1");
     }
 
-    // Auto-start flow tour on first flow mode visit (3s delay for layout to settle)
+    // Flow tour disabled — auto-start caused blank gray screen on first load
+    // Users can still trigger the tour manually from the help menu
     if (flowMode && !localStorage.getItem("murmur-flow-tour-done")) {
-      setTimeout(startFlowTour, 3000);
+      localStorage.setItem("murmur-flow-tour-done", "1");
     }
 
     // Auto-start on first visit — defer if in flow mode (tour targets are hidden)

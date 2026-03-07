@@ -137,7 +137,7 @@ async function runScenario(scenario: UxScenario) {
     localStorage.setItem("murmur-tour-done", "1");
     localStorage.removeItem("murmur-debug");
     localStorage.removeItem("murmur-think-mode");
-    localStorage.removeItem("murmur-flow-mode");
+    localStorage.setItem("murmur-flow-mode", "0");
     localStorage.removeItem("term-open");
   });
   // Reload so page picks up the clean localStorage
@@ -397,7 +397,7 @@ const scenarios: UxScenario[] = [
     setup: async (p) => {
       await p.locator("#flowModeBtn").click();
       await p.waitForTimeout(300);
-      await p.locator("#flowExitBtn").click();
+      await p.locator("#flowModeBtn").click(); // flowModeBtn acts as toggle (flowExitBtn is display:none)
       await p.waitForTimeout(300);
     },
     expectation: `After exiting flow mode:

@@ -50,9 +50,13 @@ async function screenshot(label: string) {
 async function freshPage() {
   // Clear all localStorage and reload for a clean state
   await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
-  await page.evaluate(() => localStorage.clear());
-  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(1000);
+  await page.evaluate(() => {
+    localStorage.clear();
+    localStorage.setItem("murmur-flow-mode", "0"); // flow mode defaults ON when key absent
+  });
+  await page.reload({ waitUntil: "networkidle" });
+  await page.evaluate(() => document.body.classList.remove("flow-mode"));
+  await page.waitForTimeout(500);
 }
 
 async function readyPage() {
@@ -60,9 +64,11 @@ async function readyPage() {
   await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => {
     localStorage.setItem("murmur-tour-done", "1");
+    localStorage.setItem("murmur-flow-mode", "0"); // flow mode defaults ON when key absent
   });
-  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(1000);
+  await page.reload({ waitUntil: "networkidle" });
+  await page.evaluate(() => document.body.classList.remove("flow-mode"));
+  await page.waitForTimeout(500);
 }
 
 async function setup() {
@@ -75,6 +81,9 @@ async function setup() {
     viewport: { width: 320, height: 800 },
   });
   page = await ctx.newPage();
+  // Default to normal mode — flow mode tests explicitly enable it
+  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
 }
 
 // Wrap each test so one failure doesn't crash the suite
@@ -1579,8 +1588,9 @@ async function fmTestGearBtnVisible() {
 }
 
 async function fmTestExitButton() {
+  // flowExitBtn (display:none) replaced by flowModeBtn toggle — check the toggle is visible in flow mode
   const visible = await page.evaluate(() => {
-    const btn = document.querySelector(".flow-exit-btn") as HTMLElement;
+    const btn = document.getElementById("flowModeBtn") as HTMLElement;
     return btn ? getComputedStyle(btn).display !== "none" : false;
   });
   report("Flow mode: exit button visible", visible);
