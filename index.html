@@ -711,6 +711,12 @@
       opacity: 1 !important;
     }
 
+    /* Unspoken/dropped entry — red tint so user knows TTS was skipped */
+    body.flow-mode .msg.assistant.bubble-dropped {
+      color: #c0392b !important;
+      opacity: 0.7 !important;
+    }
+
     body.flow-mode .msg .role,
     body.flow-mode .msg .time,
     body.flow-mode .msg-replay,
@@ -5555,6 +5561,13 @@
       if (autoListenEnabled && idleFromTtsCompletion) playReadyChime();
       idleFromTtsCompletion = false;
       document.body.classList.remove("flow-recording"); // Hide live transcription strip
+      // Mark any assistant entries that were never spoken (no bubble-spoken/bubble-active) as dropped
+      if (flowMode) {
+        transcript.querySelectorAll(".msg.assistant:not(.bubble-spoken):not(.bubble-active):not(.bubble-dropped):not(.entry-nonspeakable)").forEach(el => {
+          el.classList.add("bubble-dropped");
+          rlog(`[tts] Marking entry as dropped (never spoken): ${el.textContent?.slice(0, 40)}`);
+        });
+      }
       setTalkState("idle");
     }
     const TTS_ECHO_COOLDOWN = 150;   // 150ms cooldown after TTS ends (echoCancellation handles the rest)
