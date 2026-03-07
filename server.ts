@@ -1991,7 +1991,8 @@ function startPassiveWatcher() {
     if (!pane) return;
 
     // Detect "Interrupted" prompt — runs in ANY state since interrupts happen mid-stream
-    if (/Interrupted\s*[·—]\s*What should Claude do/i.test(pane)) {
+    if (/Interrupted\s*.{0,3}\s*What should Claude do/i.test(pane)) {
+      console.log("[passive] Detected interrupt prompt in pane");
       broadcast({ type: "tool_status", text: "Interrupted — waiting for direction" });
       // Also end the stream if still active
       if (streamState !== "IDLE" && streamState !== "DONE") {
