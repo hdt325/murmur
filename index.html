@@ -3118,8 +3118,10 @@
         const userSnapScroll = Math.max(0, eR.top - cR.top - 20);
 
         if (forceUserSnap) {
-          // Opening flow mode — always snap to last user, don't override with assistant bottom
-          transcript.scrollTop = userSnapScroll;
+          // Opening flow mode — position last exchange around mid-viewport so bottom half is empty
+          const visibleH = cR.height - barH;
+          const midSnap = Math.max(0, eR.top - cR.top + transcript.scrollTop - visibleH * 0.4);
+          transcript.scrollTop = midSnap;
         } else {
           const allEntries = transcript.querySelectorAll(".msg.assistant, .msg.user");
           const lastEntry = allEntries.length ? allEntries[allEntries.length - 1] : null;
