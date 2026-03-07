@@ -110,9 +110,11 @@ export class TmuxBackend implements TerminalManager {
     try {
       // send-keys -l types each character literally into Claude Code's ink TUI.
       // paste-buffer was tried but doesn't reliably insert into the prompt.
+      // Timeout scales with message length — very long messages need more time.
+      const sendTimeout = Math.max(5000, Math.ceil(sanitized.length / 50) * 1000);
       execFileSync("tmux", ["send-keys", "-t", target, "-l", sanitized], {
         stdio: "ignore",
-        timeout: 5000,
+        timeout: sendTimeout,
       });
     } catch (err) {
       console.error("[sendText] send-keys -l failed:", (err as Error).message);
@@ -120,9 +122,12 @@ export class TmuxBackend implements TerminalManager {
     }
 
     // For long messages (>80 chars), Claude Code's ink TUI event loop may need
-    // time to process all the key events before Enter is accepted. Add a small
+    // time to process all the key events before Enter is accepted. Add a
     // proportional delay before sending Enter. Short messages get no delay.
-    const enterDelayMs = sanitized.length > 80 ? Math.min(100 + Math.floor(sanitized.length / 10), 400) : 0;
+    // Very long messages (500+ chars) need significantly more time.
+    const enterDelayMs = sanitized.length > 80
+      ? Math.min(200 + Math.floor(sanitized.length / 3), 3000)
+      : 0;
 
     const doSendEnter = () => {
       try {
@@ -194,15 +199,17 @@ export class TmuxBackend implements TerminalManager {
       } catch { return false; }
     };
 
-    // First retry fires after Enter would have been sent + 500ms buffer.
-    // Subsequent retries at 600ms intervals. 3 total retries.
-    const firstRetryMs = enterDelayMs + 500;
+    // First retry fires after Enter would have been sent + buffer.
+    // Longer messages get more buffer. 3 total retries.
+    const retryBuffer = sanitized.length > 300 ? 1000 : 500;
+    const retryInterval = sanitized.length > 300 ? 1000 : 600;
+    const firstRetryMs = enterDelayMs + retryBuffer;
     setTimeout(() => {
       if (!retryEnterIfStuck()) return;
       setTimeout(() => {
         if (!retryEnterIfStuck()) return;
-        setTimeout(retryEnterIfStuck, 600);
-      }, 600);
+        setTimeout(retryEnterIfStuck, retryInterval);
+      }, retryInterval);
     }, firstRetryMs);
   }
 

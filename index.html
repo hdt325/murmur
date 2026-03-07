@@ -558,10 +558,10 @@
       /* Use 100% of html's -webkit-fill-available — more reliable than 100dvh on iOS */
       height: 100%;
       min-height: -webkit-fill-available;
-      /* Top safe area: padding is inside the 100% height with border-box.
-         max() ensures at least 20px on devices where the env() returns 0. */
-      padding-top: max(env(safe-area-inset-top, 0px), 20px);
+      padding-top: 0;
       box-sizing: border-box;
+      /* Safe area top: at least 20px, more on notched devices */
+      --flow-safe-top: max(env(safe-area-inset-top, 0px), 20px);
     }
 
     body.flow-mode .header {
@@ -592,8 +592,8 @@
     body.flow-mode .transcript {
       min-height: 0;
       /* override 20vh min so flex can shrink to fit talk-bar */
-      padding: 16px 20px 0;
-      /* safe area already handled by body padding-top */
+      padding: 20px 20px 0;
+      /* top padding: just clearance — notch area covered by .flow-top-shield overlay */
       padding-bottom: calc(100vh + env(safe-area-inset-bottom, 0px));
       /* bottom padding ensures transcript is always scrollable enough to snap user entry to top */
       gap: 4px;
@@ -601,8 +601,8 @@
       /* prevent browser scroll anchoring from fighting JS-driven scrolls */
       scroll-behavior: auto;
       /* Fade top 16px so entries that scroll up disappear cleanly */
-      -webkit-mask-image: linear-gradient(to bottom, transparent 0px, black 16px);
-      mask-image: linear-gradient(to bottom, transparent 0px, black 16px);
+      -webkit-mask-image: none;
+      mask-image: none;
     }
 
     /* Bubbles: Claude Code style —
@@ -684,6 +684,14 @@
       opacity: 0.78;
     }
 
+    body.flow-mode .msg.user.prelim-bubble {
+      opacity: 0.6;
+      border: 1px dashed rgba(26, 26, 30, 0.15) !important;
+    }
+    body.flow-mode .msg.user.prelim-bubble .entry-text {
+      font-style: italic;
+    }
+
     body.flow-mode .msg:hover {
       filter: none;
     }
@@ -713,18 +721,20 @@
       display: none;
     }
 
-    /* shown via JS when recording */
+    /* Hidden in flow mode — replaced by prelim bubble in transcript */
     body.flow-mode.flow-recording .flow-live-transcription {
-      display: block;
+      display: none;
       position: fixed;
       bottom: calc(96px + env(safe-area-inset-bottom, 0px));
       right: 20px;
       max-width: 72%;
-      background: rgba(26, 26, 30, 0.05);
+      background: #f5f4ef;
+      border: 1px solid rgba(26, 26, 30, 0.12);
+      box-shadow: 0 2px 16px rgba(26, 26, 30, 0.10);
       border-radius: 18px 18px 4px 18px;
-      padding: 8px 14px;
+      padding: 10px 16px;
       font-size: 15px;
-      color: rgba(26, 26, 30, 0.4);
+      color: rgba(26, 26, 30, 0.55);
       font-style: italic;
       animation: flow-fade-in 0.2s ease-out;
       z-index: 10;
@@ -748,8 +758,8 @@
     body.flow-mode .talk-bar {
       background: #f5f4ef;
       border-top: none;
-      padding: 10px 20px;
-      padding-bottom: env(safe-area-inset-bottom, 0px);
+      padding: 16px 20px;
+      padding-bottom: max(env(safe-area-inset-bottom, 0px), 16px);
       display: flex;
       align-items: center;
       justify-content: center;
@@ -774,8 +784,11 @@
       color: rgba(26, 26, 30, 0.55);
       font-style: italic;
       pointer-events: none;
-      max-height: 160px;
-      overflow: hidden;
+      max-height: 40vh;
+      overflow-y: auto;
+      overflow-x: hidden;
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0px, black 20px);
+      mask-image: linear-gradient(to bottom, transparent 0px, black 20px);
       opacity: 1;
       transition: opacity 0.35s ease-out;
     }
@@ -785,7 +798,7 @@
     }
 
     body.flow-mode .flow-live-transcript.active {
-      display: block;
+      display: none; /* replaced by prelim bubble in transcript */
     }
 
     /* Each word fades in individually */
@@ -959,6 +972,23 @@
     }
 
     body.flow-mode .flow-exit-btn {
+      display: block;
+    }
+
+    /* Fixed top shield — covers notch/status bar area so transcript content can't bleed through */
+    .flow-top-shield {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: calc(env(safe-area-inset-top, 0px) + 20px);
+      min-height: 20px;
+      background: linear-gradient(to bottom, #f5f4ef 60%, transparent);
+      z-index: 100;
+      pointer-events: none;
+    }
+    body.flow-mode .flow-top-shield {
       display: block;
     }
 
@@ -2508,7 +2538,8 @@
 
 <body>
 
-  <!-- Flow mode exit button — shown only in flow-mode via CSS -->
+  <!-- Flow mode: top shield covers notch/status bar; exit button -->
+  <div class="flow-top-shield"></div>
   <button class="flow-exit-btn" id="flowExitBtn" data-tip="Exit Flow Mode">flow ×</button>
 
   <!-- Update banner (hidden until electron-updater signals update-downloaded) -->
@@ -3002,7 +3033,7 @@
         return;
       }
       // If TTS is actively speaking, scroll to the active entry instead of the user bubble
-      const activeEntry = transcript.querySelector(".entry-bubble.bubble-active");
+      const activeEntry = transcript.querySelector(".msg.bubble-active");
       if (activeEntry && typeof ttsPlaying !== "undefined" && ttsPlaying) {
         const cR = transcript.getBoundingClientRect();
         const eR = activeEntry.getBoundingClientRect();
@@ -3011,16 +3042,47 @@
         }
         return;
       }
-      // Flow mode: snap the latest user bubble to 20px from the transcript top.
-      const userBubbles = transcript.querySelectorAll(".entry-bubble.user");
+      // Flow mode scroll strategy:
+      // 1. If all content fits in viewport — just scroll to bottom (show everything)
+      // 2. If content overflows — snap last user message to 20px from top
+      // 3. If assistant response grew past viewport after snap — scroll to show newest content
+      // Check both entry-bubble (renderEntries path) and plain .msg (addMessage/history path)
+      const userBubbles = transcript.querySelectorAll(".msg.user");
       const lastUser = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
-      if (lastUser) {
+
+      // Check if content overflows the viewport
+      if (transcript.scrollHeight <= transcript.clientHeight + 10) {
+        // Everything fits — no scrolling needed, show all content
         transcript.scrollTop = 0;
-        const cR = transcript.getBoundingClientRect(); // forces reflow at scrollTop=0
-        const eR = lastUser.getBoundingClientRect();   // absolute position from container top
-        transcript.scrollTop = Math.max(0, eR.top - cR.top - 20);
+      } else if (lastUser) {
+        // Content overflows — snap last user message to near top
+        transcript.scrollTop = 0;
+        void transcript.getBoundingClientRect(); // force reflow
+        const cR = transcript.getBoundingClientRect();
+        const eR = lastUser.getBoundingClientRect();
+        const userSnapScroll = Math.max(0, eR.top - cR.top - 20);
+
+        // Find the last entry (newest content)
+        const allEntries = transcript.querySelectorAll(".msg.assistant, .msg.user");
+        const lastEntry = allEntries.length ? allEntries[allEntries.length - 1] : null;
+
+        if (lastEntry && lastEntry !== lastUser) {
+          // Check if snapping to user bubble would hide the latest content
+          transcript.scrollTop = userSnapScroll;
+          void transcript.getBoundingClientRect();
+          const lastR = lastEntry.getBoundingClientRect();
+          const tR = transcript.getBoundingClientRect();
+          if (lastR.bottom > tR.bottom + 20) {
+            // Latest content is below viewport — scroll to show it instead
+            transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - tR.height + 40);
+          }
+          // else: user snap is fine, latest content is visible
+        } else {
+          transcript.scrollTop = userSnapScroll;
+        }
       } else {
-        transcript.scrollTop = 0;
+        // No user bubbles — scroll to bottom to show latest content
+        transcript.scrollTop = transcript.scrollHeight;
       }
     }
 
@@ -3095,7 +3157,8 @@
       localStorage.setItem("murmur-flow-mode", flowMode ? "1" : "0");
       if (!flowMode) { document.body.classList.remove("flow-recording"); stopBargeIn(); }
       applyFlowMode();
-      scrollTranscript();
+      // Delay scroll to let CSS layout settle after flow mode transition
+      requestAnimationFrame(() => { requestAnimationFrame(() => scrollTranscript()); });
     });
     flowExitBtn.addEventListener("click", () => {
       flowMode = false;
@@ -4582,6 +4645,11 @@
       if (_ltWaitingForBubble && entries.some(e => e.role === "user")) {
         _clearLiveTranscription();
       }
+      // Always remove prelim bubble when real entries arrive (it has no data-entry-id so
+      // the stale-removal loop above won't catch it)
+      if (_prelimBubble && entries.some(e => e.role === "user")) {
+        _removePrelimBubble();
+      }
 
       // Mark initial render done — subsequent renderEntries calls are live streaming, not history restore
       if (!_flowInitialRender) _flowInitialRender = true;
@@ -5256,19 +5324,49 @@
 
     let _ltRenderedWords = 0; // how many words we've already rendered as spans
 
+    // Prelim bubble: a temporary user bubble in the transcript that shows live transcription
+    let _prelimBubble = null;
+
+    function _ensurePrelimBubble() {
+      if (_prelimBubble && _prelimBubble.parentNode) return _prelimBubble;
+      _prelimBubble = document.createElement("div");
+      _prelimBubble.className = "msg user entry-bubble prelim-bubble";
+      _prelimBubble.innerHTML =
+        `<div class="meta"><span class="role">You</span><span class="time">now</span></div>` +
+        `<span class="entry-text" style="font-style:italic"></span>`;
+      transcript.appendChild(_prelimBubble);
+      return _prelimBubble;
+    }
+
+    function _removePrelimBubble() {
+      if (_prelimBubble && _prelimBubble.parentNode) {
+        _prelimBubble.parentNode.removeChild(_prelimBubble);
+      }
+      _prelimBubble = null;
+    }
+
     function _ltRenderText(text) {
-      // Split on whitespace, keep existing spans, only add new words
-      const words = text.trim().split(/\s+/).filter(Boolean);
-      // Remove any extra spans beyond current word count (edge case: correction)
+      const trimmed = text.trim();
+      if (!trimmed) return;
+
+      if (flowMode) {
+        // Flow mode: render into a prelim user bubble in the transcript
+        const bubble = _ensurePrelimBubble();
+        const textEl = bubble.querySelector(".entry-text");
+        if (textEl) textEl.textContent = trimmed;
+        // Scroll to keep the prelim bubble visible
+        scrollTranscript();
+      }
+
+      // Also update the floating element (non-flow mode or fallback)
+      const words = trimmed.split(/\s+/).filter(Boolean);
       while (_liveTranscriptEl.children.length > words.length) {
         _liveTranscriptEl.removeChild(_liveTranscriptEl.lastChild);
         if (_ltRenderedWords > words.length) _ltRenderedWords = words.length;
       }
-      // Update text of existing spans (in case of correction mid-word)
       for (let i = 0; i < Math.min(_ltRenderedWords, words.length); i++) {
         _liveTranscriptEl.children[i].textContent = words[i] + (i < words.length - 1 ? " " : "");
       }
-      // Append new words as animated spans
       for (let i = _ltRenderedWords; i < words.length; i++) {
         const span = document.createElement("span");
         span.className = "lt-word";
@@ -5276,6 +5374,7 @@
         _liveTranscriptEl.appendChild(span);
       }
       _ltRenderedWords = words.length;
+      _liveTranscriptEl.scrollTop = _liveTranscriptEl.scrollHeight;
     }
 
     function initLiveTranscription() {
@@ -5333,6 +5432,7 @@
 
     function _clearLiveTranscription() {
       _ltWaitingForBubble = false;
+      _removePrelimBubble();
       _liveTranscriptEl.classList.add("fading");
       setTimeout(() => {
         _liveTranscriptEl.classList.remove("active", "fading");
@@ -5812,7 +5912,11 @@
         audio.onerror = done;
         ttsCurrentSource = audio;
         ttsPlaybackTimer = setTimeout(() => { audio.pause(); done(); }, 120000);
-        audio.onplay = () => { onTtsAudioStart((audio.duration || 3) * 1000); };
+        audio.onplay = () => {
+          const dur = audio.duration;
+          const durMs = (dur && isFinite(dur) && dur > 0) ? dur * 1000 : 3000;
+          onTtsAudioStart(durMs);
+        };
         audio.play().catch(e => { console.error("[tts] Fallback play failed:", e); done(); });
       });
     }
