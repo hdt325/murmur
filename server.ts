@@ -823,7 +823,11 @@ function handleTtsDone() {
       console.log(`[tts] TTS chunk done, ${ttsQueue.length} queued — staying in speaking state`);
       return;
     }
-    console.log(`[tts] TTS chunk done, queue empty, stream ${streamState} — going idle (will re-speak if more comes)`);
+    console.log(`[tts] TTS chunk done, queue empty, stream ${streamState} — staying in ${streamState} state`);
+    // Don't go idle — stream is still active. Broadcast current stream state to prevent flicker.
+    const streamVoiceState = streamState === "RESPONDING" ? "responding" : "thinking";
+    broadcast({ type: "voice_status", state: streamVoiceState });
+    return;
   } else {
     console.log("[tts] TTS done — broadcasting idle");
     plog("cycle_idle", "tts done, queue empty");
