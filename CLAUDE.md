@@ -26,9 +26,9 @@ tmux (macOS) / node-pty (Windows)
 Claude Code CLI session
 ```
 
-- **Frontend**: `index.html` — Single-file SPA (3.5K LOC), all CSS/JS inline
-- **Server**: `server.ts` — Express + WebSocket bridge (~2.9K LOC). Manages terminal session, TTS queue, STT transcription, conversation entry model, passive watcher polling
-- **Electron**: `electron/main.js` — App shell (~680 LOC). Startup checks, auto-update (electron-updater), content auto-update from GitHub raw
+- **Frontend**: `index.html` — Single-file SPA (~6.6K LOC), all CSS/JS inline
+- **Server**: `server.ts` — Express + WebSocket bridge (~3.5K LOC). Manages terminal session, TTS queue, STT transcription, conversation entry model, passive watcher polling
+- **Electron**: `electron/main.js` — App shell (~800 LOC). Startup checks, auto-update (electron-updater), content auto-update from GitHub raw
 - **Terminal**: `terminal/` — `interface.ts` (abstraction), `tmux-backend.ts` (macOS), `pty-backend.ts` (Windows)
 - **Site**: `site/index.html` — Marketing/download page deployed to Cloudflare Pages
 
@@ -45,9 +45,9 @@ Claude Code CLI session
 
 | File | LOC | Purpose |
 |------|-----|---------|
-| `server.ts` | 2915 | Core server: WS handlers, TTS queue, STT, entry model, passive watcher |
-| `index.html` | 3475 | Full frontend: CSS, HTML, JS inline. Conversation UI, terminal panel, controls |
-| `electron/main.js` | 683 | Electron shell: startup, auto-update, content update, window management |
+| `server.ts` | ~3460 | Core server: WS handlers, TTS queue, STT, entry model, passive watcher |
+| `index.html` | ~6607 | Full frontend: CSS, HTML, JS inline. Conversation UI, terminal panel, controls |
+| `electron/main.js` | ~804 | Electron shell: startup, auto-update, content update, window management |
 | `terminal/interface.ts` | 59 | TerminalManager abstraction (sendText, sendKey, capturePane, etc.) |
 | `terminal/tmux-backend.ts` | 185 | tmux implementation (macOS) |
 | `terminal/pty-backend.ts` | 159 | node-pty implementation (Windows) |
@@ -228,17 +228,47 @@ Push to main
 
 ## Testing
 
+> **CRITICAL — SELF-INTERRUPTION PREVENTION**
+> Tests MUST be run in the **`test-runner`** tmux session ONLY.
+>
+> **Why**: Every command run via the Bash tool executes in the claude-voice shell, and its output
+> appears in the claude-voice tmux pane. The passive watcher captures that output as Claude's
+> response. `tail`, `cat`, `grep`, running `tests/run.sh` directly — all of these pollute the
+> terminal and break the conversation.
+>
+> **What is safe from the Bash tool:**
+> - `tmux send-keys -t test-runner "CMD" Enter` — sends command to test-runner, produces no output here
+> - `Read /tmp/murmur-test-results.txt` — file read via dedicated tool, no terminal output
+>
+> **What is NEVER safe from the Bash tool:**
+> - Running `tests/run.sh` directly (its `tail -f` runs in claude-voice shell)
+> - `cat`, `tail`, `tail -5`, `grep`, `wc`, `ls` on result files (output appears in pane)
+> - `tmux capture-pane -t test-runner -p` (capture output appears in pane)
+> - ANY Bash command that produces visible terminal output — including one-liners like `tail -5 /tmp/results.txt`
+>
+> **Correct protocol from Claude Code:**
+> ```
+> Step 1: tmux send-keys -t test-runner "cd /Users/happythakkar/Desktop/Programming/murmur && node --import tsx/esm tests/test-bugs.ts > /tmp/murmur-test-results.txt 2>&1; echo DONE" Enter
+> Step 2: Wait a reasonable amount of time (tests take ~60-90s), then use Read tool to check
+> Step 3: Read /tmp/murmur-test-results.txt  ← ALWAYS use Read tool, NEVER tail/cat via Bash
+> ```
+>
+> The Read tool reads files without running any shell command — it is always safe.
+
 ```bash
-npm test              # Smoke tests (fast, server only)
-npm run test:e2e      # Full E2E (needs server + Claude session)
-npm run test:bugs     # Regression tests
+tests/run.sh all      # ← SINGLE COMMAND: full suite, service-aware
+tests/run.sh e2e      # E2E + flow mode only (~105 tests)
+tests/run.sh flow     # Flow mode deep tests
+tests/run.sh bugs     # Regression tests
+tests/run.sh smoke    # UI smoke tests only
 ```
 
 | Test File | Purpose | Requires |
 |-----------|---------|----------|
-| `test-smoke.ts` | 20 UI smoke tests | server:3457 |
-| `test-e2e.ts` | 91 E2E tests (all features) | server:3457 + Claude session |
-| `test-bugs.ts` | 11+ regression tests | server:3457 |
+| `test-smoke.ts` | ~20 UI smoke tests | server:3457 |
+| `test-e2e.ts` | ~105 E2E + flow mode tests | server:3457 + Claude session |
+| `test-flow.ts` | Comprehensive flow mode (real entry data, TTS highlight) | server:3457 |
+| `test-bugs.ts` | Regression tests | server:3457 |
 | `test-detection.ts` | Poll detection unit tests | optional: tmux |
 | `test-audio-pipeline.ts` | STT/TTS integration | server + Whisper + Kokoro |
 | `test-tts-pipeline.ts` | TTS formatting/codec | server + Kokoro |
@@ -256,7 +286,7 @@ Up to 5 tests are flaky due to state leakage (prior interactions affect later te
 - "Unspoken entry has full opacity" — entry marked spoken by earlier test
 - "Opacity boundary" — passive watcher re-renders entries mid-animation during active Claude sessions
 
-Typical results: **20/20 smoke**, **86/91 E2E** (with active Claude session), **91/91 E2E** (fresh server + idle Claude).
+Typical results: **20/20 smoke**, **~100/105 E2E+flow** (with active Claude session), **105/105 E2E+flow** (fresh server + idle Claude).
 
 ## Security Hardening
 
@@ -304,6 +334,59 @@ git push origin main   # → release.yml + deploy-site.yml
 ### Modify system context
 - Edit `MURMUR_CONTEXT_LINES` array (server.ts ~179)
 - **Also update `MURMUR_CONTEXT_FILTER` regex** (server.ts ~186) to match new lines — prevents leaked context from appearing as conversation bubbles
+
+## Bug Fixing Protocol — MANDATORY
+
+Every bug fix MUST follow this sequence. Do NOT skip steps.
+
+### Step 1: Investigate BEFORE Changing Code
+
+- **Read the full function/module** involved in the bug — not just the line that looks wrong.
+- **Trace the data flow** from input to output. Identify WHERE the state goes wrong, not just where the symptom appears.
+- **Explain the root cause** in plain language before proposing any fix. If you can't explain why the bug happens, you don't understand it well enough to fix it.
+- **Check for related state**: bugs in this codebase often involve stale state, missed cleanup, race conditions between TTS/polling/WebSocket, or event handler accumulation. Look for these patterns specifically.
+
+### Step 2: Fix Narrowly
+
+- Change the minimum code necessary. Do not refactor surrounding code.
+- If the fix touches shared state (entries, TTS queue, generation counter, polling), check every other consumer of that state for breakage.
+
+### Step 3: Run Tests After EVERY Change
+
+After ANY code modification (bug fix, feature, refactor), run the full test suite:
+
+```bash
+tests/run.sh all
+```
+
+Then read `/tmp/murmur-test-results.txt` to confirm results.
+
+**Do NOT consider a fix complete until tests pass.** If a test fails, investigate — do not ignore it.
+
+### Step 4: Add a Regression Test
+
+For every bug fix, add a test to `tests/test-bugs.ts` that:
+1. Reproduces the conditions that caused the bug
+2. Asserts the correct behavior
+3. Would FAIL if the bug were reintroduced
+
+Name it `testBugN_shortDescription` following the existing pattern.
+
+### Step 5: Verify No Regressions
+
+If you changed server.ts → run bugs + smoke + e2e.
+If you changed index.html → run smoke + e2e.
+If you changed TTS/entry logic → run e2e + flow.
+
+Read the full output in `/tmp/murmur-test-results.txt` and confirm pass counts match or exceed previous run.
+
+### Common Debugging Mistakes (DO NOT DO THESE)
+
+- **Patching symptoms**: Adding a null check where the real bug is that state wasn't cleaned up. Find WHY the value is null.
+- **Guess-and-check**: Making a change, seeing if it helps, making another change. Investigate first.
+- **Ignoring test failures**: "That test was already flaky" — check if your change made it worse. Compare to the known flaky list in the Testing section.
+- **Not reading enough code**: If a bug involves the entry system, read ALL of `extractStructuredOutput`, `getLinesAfterInput`, `reflowText`, and the entry broadcast path. Not just the function that seems related.
+- **Breaking other features**: Every TTS change risks breaking highlight chain. Every entry change risks breaking clean/verbose mode. Every poll change risks breaking state detection. Check downstream consumers.
 
 ## Critical Gotchas
 

@@ -2,8 +2,9 @@
  * Generate test audio files using Kokoro TTS for pipeline integration tests.
  *
  * Produces WAV files in tests/test-audio/ that simulate real user speech.
- * Run once before test-tts-pipeline.ts:
- *   npx tsx tests/generate-test-audio.ts
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Run once before test-tts-pipeline.ts (in test-runner):
+ *   node --import tsx/esm tests/generate-test-audio.ts
  */
 
 import { writeFileSync, mkdirSync, statSync } from "fs";

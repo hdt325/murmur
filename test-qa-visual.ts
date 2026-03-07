@@ -1,11 +1,12 @@
 /**
  * Murmur Visual + Functional + Electron + Site QA
  *
- * Usage:
- *   npx tsx test-qa-visual.ts              # Web UI tests only (needs server on :3457)
- *   npx tsx test-qa-visual.ts --electron   # Full suite: launches Electron, tests UI + app lifecycle
- *   npx tsx test-qa-visual.ts --site       # Marketing site tests only (no server needed)
- *   npx tsx test-qa-visual.ts --all        # Everything: web UI + site + Electron
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Usage (in test-runner):
+ *   node --import tsx/esm test-qa-visual.ts              # Web UI tests only (needs server on :3457)
+ *   node --import tsx/esm test-qa-visual.ts --electron   # Full suite: Electron + UI + app lifecycle
+ *   node --import tsx/esm test-qa-visual.ts --site       # Marketing site tests only
+ *   node --import tsx/esm test-qa-visual.ts --all        # Everything: web UI + site + Electron
  *
  * Screenshots saved to /tmp/murmur-qa-shots/ for visual review.
  * Launches a VISIBLE browser so the user can watch.

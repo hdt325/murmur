@@ -3,6 +3,7 @@ node_modules/
 settings.json
 tests/test-audio/
 tests/screenshots/
+tests/screenshots-flow/
 test-results/
 Murmur.app/
 tmp/

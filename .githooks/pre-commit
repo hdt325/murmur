@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook: type-check server modules and run smoke tests.
+# Install: git config core.hooksPath .githooks
+# Skip once: git commit --no-verify (use sparingly)
+
+set -e
+
+echo "🔍 Type-checking TypeScript..."
+npx tsc --noEmit 2>&1 | head -20
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+  echo "❌ TypeScript errors found. Fix before committing."
+  exit 1
+fi
+
+# Quick smoke test if server is running
+if curl -s http://localhost:3457/version > /dev/null 2>&1; then
+  echo "🧪 Running smoke tests..."
+  HEADLESS=1 node --import tsx/esm tests/test-smoke.ts > /tmp/murmur-precommit.txt 2>&1
+  SMOKE_EXIT=$?
+  if [ $SMOKE_EXIT -ne 0 ]; then
+    echo "❌ Smoke tests failed. Check /tmp/murmur-precommit.txt"
+    tail -5 /tmp/murmur-precommit.txt
+    exit 1
+  fi
+  # Extract pass/fail counts
+  RESULTS=$(tail -3 /tmp/murmur-precommit.txt | grep -oE '[0-9]+/[0-9]+ passed' || echo "unknown")
+  echo "✅ Smoke tests: $RESULTS"
+else
+  echo "⚠️  Server not running — skipping smoke tests (type-check passed)"
+fi
+
+echo "✅ Pre-commit checks passed"

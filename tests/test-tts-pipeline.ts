@@ -13,11 +13,11 @@
  * 6. Rapid TTS: two test:cycle back-to-back
  *
  * Prerequisites:
- *   - Server running (npx tsx server.ts) — must have test: handlers
- *   - Test audio generated (npx tsx tests/generate-test-audio.ts)
+ *   - Server running (npm start) — must have test: handlers
+ *   - Test audio generated (in test-runner): node --import tsx/esm tests/generate-test-audio.ts
  *
- * Run:
- *   npx tsx tests/test-tts-pipeline.ts
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Run (in test-runner): node --import tsx/esm tests/test-tts-pipeline.ts
  */
 
 import WebSocket from "ws";
@@ -721,7 +721,7 @@ async function main() {
     console.log(`\n  Server: v${data.version}`);
   } catch {
     console.error("\n  ✗ Server not running at", HTTP_URL);
-    console.error("    Start it: npx tsx server.ts");
+    console.error("    Start it: npm start");
     process.exit(1);
   }
 
@@ -739,7 +739,7 @@ async function main() {
   const missing = required.filter(f => !existsSync(join(AUDIO_DIR, f)));
   if (missing.length > 0) {
     console.error(`\n  ✗ Missing audio files: ${missing.join(", ")}`);
-    console.error("    Run: npx tsx tests/generate-test-audio.ts");
+    console.error("    Run (in test-runner): node --import tsx/esm tests/generate-test-audio.ts");
     process.exit(1);
   }
   console.log("  ✓ Test audio files present");

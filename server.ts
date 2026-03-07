@@ -35,6 +35,22 @@ import { homedir, tmpdir } from "os";
 import chokidar from "chokidar";
 import { createTerminalManager, type TerminalManager } from "./terminal/interface.js";
 
+// --- Modular imports (gradual migration from monolith) ---
+// These modules contain extracted, typed versions of functions and types.
+// server.ts still uses its own local implementations for now — the modules
+// serve as the canonical typed definitions that new code should import from.
+// As migration progresses, local definitions will be replaced by module imports.
+import {
+  // Validation (used directly — no local conflict)
+  validateVoice,
+  safeInt,
+  safeJsonParse,
+  shellEscape,
+  escHtml as escHtmlServer,
+  // Re-exports for reference
+  type ServiceStatus as ServiceStatusType,
+} from "./server/index.js";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = 3457;
 const HTTPS_PORT = 3458;
@@ -65,9 +81,28 @@ const KOKORO_URL = "http://127.0.0.1:8880";
 
 // Valid Kokoro TTS voice names
 const VALID_VOICES = new Set([
-  "af_sky", "af_heart", "af_nova", "am_adam", "am_echo",
-  "bf_emma", "bf_alice", "bm_george", "bm_daniel",
-  "ff_siwis", "ef_dora", "jf_alpha", "zf_xiaoxiao",
+  // American English female
+  "af_heart", "af_bella", "af_nicole", "af_sky", "af_nova",
+  "af_alloy", "af_aoede", "af_kore", "af_sarah", "af_jessica", "af_river",
+  // American English male
+  "am_fenrir", "am_michael", "am_puck", "am_echo", "am_eric", "am_liam", "am_onyx", "am_adam",
+  // British English female
+  "bf_emma", "bf_isabella", "bf_alice", "bf_lily",
+  // British English male
+  "bm_fable", "bm_george", "bm_daniel", "bm_lewis",
+  // French / Spanish
+  "ff_siwis", "ef_dora", "em_alex",
+  // Hindi
+  "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
+  // Italian
+  "if_sara", "im_nicola",
+  // Japanese
+  "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo",
+  // Portuguese
+  "pf_dora", "pm_alex", "pm_santa",
+  // Chinese
+  "zf_xiaoxiao", "zf_xiaobei", "zf_xiaoni", "zf_xiaoyi",
+  "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
 ]);
 
 // --- Service Health Checks ---
@@ -218,13 +253,13 @@ const wss = new WebSocketServer({ server });
 //   2. MURMUR_CONTEXT_FILTER — strips these lines from scrollback catch-up (loadScrollbackEntries)
 //      and from addUserEntry if they somehow appear as user input
 const MURMUR_CONTEXT_LINES = [
-  "Voice mode on — prose only, no markdown, short sentences.",
+  "Prose mode on — no markdown, short sentences.",
 ];
-const MURMUR_EXIT = "Voice mode off — resume normal formatting.";
+const MURMUR_EXIT = "Prose mode off — resume normal formatting.";
 
-// Filter that matches any voice-mode signal line so it never surfaces as a conversation bubble.
+// Filter that matches any prose-mode signal line so it never surfaces as a conversation bubble.
 // Must stay in sync with MURMUR_CONTEXT_LINES and MURMUR_EXIT above.
-const MURMUR_CONTEXT_FILTER = /^(Voice mode (on|off)|Murmur voice panel|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
+const MURMUR_CONTEXT_FILTER = /^(Prose mode (on|off)|Voice mode (on|off)|Murmur voice panel|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
 
 let contextSent = false; // Send once per server instance — no repeated injection on reconnect
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
@@ -241,6 +276,13 @@ function sendMurmurContext(delayMs = 2000) {
       contextSent = true;
       console.log("[context] Sent Murmur system context to Claude (once per server run)");
       broadcast({ type: "context_sent" });
+      // Safety: reset _isSystemContext after 30s in case terminal dies before handleStreamDone
+      setTimeout(() => {
+        if (_isSystemContext) {
+          console.warn("[context] Safety timeout — resetting _isSystemContext (terminal may have died)");
+          _isSystemContext = false;
+        }
+      }, 30000);
     }
   }, delayMs);
 }
@@ -303,9 +345,10 @@ function stopTts() {
 // --- Audio Pre-Buffer Combination ---
 
 function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
-  const preFile = join(TEMP_DIR, "murmur-prebuf.wav");
-  const mainFile = join(TEMP_DIR, "murmur-main.webm");
-  const outFile = join(TEMP_DIR, "murmur-combined.webm");
+  const uid = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  const preFile = join(TEMP_DIR, `murmur-prebuf-${uid}.wav`);
+  const mainFile = join(TEMP_DIR, `murmur-main-${uid}.webm`);
+  const outFile = join(TEMP_DIR, `murmur-combined-${uid}.webm`);
   writeFileSync(preFile, preBuffer);
   writeFileSync(mainFile, mainAudio);
 
@@ -329,6 +372,21 @@ function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
 
 // --- Direct Voice Input: Transcribe + Type into tmux ---
 
+/** Detect audio format from magic bytes — iOS sends mp4, desktop sends webm */
+function detectAudioExt(data: Buffer): string {
+  if (data.length > 12) {
+    // WAV: "RIFF" at 0, "WAVE" at 8
+    if (data.slice(0, 4).toString("ascii") === "RIFF" && data.slice(8, 12).toString("ascii") === "WAVE") return "wav";
+    // WebM/MKV: EBML header 0x1A45DFA3
+    if (data[0] === 0x1a && data[1] === 0x45 && data[2] === 0xdf && data[3] === 0xa3) return "webm";
+    // MP4: "ftyp" box at offset 4
+    if (data.slice(4, 8).toString("ascii") === "ftyp") return "mp4";
+    // OGG: "OggS"
+    if (data.slice(0, 4).toString("ascii") === "OggS") return "ogg";
+  }
+  return "webm"; // default
+}
+
 async function transcribeAudio(audioData: Buffer): Promise<string> {
   if (!serviceStatus.whisper) {
     // Re-check in case it came up since last check
@@ -341,35 +399,58 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
   }
 
   const uid = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+  // Detect actual audio format from magic bytes so the file extension is correct.
+  // iOS Safari records audio/mp4 (not webm), and Whisper uses the extension to determine format.
+  const audioExt = detectAudioExt(audioData);
   // Write audio directly — no ffmpeg normalization step.
-  // Whisper (ggml-small + CoreML) handles un-normalized webm/wav input fine.
-  // Removing loudnorm saves 1-3s of blocking ffmpeg execution per transcription.
-  const tmpFile = join(TEMP_DIR, `murmur-audio-${uid}.webm`);
+  // Whisper (ggml-small + CoreML) handles un-normalized webm/wav/mp4 input fine.
+  const tmpFile = join(TEMP_DIR, `murmur-audio-${uid}.${audioExt}`);
   writeFileSync(tmpFile, audioData);
 
+  // language=en avoids cross-language hallucinations.
+  // Avoid short common words (okay, yes, no) — they increase Whisper hallucination risk.
+  const STT_PROMPT = "Claude, Murmur, tmux, TypeScript, JavaScript, npm, npx, Python, Git, terminal, code, function, variable, component, server, error, install, run, test.";
   try {
     plog("transcribe_start");
     const sttStart = Date.now();
-    slog("stt", "start", { bytes: audioData.length });
-    // language=en avoids cross-language hallucinations.
-    // prompt biases Whisper toward domain vocabulary it otherwise mangles.
-    const STT_PROMPT = "Claude, Murmur, tmux, TypeScript, JavaScript, npm, npx, Python, Git, terminal, code, function, variable, component, server, error, install, run, test, stop, yes, no, okay.";
-    const result = execSync(
-      `curl -s -X POST ${WHISPER_URL}/v1/audio/transcriptions ` +
-        `-F "file=@${tmpFile}" -F "model=whisper-1" -F "language=en" -F "prompt=${STT_PROMPT}"`,
-      { encoding: "utf-8", timeout: 10000 }
-    );
+    slog("stt", "start", { bytes: audioData.length, ext: audioExt });
+    const result = execFileSync("curl", [
+      "-s", "-X", "POST", `${WHISPER_URL}/v1/audio/transcriptions`,
+      "-F", `file=@${tmpFile}`, "-F", "model=whisper-1", "-F", "language=en",
+      "-F", "response_format=verbose_json", "-F", `prompt=${STT_PROMPT}`,
+    ], { encoding: "utf-8", timeout: 10000 });
     const json = JSON.parse(result);
+    // Discard if Whisper itself thinks there's no speech (hallucination from silence/noise)
+    const noSpeechProb = json.segments?.[0]?.no_speech_prob ?? 0;
+    if (noSpeechProb >= 0.6) {
+      console.log(`[stt] Discarded — no_speech_prob=${noSpeechProb.toFixed(2)} (likely hallucination)`);
+      return "";
+    }
     const text = json.text?.trim() || "";
     plog("transcribe_done", text ? `"${text.slice(0, 100)}"` : "(empty)");
     slog("stt", "done", { text: text.slice(0, 100), durationMs: Date.now() - sttStart });
     return text;
   } catch (err) {
-    console.error("Whisper transcription failed:", (err as Error).message);
-    plog("transcribe_error", (err as Error).message);
-    slog("stt", "error", { error: (err as Error).message });
-    serviceStatus.whisper = false; // Mark as down so next call re-checks
-    return "";
+    // Retry once on failure before giving up
+    console.warn("[stt] First attempt failed, retrying:", (err as Error).message);
+    try {
+      const retryResult = execFileSync("curl", [
+        "-s", "-X", "POST", `${WHISPER_URL}/v1/audio/transcriptions`,
+        "-F", `file=@${tmpFile}`, "-F", "model=whisper-1", "-F", "language=en",
+        "-F", "response_format=verbose_json", "-F", `prompt=${STT_PROMPT}`,
+      ], { encoding: "utf-8", timeout: 10000 });
+      const retryJson = JSON.parse(retryResult);
+      const text = retryJson.text?.trim() || "";
+      console.log(`[stt] Retry succeeded: "${text.slice(0, 60)}"`);
+      return text;
+    } catch (retryErr) {
+      console.error("Whisper transcription failed (after retry):", (retryErr as Error).message);
+      plog("transcribe_error", (retryErr as Error).message);
+      slog("stt", "error", { error: (retryErr as Error).message });
+      serviceStatus.whisper = false; // Mark as down so next call re-checks
+      broadcast({ type: "voice_status", state: "error", message: "Whisper STT failed" });
+      return "";
+    }
   } finally {
     try { unlinkSync(tmpFile); } catch {}
   }
@@ -385,8 +466,67 @@ let ttsQueue: string[] = []; // Queue of texts waiting to be spoken
 let ttsEntryIdQueue: (number | null)[] = []; // Entry IDs corresponding to queued texts
 let ttsRetryCount = 0;
 const TTS_MAX_RETRIES = 3;
+// Pre-generated audio for look-ahead buffering — generated while current chunk plays
+let ttsPregenPromises: Array<{ promise: Promise<Buffer | null>; gen: number }> = [];
 
 let _forceKokoroFallback = false;
+
+// Clean raw text for TTS (same logic used in speakText, extracted for pre-generation)
+function cleanTtsText(text: string): string {
+  return text
+    .replace(/\n*(?:Sources?|Citations?|References?|Further [Rr]eading):[\s\S]*/i, "")
+    .replace(/```[\s\S]*?```/g, "... code block omitted ...")
+    .replace(/`[^`]+`/g, (m) => m.slice(1, -1))
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\b\S+\.(com|org|net|io|dev|ai|co)\b/gi, "")
+    .replace(/(\/[\w.~-]+){3,}/g, "that path")
+    .replace(/[a-f0-9]{8,}/gi, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[#*_]{2,}/g, "")
+    .replace(/^[-*•]\s*[,.;)]*\s*$/gm, "")
+    .split(/\n\n+/)
+    .map(paragraph => {
+      const lines = paragraph.split("\n").map(l => l.trim()).filter(Boolean);
+      const joined = lines
+        .map(l => l.replace(/^[-*•]\s+/, "").replace(/^\d+[.)]\s+/, ""))
+        .map(l => l.replace(/\*\*([^*]+)\*\*/g, "$1"))
+        .join(" ");
+      if (joined && !/[.!?:;,—]$/.test(joined)) return joined + ".";
+      return joined;
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Pre-generate Kokoro audio in background (for look-ahead buffering, zero-gap playback)
+function pregenerateKokoro(cleanText: string, voice: string, speed: number): Promise<Buffer | null> {
+  if (!cleanText || voice.startsWith("_local")) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const ttsFile = join(TEMP_DIR, `murmur-tts-pre-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`);
+    const payload = JSON.stringify({ model: "kokoro", input: cleanText, voice, speed });
+    const curl = spawn("curl", [
+      "-s", "-X", "POST",
+      `${KOKORO_URL}/v1/audio/speech`,
+      "-H", "Content-Type: application/json",
+      "-d", payload,
+      "--output", ttsFile,
+      "--max-time", "30",
+    ], { stdio: "ignore" });
+    curl.on("exit", (code) => {
+      if (code !== 0 || !existsSync(ttsFile) || statSync(ttsFile).size < 100) {
+        try { unlinkSync(ttsFile); } catch {}
+        resolve(null);
+        return;
+      }
+      const buf = readFileSync(ttsFile);
+      try { unlinkSync(ttsFile); } catch {}
+      resolve(buf);
+    });
+    curl.on("error", () => resolve(null));
+  });
+}
 
 async function speakText(text: string, interrupt = false): Promise<void> {
   // If TTS is in progress and not interrupting, queue the text
@@ -395,13 +535,21 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     console.log(`[tts] Queuing text (${text.length} chars) — ${ttsQueue.length + 1} in queue`);
     ttsQueue.push(text);
     ttsEntryIdQueue.push(currentTtsEntryId);
+    // Pre-generate audio in background so next chunk is ready when current chunk finishes.
+    // Pass the real voice — pregenerateKokoro returns null for _local voices automatically,
+    // which causes handleTtsDone to fall through to speakText() and send local_tts correctly.
+    const pSettings = loadSettings();
+    const pVoice = pSettings.voice || "af_heart";
+    const pSpeed = pSettings.speed || 1;
+    ttsPregenPromises.push({ promise: pregenerateKokoro(cleanTtsText(text), pVoice, pSpeed), gen: ttsGeneration });
     return;
   }
 
-  // If interrupting, clear the queue too
+  // If interrupting, clear the queue too (splice to avoid race with handleTtsDone shift)
   if (interrupt) {
-    ttsQueue = [];
-    ttsEntryIdQueue = [];
+    ttsQueue.splice(0, ttsQueue.length);
+    ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
+    ttsPregenPromises.splice(0, ttsPregenPromises.length);
   }
 
   // Broadcast highlight + speakable text for the entry we're about to speak.
@@ -423,37 +571,8 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   _forceKokoroFallback = false;
   const speed = settings.speed || 1;
 
-  // Clean text for TTS — remove URLs, paths, code, and other non-speakable content
-  const speakable = text
-    .replace(/\n*(?:Sources?|Citations?|References?|Further [Rr]eading):[\s\S]*/i, "") // strip sources section
-    .replace(/```[\s\S]*?```/g, "... code block omitted ...")
-    .replace(/`[^`]+`/g, (m) => m.slice(1, -1))         // inline code → just the word
-    .replace(/https?:\/\/\S+/g, "")                      // URLs
-    .replace(/\b\S+\.(com|org|net|io|dev|ai|co)\b/gi, "") // domains
-    .replace(/(\/[\w.~-]+){3,}/g, "that path")            // file paths (3+ segments)
-    .replace(/[a-f0-9]{8,}/gi, "")                         // hex hashes/IDs
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")               // markdown links → just text
-    .replace(/[#*_]{2,}/g, "")                             // markdown formatting
-    .replace(/^[-*•]\s*[,.;)]*\s*$/gm, "")                 // empty bullets (after URL removal)
-    // Process paragraphs (double newline = real break, single newline = tmux wrap)
-    .split(/\n\n+/)
-    .map(paragraph => {
-      // Within a paragraph, join tmux-wrapped lines with spaces
-      const lines = paragraph.split("\n").map(l => l.trim()).filter(Boolean);
-      const joined = lines
-        .map(l => l.replace(/^[-*•]\s+/, "").replace(/^\d+[.)]\s+/, "")) // strip bullets
-        .map(l => l.replace(/\*\*([^*]+)\*\*/g, "$1")) // bold → plain
-        .join(" ");
-      // Add period at end of paragraph if missing punctuation
-      if (joined && !/[.!?:;,—]$/.test(joined)) {
-        return joined + ".";
-      }
-      return joined;
-    })
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s{2,}/g, " ")                              // collapse whitespace
-    .trim();
+  // Clean text for TTS
+  const speakable = cleanTtsText(text);
 
   if (!speakable) {
     ttsInProgress = false;
@@ -481,16 +600,19 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       ttsActiveGen = myGen;
       sendToAudioClient({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
       broadcast({ type: "voice_status", state: "speaking" });
-      // Safety timeout — 10s for local TTS, with auto-fallback to Kokoro
+      // Safety timeout — proportional to text length so long passages don't fall back to Kokoro.
+      // ~400ms per word (generous margin over normal ~250ms/word at rate 1.1) + 8s buffer.
+      const wordCount = ttsText.trim().split(/\s+/).length;
+      const localTtsTimeoutMs = Math.max(8000, wordCount * 400 + 5000);
+      console.log(`[tts] Local TTS timeout set to ${(localTtsTimeoutMs/1000).toFixed(0)}s for ${wordCount} words`);
       ttsClientTimeout = setTimeout(() => {
         if (myGen === ttsGeneration) {
           console.warn("[tts] Local TTS timeout — falling back to Kokoro");
           ttsInProgress = false;
-          // Temporarily override voice to force Kokoro, then retry
           _forceKokoroFallback = true;
           speakText(ttsText);
         }
-      }, 10000);
+      }, localTtsTimeoutMs);
       return;
     } else {
       // Audio client doesn't have this local voice (e.g. phone without macOS voices) — fall back to Kokoro
@@ -534,6 +656,10 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     "--output", ttsFile,
     "--max-time", "30",
   ], { stdio: "ignore" });
+  // Safety: kill curl if it hangs beyond max-time (35s timeout)
+  const curlKillTimer = setTimeout(() => { try { curl.kill(); } catch {} }, 35000);
+  curl.on("exit", () => clearTimeout(curlKillTimer));
+  curl.on("error", () => clearTimeout(curlKillTimer));
 
   curl.on("exit", (code) => {
     // Superseded by a newer speakText call — discard
@@ -554,6 +680,11 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       } else {
         console.error(`[tts] curl failed with code ${code} — giving up after ${TTS_MAX_RETRIES} retries`);
         ttsRetryCount = 0;
+        // Clear stuck queue so future TTS calls work when Kokoro recovers
+        ttsQueue.splice(0, ttsQueue.length);
+        ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
+        ttsPregenPromises.splice(0, ttsPregenPromises.length);
+        serviceStatus.kokoro = false; // Force re-check on next call
         broadcast({ type: "voice_status", state: "idle" });
       }
       return;
@@ -580,8 +711,8 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     broadcast({ type: "voice_status", state: "speaking" });
 
     // Client sends "tts_done" when playback finishes; timeout as fallback
-    // Estimate duration: ~16KB/s for 24kHz mono MP3 at normal speed
-    const estimatedDurationMs = Math.max(5000, (audioData.length / 16000) * 1000 + 3000);
+    // Estimate duration: ~12KB/s conservative for variable bitrate Kokoro MP3
+    const estimatedDurationMs = Math.max(5000, (audioData.length / 12000) * 1000 + 2000);
     console.log(`[tts] Estimated playback: ${(estimatedDurationMs/1000).toFixed(1)}s`);
     ttsClientTimeout = setTimeout(() => {
       if (myGen !== ttsGeneration) return;
@@ -602,6 +733,7 @@ function stopClientPlayback() {
   ttsGeneration++;
   ttsQueue = []; // Clear pending queue
   ttsEntryIdQueue = [];
+  ttsPregenPromises = [];
   entryTtsCursor.clear(); // Reset sentence cursors so next turn starts fresh
   if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
   broadcast({ type: "tts_stop" });
@@ -622,9 +754,37 @@ function handleTtsDone() {
   if (ttsQueue.length > 0) {
     const next = ttsQueue.shift()!;
     const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+    const pregenEntry = ttsPregenPromises.shift();
     currentTtsEntryId = nextEntryId;
     console.log(`[tts] Playing next in queue (${next.length} chars, entryId=${nextEntryId}, ${ttsQueue.length} remaining)`);
-    speakText(next);
+
+    if (pregenEntry && pregenEntry.gen === ttsGeneration) {
+      // Use pre-generated audio if available — eliminates inter-chunk gap
+      ttsInProgress = true; // Hold slot while we await the pre-gen promise
+      // Claim generation BEFORE async resolution to prevent stale callbacks
+      const newGen = ++ttsGeneration;
+      ttsActiveGen = newGen;
+      pregenEntry.promise.then(buf => {
+        if (newGen !== ttsGeneration) { ttsInProgress = false; return; } // Stale (someone interrupted)
+        if (buf) {
+          console.log(`[tts] Pre-generated audio ready (${buf.length} bytes) — zero-gap playback`);
+          if (currentTtsEntryId != null) {
+            broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: next });
+          }
+          broadcastBinary(buf);
+          broadcast({ type: "voice_status", state: "speaking" });
+          const estimatedMs = Math.max(5000, (buf.length / 16000) * 1000 + 3000);
+          ttsClientTimeout = setTimeout(() => {
+            if (newGen === ttsGeneration) handleTtsDone();
+          }, estimatedMs);
+        } else {
+          ttsInProgress = false;
+          speakText(next); // Pre-gen failed — generate fresh
+        }
+      });
+    } else {
+      speakText(next); // No pre-gen entry — generate fresh
+    }
     return;
   }
 
@@ -673,7 +833,7 @@ const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
 const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
-let pendingVoiceInput: Array<{ text: string; entryId: number }> = []; // Queued voice while Claude is active
+let pendingVoiceInput: Array<{ text: string; entryId: number; target: string }> = []; // Queued voice while Claude is active
 let _voiceQueueDraining = false; // Drain lock — prevents concurrent drains
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
@@ -762,7 +922,7 @@ function detectInteractivePrompt(pane: string): boolean {
     // Auto-dismiss Claude's session feedback prompt ("1: Bad  2: Fine  3: Good  0: Dismiss")
     if (/\b0:\s*Dismiss\b/i.test(tail)) {
       console.log("[interactive] Auto-dismissing session feedback prompt");
-      terminal.sendKey("0");
+      terminal.sendText("0");
       return true;
     }
     if (!interactivePromptActive) {
@@ -858,8 +1018,8 @@ function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput
         startIdx = i + 1;
         continue;
       }
-      // Fallback: substring match within remaining unconsumed input (min 3 chars)
-      if (tNorm.length >= 3 && remaining.includes(tNorm)) {
+      // Fallback: match near start of remaining unconsumed input (min 5 chars, within first 10 chars)
+      if (tNorm.length >= 5 && remaining.indexOf(tNorm) >= 0 && remaining.indexOf(tNorm) < 10) {
         const idx = remaining.indexOf(tNorm);
         consumedLen += idx + tNorm.length;
         startIdx = i + 1;
@@ -904,7 +1064,9 @@ let entryTtsCursor: Map<number, number> = new Map();
 // Add a user entry and broadcast the updated entry list
 function addUserEntry(text: string, queued = false) {
   // Suppress voice panel instruction messages from appearing in the conversation view
-  if (MURMUR_CONTEXT_FILTER.test(text.trim())) return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn };
+  if (MURMUR_CONTEXT_FILTER.test(text.trim())) {
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
   const entry: ConversationEntry = {
     id: ++entryIdCounter,
     role: "user",
@@ -1266,8 +1428,8 @@ function broadcastCurrentOutput() {
 
   // Remove stale assistant entries if paragraphs shrunk (rare reparse)
   // But never remove entries that were already spoken — they're real content
-  // Only consider current turn entries
-  if (paragraphs.length < assistantEntries.length) {
+  // Only trim when NOT actively responding (avoids losing content mid-stream)
+  if (paragraphs.length < assistantEntries.length && streamState !== "RESPONDING") {
     const staleEntries = assistantEntries.slice(paragraphs.length);
     const staleIds = new Set(staleEntries.filter(e => !e.spoken).map(e => e.id));
     if (staleIds.size > 0) {
@@ -1457,18 +1619,22 @@ function startTmuxStreaming(userInput: string) {
   lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
-  entryTtsCursor.clear(); // Reset sentence cursor for new turn
+  // Reset sentence cursor for new turn (after stopClientPlayback drains stale TTS)
   // Start a new conversation turn — keep old entries for history
   currentTurn++;
   // Cap at ~200 entries to prevent unbounded memory growth (trim oldest turns)
   if (conversationEntries.length > 200) {
     const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
     conversationEntries = conversationEntries.filter(e => e.turn >= oldestTurnToKeep);
+    // Clean up entryTtsCursor for trimmed entries to prevent memory leak
+    const liveIds = new Set(conversationEntries.map(e => e.id));
+    entryTtsCursor.forEach((_, id) => { if (!liveIds.has(id)) entryTtsCursor.delete(id); });
   }
   currentTtsEntryId = null;
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   streamFileOffset = 0;
   stopClientPlayback(); // Stop any current TTS before new input
+  entryTtsCursor.clear(); // Reset sentence cursor AFTER TTS stop to avoid re-speaking tail
 
   // Take snapshot BEFORE terminal.sendText is called — captures the clean prompt state
   preInputSnapshot = captureTmuxPane();
@@ -1741,17 +1907,29 @@ function stopTmuxStreaming() {
     const remaining = pendingVoiceInput.length;
     console.log(`[voice] Draining queued input: "${next.text.slice(0, 60)}" — ${remaining} remaining`);
     setTimeout(() => {
-      _voiceQueueDraining = false;
+      try {
       // Mark the queued entry as sent (remove queued flag) before starting stream
       const queuedEntry = conversationEntries.find(e => e.id === next.entryId);
       if (queuedEntry) {
         queuedEntry.queued = false;
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
       }
+      // Switch to the session that was active when the message was queued
+      const savedTarget = terminal.currentTarget;
+      if (next.target && next.target !== savedTarget && terminal.switchTarget) {
+        console.log(`[voice] Restoring queued target: ${next.target} (current: ${savedTarget})`);
+        const lastColon = next.target.lastIndexOf(":");
+        if (lastColon !== -1) {
+          const session = next.target.slice(0, lastColon);
+          const windowIdx = parseInt(next.target.slice(lastColon + 1));
+          terminal.switchTarget(session, windowIdx);
+        }
+      }
       startTmuxStreaming(next.text);
       if (!queuedEntry) addUserEntry(next.text); // Fallback if entry was lost
       terminal.sendText(next.text);
       broadcast({ type: "voice_queue", count: remaining });
+      } finally { _voiceQueueDraining = false; }
     }, 500);
   }
 }
@@ -1783,13 +1961,22 @@ function startPassiveWatcher() {
     if (hasSpinnerChars(pane)) {
       console.log("[passive] Spinner detected — native CLI input");
 
-      // Try to extract the user's input from the pane (line starting with ❯)
+      // Try to extract the user's input from the pane (line starting with ❯, plus any
+      // continuation lines — long inputs wrap at terminal width without a ❯ prefix)
       const lines = pane.split("\n");
       let userInput = "";
       for (let i = lines.length - 1; i >= 0; i--) {
         const trimmed = lines[i].trim();
         if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
-          userInput = trimmed.slice(2).trim();
+          // Collect continuation lines that follow (tmux-wrapped input)
+          const parts = [trimmed.slice(2).trim()];
+          for (let j = i + 1; j < lines.length; j++) {
+            const next = lines[j].trim();
+            // Stop at empty lines, spinner lines, or new prompt lines
+            if (!next || next.startsWith("❯") || /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next)) break;
+            parts.push(next);
+          }
+          userInput = parts.join(" ");
           break;
         }
       }
@@ -1864,8 +2051,21 @@ function startPassiveWatcher() {
         console.log(`[passive] Started streaming for native CLI input: "${userInput.slice(0, 60)}"`);
       }
     } else {
-      // Save clean snapshot for next comparison
-      lastPassiveSnapshot = pane;
+      // Only save snapshot when the ❯ input prompt is empty (user is idle, not mid-typing).
+      // If we save a mid-typing snapshot and the spinner fires on the next poll,
+      // preInputSnapshot will contain a partial message, causing the diff approach in
+      // getLinesAfterInput to start from line 2+ of the user's message — which then
+      // gets mistakenly returned as Claude's response content.
+      const paneLines = pane.split("\n");
+      let lastPromptLine = "";
+      for (let i = paneLines.length - 1; i >= 0; i--) {
+        const t = paneLines[i].trim();
+        if (t.startsWith("❯")) { lastPromptLine = t; break; }
+      }
+      // Empty prompt (just ❯ with optional whitespace) = user is idle, safe to save
+      if (!lastPromptLine || /^❯\s*$/.test(lastPromptLine)) {
+        lastPassiveSnapshot = pane;
+      }
     }
   }, 2000);
 }
@@ -2252,7 +2452,12 @@ setInterval(() => {
 let exitTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSentAt = 0;
 
-function handleWsConnection(ws: WebSocket) {
+function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage) {
+  // Test mode: text messages render in UI but are NOT forwarded to the terminal.
+  // Activated by connecting with ?testmode=1 in the WebSocket URL.
+  const reqUrl = req?.url || "";
+  const isTestMode = reqUrl.includes("testmode=1");
+  if (isTestMode) (ws as any)._isTestMode = true;
   const wasEmpty = clients.size === 0;
   clients.add(ws);
   slog("ws", "connect", { clients: clients.size });
@@ -2310,7 +2515,7 @@ function handleWsConnection(ws: WebSocket) {
     const settings: Record<string, string> = {};
     if (persisted.speed) settings.speed = persisted.speed.toString();
     else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-speed"), "utf-8").trim(); if (v) settings.speed = v; } catch {} }
-    if (persisted.voice) settings.voice = persisted.voice;
+    if (persisted.voice && (VALID_VOICES.has(persisted.voice) || persisted.voice.startsWith("_local:"))) settings.voice = persisted.voice;
     else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-voice"), "utf-8").trim(); if (v) settings.voice = v; } catch {} }
     try { const v = readFileSync(join(SIGNAL_DIR, "claude-mic-mute"), "utf-8").trim(); settings.muted = v === "1" ? "1" : "0"; } catch {}
     ws.send(JSON.stringify({ type: "settings", ...settings }));
@@ -2462,7 +2667,7 @@ function handleWsConnection(ws: WebSocket) {
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
           const queuedEntry = addUserEntry(text, true);
-          pendingVoiceInput.push({ text, entryId: queuedEntry.id });
+          pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
           broadcast({ type: "voice_queue", count });
@@ -2584,8 +2789,10 @@ function handleWsConnection(ws: WebSocket) {
 
     // TTS playback complete (from client)
     if (msg === "tts_done") {
-      // Ignore tts_done from non-audio clients to prevent double-drain
-      if (activeAudioClient && activeAudioClient !== ws && !(ws as any)._isTestClient) {
+      // Ignore tts_done from non-audio clients to prevent double-drain,
+      // BUT accept if audio client has disconnected (prevents deadlock)
+      if (activeAudioClient && activeAudioClient !== ws && !(ws as any)._isTestClient
+          && activeAudioClient.readyState === WebSocket.OPEN) {
         console.log("[tts] Ignoring tts_done from non-audio client");
         return;
       }
@@ -2788,7 +2995,11 @@ function handleWsConnection(ws: WebSocket) {
     if (msg.startsWith("text:")) {
       const text = msg.slice(5);
       if (text) {
-        if (interactivePromptActive) {
+        if ((ws as any)._isTestMode) {
+          // Test mode: render user bubble in UI but do NOT forward to terminal
+          console.log(`[terminal] Test mode text (not sent to Claude): "${text.slice(0, 60)}"`);
+          addUserEntry(text);
+        } else if (interactivePromptActive) {
           // Interactive prompt — send keystroke directly
           console.log(`[terminal] Interactive response: "${text}"`);
           terminal.sendText(text);
@@ -2801,7 +3012,7 @@ function handleWsConnection(ws: WebSocket) {
         } else {
           // Claude is active — queue typed text same as voice
           const queuedEntry = addUserEntry(text, true);
-          pendingVoiceInput.push({ text, entryId: queuedEntry.id });
+          pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[terminal] Text queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
           broadcast({ type: "voice_queue", count });
@@ -2885,7 +3096,8 @@ function handleWsConnection(ws: WebSocket) {
     // Input: JSON array of paragraph strings, e.g. ["First paragraph.", "Second paragraph."]
     // Broadcasts: thinking → responding → incremental entry broadcasts → idle
     if (msg.startsWith("test:entries:")) {
-      const paragraphs: string[] = JSON.parse(msg.slice(13));
+      let paragraphs: string[];
+      try { paragraphs = JSON.parse(msg.slice(13)); } catch { console.warn("[test] Invalid JSON in test:entries"); return; }
       console.log(`[test] Simulating ${paragraphs.length} assistant entries`);
 
       broadcast({ type: "voice_status", state: "thinking" });
@@ -2926,7 +3138,8 @@ function handleWsConnection(ws: WebSocket) {
     // Input: JSON array of { text, spoken?, speakable? } objects
     // Broadcasts: entry list immediately (no TTS, no state transitions)
     if (msg.startsWith("test:entries-mixed:")) {
-      const items: Array<{ text: string; spoken?: boolean; speakable?: boolean }> = JSON.parse(msg.slice(19));
+      let items: Array<{ text: string; spoken?: boolean; speakable?: boolean }>;
+      try { items = JSON.parse(msg.slice(19)); } catch { console.warn("[test] Invalid JSON in test:entries-mixed"); return; }
       console.log(`[test] Creating ${items.length} mixed entries`);
 
       for (const item of items) {
@@ -2950,7 +3163,8 @@ function handleWsConnection(ws: WebSocket) {
     // Like test:entries but also speaks each entry, setting currentTtsEntryId correctly.
     // This exercises the full entryId→tts_highlight→audio chain per paragraph.
     if (msg.startsWith("test:entries-tts:")) {
-      const paragraphs: string[] = JSON.parse(msg.slice(17));
+      let paragraphs: string[];
+      try { paragraphs = JSON.parse(msg.slice(17)); } catch { console.warn("[test] Invalid JSON in test:entries-tts"); return; }
       console.log(`[test] Simulating ${paragraphs.length} entries with TTS`);
 
       broadcast({ type: "voice_status", state: "thinking" });
@@ -2992,7 +3206,8 @@ function handleWsConnection(ws: WebSocket) {
     // Input: JSON object { question: "...", options: ["a", "b", "c"] }
     // Broadcasts: assistant entries with question + options, then interactive_prompt active
     if (msg.startsWith("test:interactive:")) {
-      const { question, options } = JSON.parse(msg.slice(17));
+      let question: string, options: string[];
+      try { ({ question, options } = JSON.parse(msg.slice(17))); } catch { console.warn("[test] Invalid JSON in test:interactive"); return; }
       console.log(`[test] Simulating interactive prompt: "${question}" with ${options.length} options`);
 
       // Build text like Claude would render
@@ -3117,7 +3332,12 @@ function handleWsConnection(ws: WebSocket) {
   });
 }
 
-wss.on("connection", handleWsConnection);
+wss.on("connection", (ws, req) => handleWsConnection(ws, req));
+
+// --- Static Files ---
+app.use("/js", express.static(join(__dirname, "public", "js"), {
+  setHeaders: (res) => { res.set("Cache-Control", "no-store"); },
+}));
 
 // --- HTTP Endpoints ---
 
@@ -3214,7 +3434,7 @@ app.get("/info", (_req, res) => {
         try {
           cli.cwd =
             execSync(
-              `lsof -p ${pid} 2>/dev/null | grep cwd | awk '{print $NF}'`,
+              `lsof -p ${parseInt(String(pid), 10)} 2>/dev/null | grep cwd | awk '{print $NF}'`,
               { encoding: "utf-8" }
             ).trim() || null;
         } catch {}
@@ -3318,7 +3538,7 @@ if (existsSync(certPath) && existsSync(keyPath)) {
     app
   );
   const wssSecure = new WebSocketServer({ server: httpsServer });
-  wssSecure.on("connection", handleWsConnection);
+  wssSecure.on("connection", (ws, req) => handleWsConnection(ws, req));
   httpsServer.listen(HTTPS_PORT, "0.0.0.0", () => {
     if (TS_HOSTNAME) {
       console.log(`  HTTPS: https://${TS_HOSTNAME}:${HTTPS_PORT}`);

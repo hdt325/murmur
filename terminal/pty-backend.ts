@@ -103,7 +103,9 @@ export class PtyBackend implements TerminalManager {
       console.error("PTY session not alive — cannot send text");
       return;
     }
-    this.proc.write(text + "\r");
+    // Collapse newlines (Whisper multi-line transcriptions) to prevent command injection
+    const sanitized = text.replace(/[\r\n]+/g, " ").trim();
+    this.proc.write(sanitized + "\r");
   }
 
   sendKey(key: TerminalKey): void {

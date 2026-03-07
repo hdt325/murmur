@@ -1,10 +1,14 @@
 /**
- * Comprehensive end-to-end tests — every user-facing feature tested as an end-user.
- * Runs with VISIBLE browser so you can watch the tests execute.
+ * Comprehensive end-to-end tests — every user-facing feature + flow mode (Playwright, DOM injection).
  * Requires: server running on localhost:3457
  *
- * Run:        npx tsx tests/test-e2e.ts
- * Headless:   HEADLESS=1 npx tsx tests/test-e2e.ts
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ *     Running inside claude-voice causes Murmur's passive watcher to pick up Claude Code's spinner
+ *     and the test output as Claude's response, breaking both the test and the conversation.
+ *
+ * Via helper (recommended):  tests/run.sh e2e
+ * Direct (test-runner only): node --import tsx/esm tests/test-e2e.ts
+ * Headless:                  HEADLESS=1 node --import tsx/esm tests/test-e2e.ts
  */
 
 import { chromium, Browser, Page, BrowserContext } from "playwright";
@@ -14,6 +18,7 @@ import { fileURLToPath } from "url";
 import WebSocket from "ws";
 
 const BASE = "http://localhost:3457";
+const BASE_TEST = "http://localhost:3457/?testmode=1"; // text input blocked from reaching Claude
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = join(__dirname, "screenshots", "e2e");
 const HEADLESS = process.env.HEADLESS === "1";
@@ -44,19 +49,19 @@ async function screenshot(label: string) {
 
 async function freshPage() {
   // Clear all localStorage and reload for a clean state
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => localStorage.clear());
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1000);
 }
 
 async function readyPage() {
   // Load page with tour already done (most tests don't need tour)
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => {
     localStorage.setItem("murmur-tour-done", "1");
   });
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1000);
 }
 
@@ -162,12 +167,12 @@ async function testTourWalkthrough() {
   const overlayGone = !(await page.locator(".tour-overlay").isVisible());
   await screenshot("tour-done");
 
-  report("Tour has 11 steps", stepCount === 11, `${stepCount} steps: ${stepTitles.join(" → ")}`);
+  report("Tour has 12 steps", stepCount === 12, `${stepCount} steps: ${stepTitles.join(" → ")}`);
   report("Tour sets localStorage and closes overlay", overlayGone && done === "1");
 }
 
 async function testTourDoesNotRestart() {
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1500);
   const overlay = await page.locator(".tour-overlay").isVisible();
   report("Tour does not restart after completion", !overlay);
@@ -175,7 +180,7 @@ async function testTourDoesNotRestart() {
 
 async function testTourSkip() {
   await page.evaluate(() => localStorage.removeItem("murmur-tour-done"));
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(1500);
   const skipBtn = page.locator(".tour-skip");
   const skipVisible = await skipBtn.isVisible();
@@ -240,7 +245,7 @@ async function testModePersistence() {
   await page.waitForTimeout(100);
   const modeBeforeReload = await modeBtn.textContent();
 
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(500);
   const modeAfterReload = await page.locator("#modeBtn").textContent();
   report("Mode persists across reload", modeBeforeReload?.trim() === modeAfterReload?.trim(),
@@ -517,7 +522,7 @@ async function testStopButton() {
 async function testTerminalToggle() {
   await readyPage();
   await page.evaluate(() => localStorage.removeItem("term-open"));
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
   await page.waitForTimeout(300);
 
@@ -540,14 +545,14 @@ async function testTerminalToggle() {
 async function testTerminalPersistence() {
   await readyPage();
   await page.evaluate(() => localStorage.removeItem("term-open"));
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
   await page.waitForTimeout(300);
 
   await page.locator("#terminalHeader").click();
   await page.waitForTimeout(200);
 
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(300);
   const stillOpen = await page.locator(".terminal-panel").evaluate((el: Element) => el.classList.contains("open"));
   report("Terminal state persists across reload", stillOpen);
@@ -689,7 +694,7 @@ async function testChatFontZoomPersists() {
   await page.waitForTimeout(100);
   const size = await page.evaluate(() => localStorage.getItem("chat-font-size"));
 
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(500);
   const sizeAfter = await page.evaluate(() => localStorage.getItem("chat-font-size"));
   report("Chat font size persists across reload", size === sizeAfter, `stored="${size}"`);
@@ -724,7 +729,7 @@ async function testCleanModePersists() {
   await page.waitForTimeout(200);
   const newState = await page.evaluate(() => localStorage.getItem("voiced-only"));
 
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(500);
   const stateAfter = await page.evaluate(() => localStorage.getItem("voiced-only"));
   report("Clean mode persists across reload", newState === stateAfter, `stored="${newState}"`);
@@ -798,7 +803,7 @@ async function testDebugPanelPersistence() {
   await page.keyboard.press("Control+Shift+KeyD");
   await page.waitForTimeout(200);
 
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(500);
   const visible = await page.locator("#debugPanel").evaluate(
     (el: HTMLElement) => el.style.display !== "none" && el.offsetHeight > 0
@@ -1498,6 +1503,214 @@ async function testMultiEntryTtsBoundaryProgression() {
 // RUNNER
 // ═══════════════════════════════════════════
 
+// ═══════════════════════════════════════════
+// 21. FLOW MODE (DOM injection, iPhone viewport)
+// ═══════════════════════════════════════════
+
+async function fmInjectEntries(entries: object[]) {
+  await page.evaluate((entries) => {
+    (window as any).__murmur?.renderEntries(entries, false);
+  }, entries);
+  await page.waitForTimeout(300);
+}
+
+async function fmClearEntries() {
+  await page.evaluate(() => {
+    (window as any).__murmur?.renderEntries([], false);
+    const t = document.getElementById("transcript");
+    if (t) t.scrollTop = 0;
+  });
+  await page.waitForTimeout(200);
+}
+
+async function fmTestBackground() {
+  const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  report("Flow mode: body background is cream", bg === "rgb(245, 244, 239)", `bg=${bg}`);
+  await screenshot("fm-background");
+}
+
+async function fmTestSafeAreaTop() {
+  const pt = await page.evaluate(() => getComputedStyle(document.body).paddingTop);
+  report("Flow mode: body has padding-top (safe area)", pt !== undefined, `paddingTop=${pt}`);
+}
+
+async function fmTestTalkBarFixed() {
+  const pos = await page.evaluate(() => {
+    const bar = document.querySelector(".talk-bar") as HTMLElement;
+    return bar ? getComputedStyle(bar).position : "missing";
+  });
+  report("Flow mode: talk bar is position:fixed", pos === "fixed", `position=${pos}`);
+  await screenshot("fm-talk-bar");
+}
+
+async function fmTestTalkBarAtBottom() {
+  const info = await page.evaluate(() => {
+    const bar = document.querySelector(".talk-bar") as HTMLElement;
+    if (!bar) return null;
+    const r = bar.getBoundingClientRect();
+    return { bottom: Math.round(r.bottom), winH: window.innerHeight };
+  });
+  const ok = info ? info.bottom <= info.winH + 2 : false;
+  report("Flow mode: talk bar bottom touches viewport", ok, `barBottom=${info?.bottom} winH=${info?.winH}`);
+}
+
+async function fmTestHiddenElements() {
+  const hidden = await page.evaluate(() => {
+    const header = document.querySelector(".header") as HTMLElement;
+    const controls = document.querySelector(".controls") as HTMLElement;
+    const inputBar = document.querySelector(".input-bar") as HTMLElement;
+    return {
+      headerHidden: header ? getComputedStyle(header).display === "none" : true,
+      controlsHidden: controls ? getComputedStyle(controls).display === "none" : true,
+      inputBarHidden: inputBar ? getComputedStyle(inputBar).display === "none" : true,
+    };
+  });
+  const ok = hidden.headerHidden && hidden.controlsHidden && hidden.inputBarHidden;
+  report("Flow mode: header/controls/input hidden", ok,
+    `header=${hidden.headerHidden} controls=${hidden.controlsHidden} inputBar=${hidden.inputBarHidden}`);
+}
+
+async function fmTestGearBtnVisible() {
+  const visible = await page.evaluate(() => {
+    const btn = document.getElementById("flowGearBtn");
+    return btn ? getComputedStyle(btn).display !== "none" : false;
+  });
+  report("Flow mode: gear button visible", visible);
+}
+
+async function fmTestExitButton() {
+  const visible = await page.evaluate(() => {
+    const btn = document.querySelector(".flow-exit-btn") as HTMLElement;
+    return btn ? getComputedStyle(btn).display !== "none" : false;
+  });
+  report("Flow mode: exit button visible", visible);
+  await screenshot("fm-exit-btn");
+}
+
+async function fmTestLiveTranscriptElement() {
+  const exists = await page.evaluate(() => !!document.getElementById("flowLiveTranscript"));
+  report("Flow mode: live transcript element exists", exists);
+}
+
+async function fmTestUserBubbleAlignment() {
+  await fmClearEntries();
+  await fmInjectEntries([
+    { id: "u1", role: "user", text: "Test message", speakable: false, spoken: false, ts: Date.now(), turn: 1 },
+  ]);
+  const align = await page.evaluate(() => {
+    const bubble = document.querySelector(".entry-bubble.user") as HTMLElement;
+    return bubble ? getComputedStyle(bubble).alignSelf : "missing";
+  });
+  report("Flow mode: user bubble right-aligned", align === "flex-end" || align === "auto", `alignSelf=${align}`);
+}
+
+async function fmTestShortContentAtTop() {
+  await fmClearEntries();
+  await fmInjectEntries([
+    { id: "u1", role: "user", text: "Hello", speakable: false, spoken: false, ts: Date.now(), turn: 1 },
+    { id: "a1", role: "assistant", text: "Hi there.", speakable: true, spoken: false, ts: Date.now(), turn: 1 },
+  ]);
+  await page.waitForTimeout(400);
+  // Check that both injected entry-bubbles are visible in the transcript (not scrolled off screen).
+  // We check visibility rather than scrollTop=0 because live-session history entries make
+  // scrollHeight large even with few injected entries.
+  const visible = await page.evaluate(() => {
+    const t = document.getElementById("transcript")!;
+    const tR = t.getBoundingClientRect();
+    const u = t.querySelector(".entry-bubble.user[data-entry-id='u1']") as HTMLElement;
+    const a = t.querySelector(".entry-bubble.assistant[data-entry-id='a1']") as HTMLElement;
+    if (!u || !a) return { ok: false, detail: "missing bubbles" };
+    const uR = u.getBoundingClientRect();
+    const aR = a.getBoundingClientRect();
+    const uVisible = uR.top >= tR.top - 5 && uR.bottom <= tR.bottom + 5;
+    const aVisible = aR.top >= tR.top - 5 && aR.bottom <= tR.bottom + 5;
+    return { ok: uVisible && aVisible, detail: `u=${Math.round(uR.top - tR.top)}px a=${Math.round(aR.top - tR.top)}px` };
+  });
+  report("Flow mode: short conversation — injected entries visible", visible.ok, visible.detail);
+  await screenshot("fm-short-content-top");
+}
+
+async function fmTestOverflowScrollsToBottom() {
+  await fmClearEntries();
+  const entries: object[] = [];
+  for (let i = 0; i < 15; i++) {
+    entries.push({ id: `u${i}`, role: "user", text: `User message ${i}`, speakable: false, spoken: false, ts: Date.now(), turn: i + 1 });
+    entries.push({ id: `a${i}`, role: "assistant", text: `Assistant response ${i}. This is a longer reply to take up space on screen.`, speakable: true, spoken: false, ts: Date.now(), turn: i + 1 });
+  }
+  await fmInjectEntries(entries);
+  await page.waitForTimeout(500);
+  const info = await page.evaluate(() => {
+    const t = document.getElementById("transcript")!;
+    const max = t.scrollHeight - t.clientHeight;
+    const overflows = t.scrollHeight > t.clientHeight;
+    // Initial scroll formula: scrollTop = max - 25% of clientHeight (±tolerance for live session interference)
+    const expectedMin = Math.max(0, max - Math.floor(t.clientHeight * 0.35));
+    const expectedMax = max;
+    const inRange = t.scrollTop >= expectedMin && t.scrollTop <= expectedMax;
+    return { scrollTop: t.scrollTop, max, overflows, expectedMin, inRange };
+  });
+  const ok = info.overflows && info.inRange;
+  report("Flow mode: overflow content — last entry visible near top", ok,
+    `scrollTop=${info.scrollTop} expected=[${info.expectedMin},${info.max}] overflows=${info.overflows}`);
+  await screenshot("fm-overflow-scrolled");
+}
+
+async function fmTestNewUserEntrySnapsToTop() {
+  await fmClearEntries();
+  const initial: object[] = [];
+  for (let i = 0; i < 8; i++) {
+    initial.push({ id: `u${i}`, role: "user", text: `Question ${i}`, speakable: false, spoken: false, ts: Date.now(), turn: i + 1 });
+    initial.push({ id: `a${i}`, role: "assistant", text: `Answer ${i}. `.repeat(20), speakable: true, spoken: false, ts: Date.now(), turn: i + 1 });
+  }
+  await fmInjectEntries(initial);
+  await page.waitForTimeout(400);
+  await fmInjectEntries([...initial,
+    { id: "u9", role: "user", text: "New question after overflow", speakable: false, spoken: false, ts: Date.now(), turn: 9 },
+  ]);
+  await page.waitForTimeout(500);
+  const info = await page.evaluate(() => {
+    const t = document.getElementById("transcript")!;
+    const u9 = t.querySelector(".entry-bubble.user[data-entry-id='u9']") as HTMLElement;
+    const tR = t.getBoundingClientRect();
+    const uR = u9?.getBoundingClientRect();
+    const overflows = t.scrollHeight > t.clientHeight;
+    const userEntryTop = uR ? Math.round(uR.top - tR.top) : -1;
+    return { overflows, userEntryTop };
+  });
+  // Entry should be in the upper 30% of the transcript viewport (initial scroll + snap puts it there)
+  const upperThird = Math.floor(250); // ~30% of 844px viewport
+  const snapped = info.overflows && info.userEntryTop >= -5 && info.userEntryTop <= upperThird;
+  report("Flow mode: new user message near top of viewport", snapped,
+    `overflows=${info.overflows} userEntryTop=${info.userEntryTop}px`);
+  await screenshot("fm-new-user-snap");
+}
+
+async function fmTestAssistantFont() {
+  await fmClearEntries();
+  await fmInjectEntries([
+    { id: "a1", role: "assistant", text: "Testing serif font.", speakable: true, spoken: false, ts: Date.now(), turn: 1 },
+  ]);
+  const fontFamily = await page.evaluate(() => {
+    const bubble = document.querySelector(".entry-bubble.assistant") as HTMLElement;
+    return bubble ? getComputedStyle(bubble).fontFamily : "missing";
+  });
+  const isSerif = /times|serif/i.test(fontFamily);
+  report("Flow mode: assistant bubble uses serif font", isSerif, `fontFamily=${fontFamily}`);
+}
+
+async function fmTestUserTextNoLineBreaks() {
+  await fmClearEntries();
+  const multiLineText = "This is a long message that\nhas line breaks\nfrom terminal wrapping";
+  await fmInjectEntries([
+    { id: "u1", role: "user", text: multiLineText, speakable: false, spoken: false, ts: Date.now(), turn: 1 },
+  ]);
+  const hasBr = await page.evaluate(() => {
+    const bubble = document.querySelector(".entry-bubble.user") as HTMLElement;
+    return bubble ? bubble.querySelectorAll("br").length > 0 : false;
+  });
+  report("Flow mode: user text has no hard <br> line breaks", !hasBr, `hasBr=${hasBr}`);
+}
+
 async function main() {
   console.log("\n  Murmur End-to-End Tests");
   console.log(`  Mode: ${HEADLESS ? "headless" : "visible browser"}`);
@@ -1620,6 +1833,42 @@ async function main() {
     await run("Non-speakable not confused with spoken", testNonSpeakableNotFaded);
     await run("Clean mode: spoken boundary visible", testCleanModeHidesNonSpeakableShowsSpokenBoundary);
     await run("4-entry boundary progression", testMultiEntryTtsBoundaryProgression);
+
+    // ── 21. Flow Mode (iPhone viewport, DOM injection) ──
+    // Switch to iPhone 14 Pro dimensions for these tests, restore after
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
+    await page.evaluate(() => localStorage.setItem("murmur-tour-done", "1"));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1000);
+    await page.evaluate(() => {
+      document.body.classList.add("flow-mode");
+      localStorage.setItem("murmur-flow-mode", "1");
+    });
+    await page.waitForTimeout(300);
+
+    console.log("\n  ── 21. Flow Mode ──\n");
+    await run("Body background is cream", fmTestBackground);
+    await run("Body has padding-top (safe area)", fmTestSafeAreaTop);
+    await run("Talk bar is position:fixed", fmTestTalkBarFixed);
+    await run("Talk bar bottom touches viewport", fmTestTalkBarAtBottom);
+    await run("Header/controls/input hidden", fmTestHiddenElements);
+    await run("Gear button visible", fmTestGearBtnVisible);
+    await run("Exit button visible", fmTestExitButton);
+    await run("Live transcript element exists", fmTestLiveTranscriptElement);
+    await run("User bubble right-aligned", fmTestUserBubbleAlignment);
+    await run("Short conversation stays at top", fmTestShortContentAtTop);
+    await run("Overflow content: last entry visible near top", fmTestOverflowScrollsToBottom);
+    await run("New user message near top of viewport", fmTestNewUserEntrySnapsToTop);
+    await run("Assistant font is serif", fmTestAssistantFont);
+    await run("User text has no hard line breaks", fmTestUserTextNoLineBreaks);
+
+    // Disable flow mode and restore viewport
+    await page.evaluate(() => {
+      document.body.classList.remove("flow-mode");
+      localStorage.setItem("murmur-flow-mode", "0");
+    });
+    await page.setViewportSize({ width: 320, height: 800 });
 
   } catch (err) {
     await screenshot("fatal-error").catch(() => {});

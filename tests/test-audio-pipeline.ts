@@ -2,8 +2,9 @@
  * Audio pipeline tests — exercises STT/TTS round-trips via WebSocket.
  * Requires: server running on localhost:3457, Whisper STT on :2022, Kokoro TTS on :8880
  *
- * Generate test audio first:  npx tsx tests/generate-test-audio.ts
- * Run:  npx tsx tests/test-audio-pipeline.ts
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Generate test audio first (in test-runner): node --import tsx/esm tests/generate-test-audio.ts
+ * Run (in test-runner):                       node --import tsx/esm tests/test-audio-pipeline.ts
  */
 
 import WebSocket from "ws";

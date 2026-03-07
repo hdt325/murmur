@@ -4,7 +4,7 @@
 
 set -e
 SERVER="http://localhost:3457"
-LOG_FILE="/private/tmp/claude-501/-Users-happythakkar-Desktop-Programming-voice-panel/tasks/b7sdlmfz9.output"
+LOG_FILE="/tmp/murmur-server.log"
 
 echo "=== Poll Detection Test ==="
 echo ""
@@ -18,7 +18,7 @@ echo ""
 if [ ! -f "$LOG_FILE" ]; then
     echo "Server log not found at $LOG_FILE"
     echo "Finding latest log..."
-    LOG_FILE=$(ls -t /private/tmp/claude-501/-Users-happythakkar-Desktop-Programming-voice-panel/tasks/*.output 2>/dev/null | head -1)
+    LOG_FILE=$(ls -t /tmp/murmur-server.log 2>/dev/null | head -1)
     echo "Using: $LOG_FILE"
 fi
 echo ""

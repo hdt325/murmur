@@ -287,7 +287,13 @@ function httpsGet(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { "User-Agent": "Murmur-Electron" } }, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
-        return httpsGet(res.headers.location).then(resolve, reject);
+        const location = res.headers.location;
+        // Only follow redirects to GitHub domains to prevent MITM redirect attacks
+        if (!location || (!location.startsWith("https://raw.githubusercontent.com/") && !location.startsWith("https://github.com/"))) {
+          res.resume();
+          return reject(new Error(`Unsafe redirect to ${location}`));
+        }
+        return httpsGet(location).then(resolve, reject);
       }
       if (res.statusCode !== 200) {
         res.resume();
@@ -793,7 +799,7 @@ app.on("will-quit", (e) => {
       try { proc.kill("SIGKILL"); } catch {}
       serverProcess = null;
       app.quit();
-    }, 3000);
+    }, 5000);
     proc.once("exit", () => {
       clearTimeout(killTimeout);
       serverProcess = null;

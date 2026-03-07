@@ -102,48 +102,108 @@ export class TmuxBackend implements TerminalManager {
   }
 
   sendText(text: string): void {
+    // Collapse newlines (Whisper multi-line transcriptions) and strip stray CR
+    const sanitized = text.replace(/[\r\n]+/g, " ").trim();
     const target = this.currentTarget;
+    console.log(`[sendText] ${sanitized.length} chars → ${target}: "${sanitized.slice(0, 60)}"`);
+
     try {
-      execFileSync("tmux", ["send-keys", "-t", target, "-l", text], {
-        stdio: "ignore",
-        timeout: 5000,
-      });
-      execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
+      // send-keys -l types each character literally into Claude Code's ink TUI.
+      // paste-buffer was tried but doesn't reliably insert into the prompt.
+      execFileSync("tmux", ["send-keys", "-t", target, "-l", sanitized], {
         stdio: "ignore",
         timeout: 5000,
       });
     } catch (err) {
-      console.error("tmux send-keys failed:", (err as Error).message);
+      console.error("[sendText] send-keys -l failed:", (err as Error).message);
+      return;
     }
 
-    // Fallback: if text got stuck as a bracketed paste, retry Enter
-    setTimeout(() => {
+    // For long messages (>80 chars), Claude Code's ink TUI event loop may need
+    // time to process all the key events before Enter is accepted. Add a small
+    // proportional delay before sending Enter. Short messages get no delay.
+    const enterDelayMs = sanitized.length > 80 ? Math.min(100 + Math.floor(sanitized.length / 10), 400) : 0;
+
+    const doSendEnter = () => {
+      try {
+        console.log(`[sendText] Sending Enter to ${target}`);
+        execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
+          stdio: "ignore",
+          timeout: 2000,
+        });
+      } catch (err) {
+        console.error("[sendText] send-keys Enter failed:", (err as Error).message);
+      }
+    };
+
+    if (enterDelayMs > 0) {
+      setTimeout(doSendEnter, enterDelayMs);
+    } else {
+      doSendEnter();
+    }
+
+    // Retry: if Enter was dropped or not processed, detect stuck state and resend.
+    // Check the LAST 15 lines (not full pane) — Claude Code's TUI shows ❯ in
+    // conversation history too, causing false positives on full-pane checks.
+    // For long wrapped messages: text spans multiple lines after ❯, so also check
+    // continuation lines (lines after the prompt line that have content).
+    const retryEnterIfStuck = () => {
       try {
         const pane = execFileSync("tmux", ["capture-pane", "-t", target, "-p"], {
           encoding: "utf-8", timeout: 2000,
         }).trim();
         const lines = pane.split("\n");
-        const lastLines = lines.slice(-5).join("\n");
-        // Stuck = prompt has text but no spinner/response started
+        const inputArea = lines.slice(-15); // extra lines for wrapped long text
+        const inputAreaText = inputArea.join("\n");
+
+        // Not stuck if Claude is already working (spinner visible)
         if (
-          lastLines.includes("❯ ") &&
-          !lastLines.includes("✻") &&
-          !lastLines.includes("⏺")
-        ) {
-          const promptLine =
-            lines.filter((l) => l.includes("❯ ")).pop() || "";
-          const afterPrompt = promptLine.replace(/^.*❯\s*/, "").trim();
-          if (afterPrompt.length > 5) {
-            console.log(
-              `[sendText] Text stuck on prompt — sending Enter to confirm`
-            );
-            execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
-              stdio: "ignore", timeout: 2000,
-            });
-          }
+          inputAreaText.includes("✻") ||
+          inputAreaText.includes("✶") ||
+          inputAreaText.includes("⏺") ||
+          inputAreaText.includes("Transmuting") ||
+          inputAreaText.includes("Press up to edit")
+        ) return false;
+
+        if (!inputAreaText.includes("❯")) return false;
+
+        // Find the LAST prompt line (bottom of input area = actual active prompt)
+        let promptLineIdx = -1;
+        for (let i = inputArea.length - 1; i >= 0; i--) {
+          if (inputArea[i].includes("❯")) { promptLineIdx = i; break; }
         }
-      } catch {}
-    }, 800);
+        if (promptLineIdx === -1) return false;
+
+        const promptLine = inputArea[promptLineIdx];
+        const afterPrompt = promptLine.replace(/^.*❯\s*/, "").trim();
+
+        // Content exists on same line after ❯, OR on continuation lines below ❯
+        // (long messages wrap across multiple terminal lines)
+        const continuationHasContent = inputArea
+          .slice(promptLineIdx + 1)
+          .some(l => l.trim().length > 0);
+
+        if (afterPrompt.length > 0 || continuationHasContent) {
+          console.log(`[sendText] Stuck — afterPrompt="${afterPrompt.slice(0, 40)}" hasContinuation=${continuationHasContent} — retrying Enter`);
+          execFileSync("tmux", ["send-keys", "-t", target, "Enter"], {
+            stdio: "ignore", timeout: 2000,
+          });
+          return true;
+        }
+        return false;
+      } catch { return false; }
+    };
+
+    // First retry fires after Enter would have been sent + 500ms buffer.
+    // Subsequent retries at 600ms intervals. 3 total retries.
+    const firstRetryMs = enterDelayMs + 500;
+    setTimeout(() => {
+      if (!retryEnterIfStuck()) return;
+      setTimeout(() => {
+        if (!retryEnterIfStuck()) return;
+        setTimeout(retryEnterIfStuck, 600);
+      }, 600);
+    }, firstRetryMs);
   }
 
   sendKey(key: TerminalKey): void {
@@ -205,7 +265,7 @@ export class TmuxBackend implements TerminalManager {
     try {
       execFileSync("tmux", [
         "pipe-pane", "-O", "-t", this.currentTarget,
-        `cat >> ${filePath}`
+        `cat >> '${filePath.replace(/'/g, "'\\''")}'`
       ], { stdio: "ignore", timeout: 2000 });
     } catch (e) {
       console.error("[tmux] Failed to start pipe-pane:", e);

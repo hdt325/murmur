@@ -1,24 +1,33 @@
 # Murmur Test Suite
 
-Complete test suite documentation — 9 files, ~4,200 lines of test code, 8 server test protocol handlers.
+Complete test suite documentation. Single command: `tests/run.sh all`
 
-## Quick Reference
+## ⚠️ CRITICAL: Run Tests in `test-runner` Session Only
+
+**NEVER run tests via a Bash tool inside the `claude-voice` Claude Code session.**
+Murmur's passive watcher watches `claude-voice` and will pick up Claude Code's spinner
+and test output as Claude's response, breaking both the test and the conversation.
+
+**Always use the helper script** (which sends commands to the `test-runner` tmux session):
 
 ```bash
-# Prerequisites: server on localhost:3457
-# Generate test audio (requires Kokoro TTS + ffmpeg):
-npx tsx tests/generate-test-audio.ts
+tests/run.sh all      # ← SINGLE COMMAND: full suite, auto-skips audio if services unavailable
 
-# Run suites:
-npx tsx tests/test-smoke.ts              # UI only, no voice services needed
-npx tsx tests/test-e2e.ts                # Full E2E (visible browser)
-HEADLESS=1 npx tsx tests/test-e2e.ts     # Full E2E (headless)
-npx tsx tests/test-audio-pipeline.ts     # Audio pipeline (needs Whisper+Kokoro)
-npx tsx tests/test-tts-pipeline.ts       # TTS pipeline integration
-npx tsx tests/test-bugs.ts               # Bug regression checks
-npx tsx tests/test-detection.ts          # Poll detection unit tests
-bash tests/test-poll.sh                  # Poll integration (needs tmux)
-bash tests/test-voice-cycle.sh           # Full voice cycle (needs tmux+Claude)
+# Individual suites:
+tests/run.sh e2e      # E2E + flow mode (~105 tests)
+tests/run.sh flow     # Flow mode deep tests
+tests/run.sh bugs     # Regression tests
+tests/run.sh smoke    # UI smoke tests only
+tests/run.sh audio    # Audio pipeline (needs Whisper + Kokoro)
+tests/run.sh tts      # TTS pipeline (needs Kokoro)
+tests/run.sh detection # Poll detection unit tests
+
+# Shell integration (run directly in test-runner, need live Claude session):
+bash tests/test-poll.sh
+bash tests/test-voice-cycle.sh
+
+# Generate test audio first (required for audio/tts suites):
+node --import tsx/esm tests/generate-test-audio.ts
 ```
 
 ## Service Requirements
@@ -36,11 +45,11 @@ bash tests/test-voice-cycle.sh           # Full voice cycle (needs tmux+Claude)
 
 ---
 
-## 1. test-smoke.ts (388 lines, ~20 tests)
+## 1. test-smoke.ts (~20 tests)
 
 **Purpose:** Quick UI smoke tests — core interactions, no voice services needed.
 
-**Run:** `npx tsx tests/test-smoke.ts` or `HEADLESS=1 npx tsx tests/test-smoke.ts`
+**Run:** `tests/run.sh smoke` (or directly in test-runner: `node --import tsx/esm tests/test-smoke.ts`)
 
 | # | Test | What it checks |
 |---|------|----------------|
@@ -62,11 +71,11 @@ bash tests/test-voice-cycle.sh           # Full voice cycle (needs tmux+Claude)
 
 ---
 
-## 2. test-e2e.ts (930 lines, ~74 tests)
+## 2. test-e2e.ts (~105 tests)
 
-**Purpose:** Comprehensive end-to-end tests — every user-facing feature, visible browser.
+**Purpose:** Comprehensive end-to-end tests — every user-facing feature + flow mode (sections 1–21), visible browser.
 
-**Run:** `npx tsx tests/test-e2e.ts` or `HEADLESS=1 npx tsx tests/test-e2e.ts`
+**Run:** `tests/run.sh e2e` (or directly in test-runner: `node --import tsx/esm tests/test-e2e.ts`)
 
 ### Section 1: STT Tests (require Whisper + test audio)
 
@@ -162,15 +171,15 @@ bash tests/test-voice-cycle.sh           # Full voice cycle (needs tmux+Claude)
 | 39 | `testTypeModeMultiParagraphInput` | Type mode → 341-char paragraph creates bubble |
 | 40 | `testReadModeEntriesRender` | Read mode (mic, no TTS) → entries render, 0 highlights |
 
-*(Plus all smoke test equivalents — page load, tour, modes, terminal, etc. — totaling ~74 tests)*
+*(Plus all smoke test equivalents — page load, tour, modes, terminal, etc. — plus section 21: Flow Mode (14 tests) — totaling ~105 tests)*
 
 ---
 
-## 3. test-audio-pipeline.ts (930 lines, ~29 tests)
+## 3. test-audio-pipeline.ts (~29 tests)
 
 **Purpose:** Audio pipeline tests via WebSocket — STT/TTS round-trips, entry system, interactive prompts, replay chain.
 
-**Run:** `npx tsx tests/test-audio-pipeline.ts`
+**Run:** In test-runner session: `node --import tsx/esm tests/test-audio-pipeline.ts`
 
 ### STT Tests (require Whisper + test audio files)
 
@@ -233,11 +242,11 @@ bash tests/test-voice-cycle.sh           # Full voice cycle (needs tmux+Claude)
 
 ---
 
-## 4. test-tts-pipeline.ts (801 lines)
+## 4. test-tts-pipeline.ts
 
 **Purpose:** TTS pipeline integration — full pipeline exercise with timing and assertions.
 
-**Run:** `npx tsx tests/test-tts-pipeline.ts`
+**Run:** In test-runner session: `node --import tsx/esm tests/test-tts-pipeline.ts`
 
 | # | Test | What it checks |
 |---|------|----------------|
@@ -254,11 +263,11 @@ Uses `PipelineTestClient` class with timeline tracking and assertion framework.
 
 ---
 
-## 5. test-bugs.ts (349 lines, ~24 tests)
+## 5. test-bugs.ts
 
 **Purpose:** Bug fix regression tests — verifies specific bugs stay fixed.
 
-**Run:** `npx tsx tests/test-bugs.ts`
+**Run:** `tests/run.sh bugs` (or directly in test-runner: `node --import tsx/esm tests/test-bugs.ts`)
 
 | # | Test | Bug | What it checks |
 |---|------|-----|----------------|
@@ -275,11 +284,19 @@ Uses `PipelineTestClient` class with timeline tracking and assertion framework.
 
 ---
 
-## 6. test-detection.ts (307 lines)
+## 5b. test-flow.ts (~comprehensive flow mode)
+
+**Purpose:** Comprehensive flow mode tests — simulates real user behavior with server-format entry data, TTS word highlight via `onTtsAudioStart`, and full conversation turn-by-turn.
+
+**Run:** `tests/run.sh flow` (or directly in test-runner: `node --import tsx/esm tests/test-flow.ts`)
+
+---
+
+## 6. test-detection.ts
 
 **Purpose:** Unit tests for poll detection functions against real tmux pane fixtures.
 
-**Run:** `npx tsx tests/test-detection.ts`
+**Run:** In test-runner session: `node --import tsx/esm tests/test-detection.ts`
 
 | # | Test | What it checks |
 |---|------|----------------|
@@ -313,11 +330,11 @@ Sends message via tmux, monitors pane for spinner → prompt ready → response 
 
 ---
 
-## 9. generate-test-audio.ts (221 lines)
+## 9. generate-test-audio.ts
 
 **Purpose:** Generate test WAV files using Kokoro TTS for pipeline tests.
 
-**Run:** `npx tsx tests/generate-test-audio.ts`
+**Run:** In test-runner session: `node --import tsx/esm tests/generate-test-audio.ts`
 
 Generates 7 audio files in `tests/test-audio/`:
 

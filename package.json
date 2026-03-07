@@ -4,13 +4,18 @@
   "type": "module",
   "scripts": {
     "start": "node start.mjs",
-    "test": "npx tsx tests/test-smoke.ts",
-    "test:e2e": "npx tsx tests/test-e2e.ts",
-    "test:bugs": "npx tsx tests/test-bugs.ts",
-    "test:qa": "npx tsx test-qa-visual.ts",
-    "test:qa:site": "npx tsx test-qa-visual.ts --site",
-    "test:qa:electron": "npx tsx test-qa-visual.ts --electron",
-    "test:qa:all": "npx tsx test-qa-visual.ts --all",
+    "test": "tests/run.sh all",
+    "test:quick": "npx tsc --noEmit && HEADLESS=1 node --import tsx/esm tests/test-smoke.ts",
+    "typecheck": "npx tsc --noEmit",
+    "test:e2e": "tests/run.sh e2e",
+    "test:bugs": "tests/run.sh bugs",
+    "test:flow": "tests/run.sh flow",
+    "test:qa": "tests/run.sh qa",
+    "test:qa:site": "tests/run.sh qa:site",
+    "test:qa:electron": "tests/run.sh qa:electron",
+    "test:qa:all": "tests/run.sh qa:all",
+    "test:ux": "node --import tsx/esm tests/test-ux-agent.ts",
+    "test:ux:ai": "HEADLESS=1 node --import tsx/esm tests/test-ux-agent.ts",
     "electron": "cd electron && npx electron .",
     "build:mac": "cd electron && npx electron-builder --mac",
     "build:win": "cd electron && npx electron-builder --win"
@@ -24,6 +29,7 @@
     "node-pty": "^1.0.0"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.12",

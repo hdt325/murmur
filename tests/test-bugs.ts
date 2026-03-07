@@ -2,13 +2,20 @@
  * Automated UI tests for Murmur bug fixes.
  * Drives a real Chromium browser against http://localhost:3457
  *
- * Run:  npx playwright test test-bugs.ts
- *   or: npx tsx test-bugs.ts   (self-running mode)
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Via helper:  tests/run.sh bugs
+ * Direct:      node --import tsx/esm tests/test-bugs.ts  (in test-runner only)
+ *
+ * ⚠️  FOR CLAUDE CODE: To run tests and read results safely:
+ *   1. Bash: tmux send-keys -t test-runner "node --import tsx/esm tests/test-bugs.ts > /tmp/murmur-test-results.txt 2>&1" Enter
+ *   2. Wait ~60-90s
+ *   3. Read tool: Read /tmp/murmur-test-results.txt
+ *   NEVER use Bash to read results (tail/cat/grep) — that output appears in the claude-voice pane.
  */
 
 import { chromium, Browser, Page, WebSocket as PWWebSocket } from "playwright";
 
-const BASE = "http://localhost:3457";
+const BASE = "http://localhost:3457?testmode=1";
 const PASS = "\x1b[32m✓ PASS\x1b[0m";
 const FAIL = "\x1b[31m✗ FAIL\x1b[0m";
 const SKIP_LIVE = process.argv.includes("--skip-live"); // skip tests that send to Claude
@@ -380,7 +387,14 @@ async function testFeature_interruptButton() {
   const isVisible = await interruptBtn.isVisible().catch(() => false);
   report("Interrupt button is visible (always-present)", isVisible as boolean);
 
-  // Wait for any active Claude session to finish, then check
+  // Send stop to reset any active server state from prior tests, then check
+  await page.evaluate(() => {
+    const stopBtn = document.getElementById("stopBtn") as HTMLButtonElement | null;
+    if (stopBtn) stopBtn.click();
+  });
+  await page.waitForTimeout(800);
+
+  // Wait for talkBtn to reach idle (no active-state class)
   await page.waitForFunction(
     () => {
       const btn = document.querySelector("#talkBtn");
@@ -390,7 +404,7 @@ async function testFeature_interruptButton() {
     },
     { timeout: 30000 }
   ).catch(() => {});
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(500);
 
   // When idle: should NOT have active class
   const hasActiveClass = await interruptBtn.evaluate(el => el.classList.contains("active")).catch(() => false);
@@ -587,11 +601,12 @@ async function testFeature_voicePanelFilter() {
   const htmlSrc = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf-8");
 
   // MURMUR_CONTEXT_FILTER covers both the short on/off signals
-  const filterCoversActivation = serverSrc.includes("Voice mode on") &&
+  // Context lines use "Prose mode on/off" wording; filter regex covers both "Prose mode" and legacy "Voice mode"
+  const filterCoversActivation = (serverSrc.includes("Prose mode on") || serverSrc.includes("Voice mode on")) &&
     serverSrc.includes("MURMUR_CONTEXT_FILTER");
   report("MURMUR_CONTEXT_FILTER covers voice-on signal", filterCoversActivation);
 
-  const filterCoversExit = serverSrc.includes("Voice mode off") &&
+  const filterCoversExit = (serverSrc.includes("Prose mode off") || serverSrc.includes("Voice mode off")) &&
     serverSrc.includes("MURMUR_CONTEXT_FILTER");
   report("MURMUR_CONTEXT_FILTER covers voice-off signal", filterCoversExit);
 
@@ -1197,6 +1212,53 @@ async function testFeature_contextSentOnce() {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Feature: tmux text submission fix
+// send-keys -l used (not paste-buffer), newlines sanitized,
+// retryEnterIfStuck only checks last 10 lines to avoid false positives
+// ──────────────────────────────────────────────────────────────
+async function testFeature_tmuxSubmissionFix() {
+  console.log("\n[Feature] tmux text submission (send-keys -l, newline sanitize, retry scope)");
+
+  const { readFileSync } = await import("fs");
+  let backendSrc = "";
+  try { backendSrc = readFileSync("terminal/tmux-backend.ts", "utf8"); } catch (_) {
+    try { backendSrc = readFileSync("/Users/happythakkar/Desktop/Programming/murmur/terminal/tmux-backend.ts", "utf8"); } catch (_) {}
+  }
+
+  // send-keys -l used for main text delivery (paste-buffer was silently dropped by Claude Code's TUI)
+  report(
+    'Uses send-keys -l for text delivery (not paste-buffer)',
+    backendSrc.includes('"send-keys", "-t", target, "-l"') &&
+    !backendSrc.includes('"paste-buffer"')  // not used as actual tmux command
+  );
+
+  // Newlines stripped before sending — Whisper returns multi-line transcriptions
+  report(
+    'Sanitizes \\r and \\n before send-keys',
+    backendSrc.includes('/[\\r\\n]+/g')
+  );
+
+  // retryEnterIfStuck only checks last 15 lines (avoids false positives on ❯ in conversation history,
+  // extra lines handle long wrapped messages)
+  report(
+    'retryEnterIfStuck scopes check to last 15 lines of pane',
+    backendSrc.includes('slice(-15)')
+  );
+
+  // Retry checks for content on same line OR continuation lines (long wrapped text)
+  report(
+    'retryEnterIfStuck checks continuation lines for wrapped long messages',
+    backendSrc.includes('continuationHasContent')
+  );
+
+  // Proportional Enter delay for long messages
+  report(
+    'Proportional Enter delay for long messages (>80 chars)',
+    backendSrc.includes('enterDelayMs') && backendSrc.includes('sanitized.length > 80')
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
 async function main() {
@@ -1218,8 +1280,9 @@ async function main() {
 
   // Live integration checks
   await testIntegration_wsConnect();
-  if (SKIP_LIVE) { console.log("\n[Integration] Send text input — SKIPPED (--skip-live)"); }
-  else { await testIntegration_textInput(); }
+  // testmode=1 blocks text from reaching Claude, so live integration is always skipped
+  // to prevent test messages from leaking into the active Claude session
+  console.log("\n[Integration] Send text input — SKIPPED (testmode=1 prevents terminal forwarding)");
 
   // Session 1 features
   await testFeature_voiceQueue();
@@ -1254,6 +1317,9 @@ async function main() {
   await testFeature_interruptToggle();
   await testFeature_thinkModeIdleVisual();
   await testFeature_contextSentOnce();
+
+  // Session 4 features (new)
+  await testFeature_tmuxSubmissionFix();
 
   await teardown();
 }

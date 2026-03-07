@@ -250,17 +250,17 @@ murmur/
 
 ## Testing
 
+> ⚠️ Tests must be run in the **`test-runner`** tmux session — not inside the active Claude Code session.
+> Use the helper script which routes commands to the correct session:
+
 ```bash
-# Full E2E browser tests (launches Chromium via Playwright)
-npx tsx tests/test-e2e.ts
+tests/run.sh all       # ← SINGLE COMMAND: full suite, auto-skips audio if services unavailable
+tests/run.sh e2e       # E2E + flow mode only (~105 tests)
+tests/run.sh flow      # Flow mode deep tests
+tests/run.sh bugs      # Regression tests
+tests/run.sh smoke     # UI smoke tests only
 
-# Terminal state detection unit tests
-npx tsx tests/test-detection.ts
-
-# Bug regression tests
-npx tsx tests/test-bugs.ts
-
-# Bash integration tests (macOS only)
+# Bash integration tests (macOS only, run directly in test-runner)
 bash tests/test-poll.sh
 bash tests/test-voice-cycle.sh
 ```

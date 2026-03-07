@@ -1,9 +1,9 @@
-#!/usr/bin/env npx tsx
 /**
  * Self-contained unit tests for poll detection functions.
  * Tests against real tmux pane fixtures — no manual testing needed.
  *
- * Run: npx tsx test-detection.ts
+ * ⚠️  MUST be run in the `test-runner` tmux session — NOT inside the claude-voice session.
+ * Run (in test-runner): node --import tsx/esm tests/test-detection.ts
  */
 
 import { execSync } from "child_process";
