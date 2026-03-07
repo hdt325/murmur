@@ -7192,16 +7192,22 @@
     let _flowTourActive = false;
     function startFlowTour() {
       _flowTourActive = true;
-      // Reuse the main tour infrastructure with flow steps
       endTour(true);
       _tourStep = 0;
       _tourOverlay = document.createElement("div");
       _tourOverlay.className = "tour-overlay";
-      _tourOverlay.style.background = "rgba(245, 244, 239, 0.7)"; // Match flow bg
+      _tourOverlay.style.background = "rgba(245, 244, 239, 0.45)";
+      _tourOverlay.style.pointerEvents = "auto"; // Allow click-to-dismiss
+      _tourOverlay.addEventListener("click", () => endFlowTour());
       _tourSpotlight = document.createElement("div");
       _tourSpotlight.className = "tour-spotlight";
       _tourTip = document.createElement("div");
       _tourTip.className = "tour-tip";
+      // Light theme for flow mode
+      _tourTip.style.background = "rgba(255, 255, 255, 0.95)";
+      _tourTip.style.color = "#1a1a1e";
+      _tourTip.style.borderColor = "rgba(26, 26, 30, 0.12)";
+      _tourTip.style.boxShadow = "0 4px 24px rgba(26, 26, 30, 0.12)";
       document.body.append(_tourOverlay, _tourSpotlight, _tourTip);
       showFlowTourStep();
     }
@@ -7219,13 +7225,13 @@
 
       const isLast = _tourStep === FLOW_TOUR_STEPS.length - 1;
       _tourTip.innerHTML =
-        '<h4>' + s.title + '</h4>' +
-        '<p>' + s.text + '</p>' +
+        '<h4 style="color:#1a1a1e">' + s.title + '</h4>' +
+        '<p style="color:rgba(26,26,30,0.7)">' + s.text + '</p>' +
         '<div class="tour-footer">' +
-        '<span class="tour-step">' + (_tourStep + 1) + ' / ' + FLOW_TOUR_STEPS.length + '</span>' +
+        '<span class="tour-step" style="color:rgba(26,26,30,0.4)">' + (_tourStep + 1) + ' / ' + FLOW_TOUR_STEPS.length + '</span>' +
         '<div class="tour-btns">' +
-        '<button class="tour-skip">Skip</button>' +
-        '<button class="tour-next">' + (isLast ? "Done" : "Next") + '</button>' +
+        '<button class="tour-skip" style="color:rgba(26,26,30,0.5)">Skip</button>' +
+        '<button class="tour-next" style="background:#c9a227;color:#fff">' + (isLast ? "Done" : "Next") + '</button>' +
         '</div>' +
         '</div>';
       _tourTip.querySelector(".tour-skip").addEventListener("click", (e) => { e.stopPropagation(); endFlowTour(); });
@@ -7263,9 +7269,9 @@
       localStorage.setItem("murmur-flow-tour-done", "1");
     }
 
-    // Auto-start flow tour on first flow mode visit
+    // Auto-start flow tour on first flow mode visit (3s delay for layout to settle)
     if (flowMode && !localStorage.getItem("murmur-flow-tour-done")) {
-      setTimeout(startFlowTour, 1500);
+      setTimeout(startFlowTour, 3000);
     }
 
     // Auto-start on first visit — defer if in flow mode (tour targets are hidden)
