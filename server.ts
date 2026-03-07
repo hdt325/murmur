@@ -955,8 +955,42 @@ function detectInteractivePrompt(pane: string): boolean {
     }
     if (!interactivePromptActive) {
       interactivePromptActive = true;
-      console.log("[interactive] Prompt detected — notifying client to open terminal");
-      broadcast({ type: "interactive_prompt", active: true });
+      console.log("[interactive] Prompt detected — notifying client");
+
+      // Extract structured options for flow mode display
+      const options: { num: string; title: string; desc: string }[] = [];
+      const optionRe = /(?:❯\s+)?(\d+)\.\s+(.+)/g;
+      let m: RegExpExecArray | null;
+      const tailLines = tail.split("\n");
+      for (let li = 0; li < tailLines.length; li++) {
+        m = optionRe.exec(tailLines[li]);
+        if (m) {
+          const num = m[1];
+          const title = m[2].trim();
+          // Next line might be an indented description
+          let desc = "";
+          if (li + 1 < tailLines.length) {
+            const nextLine = tailLines[li + 1].trim();
+            // Description lines are indented and don't start with a number+dot
+            if (nextLine && !/^\d+\./.test(nextLine) && !/^❯/.test(nextLine) && !/^Enter/.test(nextLine)) {
+              desc = nextLine;
+            }
+          }
+          options.push({ num, title, desc });
+        }
+        optionRe.lastIndex = 0; // Reset for next line
+      }
+
+      // Extract question text (lines before the options, after horizontal rules)
+      let question = "";
+      const ruledLines = tail.split(/─{5,}/);
+      if (ruledLines.length >= 2) {
+        // Question is between the rules
+        const qBlock = ruledLines[1].trim().split("\n").filter(l => l.trim() && !/^[☐☑]/.test(l.trim()));
+        question = qBlock.join(" ").trim();
+      }
+
+      broadcast({ type: "interactive_prompt", active: true, question, options });
     }
     return true;
   }

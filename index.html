@@ -956,6 +956,83 @@
       50% { box-shadow: 0 0 32px rgba(201, 162, 39, 0.4), 0 0 64px rgba(201, 162, 39, 0.2); }
     }
 
+    /* Flow choice card — shown for interactive prompts */
+    .flow-choice-card {
+      display: none;
+      position: fixed;
+      bottom: calc(100px + env(safe-area-inset-bottom, 0px));
+      left: 16px;
+      right: 16px;
+      max-height: 60vh;
+      overflow-y: auto;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(26, 26, 30, 0.12);
+      border-radius: 16px;
+      padding: 16px;
+      z-index: 150;
+      box-shadow: 0 4px 24px rgba(26, 26, 30, 0.12);
+    }
+
+    body.flow-mode .flow-choice-card.open {
+      display: block;
+    }
+
+    .flow-choice-question {
+      font-size: 14px;
+      color: #1a1a1e;
+      line-height: 1.5;
+      margin-bottom: 12px;
+    }
+
+    .flow-choice-option {
+      display: block;
+      width: 100%;
+      text-align: left;
+      background: #f5f4ef;
+      border: 1px solid rgba(26, 26, 30, 0.08);
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .flow-choice-option:hover {
+      background: #eeede6;
+      border-color: rgba(26, 26, 30, 0.18);
+    }
+
+    .flow-choice-option:active {
+      background: #e5e4dd;
+    }
+
+    .flow-choice-option .choice-num {
+      font-weight: 600;
+      color: #c9a227;
+      margin-right: 6px;
+    }
+
+    .flow-choice-option .choice-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: #1a1a1e;
+    }
+
+    .flow-choice-option .choice-desc {
+      font-size: 11px;
+      color: rgba(26, 26, 30, 0.5);
+      margin-top: 2px;
+    }
+
+    /* Flow confirm: mic becomes submit button when choice is selected */
+    body.flow-mode .talk-bar button.flow-confirm {
+      border-color: rgba(39, 174, 96, 0.6) !important;
+      background: #f0faf4 !important;
+      box-shadow: 0 0 24px rgba(39, 174, 96, 0.2) !important;
+    }
+
     /* Speaking: subtle warm gold border, no glow/pulse */
     body.flow-mode .talk-bar button.speaking {
       border-color: rgba(201, 176, 124, 0.5);
@@ -2671,6 +2748,12 @@
 
   <!-- Flow mode live transcription — fixed above talk bar, outside transcript so it doesn't affect scrollHeight -->
   <div class="flow-live-transcription" id="flowLiveText">…</div>
+
+  <!-- Flow choice card for interactive prompts -->
+  <div class="flow-choice-card" id="flowChoiceCard">
+    <div class="flow-choice-question" id="flowChoiceQuestion"></div>
+    <div id="flowChoiceOptions"></div>
+  </div>
 
   <!-- Section 4: Talk button -->
   <div class="talk-bar">
@@ -4393,14 +4476,45 @@
 
         if (msg.type === "interactive_prompt") {
           const termNav = document.getElementById("termNav");
-          if (msg.active) {
-            // Open terminal, show nav buttons, redirect text input to terminal
+          const choiceCard = document.getElementById("flowChoiceCard");
+          const choiceQ = document.getElementById("flowChoiceQuestion");
+          const choiceOpts = document.getElementById("flowChoiceOptions");
+
+          if (msg.active && flowMode && msg.options && msg.options.length > 0) {
+            // Flow mode: show choice card
+            choiceQ.textContent = msg.question || "Claude is asking:";
+            choiceOpts.innerHTML = "";
+            let _selectedNum = null;
+
+            window._flowChoiceSelected = null;
+
+            msg.options.forEach(opt => {
+              const btn = document.createElement("button");
+              btn.className = "flow-choice-option";
+              btn.innerHTML = `<span class="choice-num">${opt.num}.</span><span class="choice-title">${escHtml(opt.title)}</span>` +
+                (opt.desc ? `<div class="choice-desc">${escHtml(opt.desc)}</div>` : "");
+              btn.addEventListener("click", () => {
+                // Highlight selected, deselect others
+                choiceOpts.querySelectorAll(".flow-choice-option").forEach(b => b.style.borderColor = "");
+                btn.style.borderColor = "#c9a227";
+                window._flowChoiceSelected = opt.num;
+                // Turn mic button into submit indicator
+                talkBtn.classList.add("flow-confirm");
+              });
+              choiceOpts.appendChild(btn);
+            });
+
+            choiceCard.classList.add("open");
+          } else if (msg.active) {
+            // Non-flow mode: open terminal
             if (!terminalOpen) { terminalOpen = true; terminalPanel.classList.add("open"); updateTermLabel(); localStorage.setItem("term-open", "1"); }
             termNav.classList.add("show");
             terminalOutput.scrollTop = terminalOutput.scrollHeight;
             terminalInput.placeholder = "Type response here (e.g. 1, 2, 3)...";
             terminalInput.focus();
           } else {
+            // Prompt dismissed
+            choiceCard.classList.remove("open");
             termNav.classList.remove("show");
             terminalInput.placeholder = "Type a message...";
           }
@@ -6340,6 +6454,22 @@
 
     // Talk button click
     talkBtn.addEventListener("click", () => {
+      // Flow choice confirm: mic button acts as submit when a choice is selected
+      if (window._flowChoiceSelected && talkBtn.classList.contains("flow-confirm")) {
+        const num = window._flowChoiceSelected;
+        window._flowChoiceSelected = null;
+        talkBtn.classList.remove("flow-confirm");
+        document.getElementById("flowChoiceCard").classList.remove("open");
+        if (ws?.readyState === WebSocket.OPEN) {
+          // Navigate down to the selected option then press Enter
+          for (let i = 1; i < parseInt(num); i++) {
+            ws.send("key:down");
+          }
+          setTimeout(() => ws.send("key:enter"), 150);
+        }
+        return;
+      }
+
       // Suppress click if long press just fired
       if (_flowLongPressFired) { _flowLongPressFired = false; return; }
       _startBgAudioSession(); // Start iOS background audio session on first user gesture
