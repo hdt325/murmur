@@ -3032,12 +3032,17 @@
         transcript.scrollTop = transcript.scrollHeight;
         return;
       }
+      // Account for fixed talk-bar overlapping transcript bottom on mobile
+      const talkBar = document.querySelector(".talk-bar");
+      const barH = talkBar ? talkBar.getBoundingClientRect().height : 0;
+
       // If TTS is actively speaking, scroll to the active entry instead of the user bubble
       const activeEntry = transcript.querySelector(".msg.bubble-active");
       if (activeEntry && typeof ttsPlaying !== "undefined" && ttsPlaying && !forceUserSnap) {
         const cR = transcript.getBoundingClientRect();
         const eR = activeEntry.getBoundingClientRect();
-        if (eR.top < cR.top || eR.bottom > cR.bottom) {
+        const visibleBottom = cR.bottom - barH;
+        if (eR.top < cR.top || eR.bottom > visibleBottom) {
           transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 96), behavior: "smooth" });
         }
         return;
@@ -3067,8 +3072,9 @@
             void transcript.getBoundingClientRect();
             const lastR = lastEntry.getBoundingClientRect();
             const tR = transcript.getBoundingClientRect();
-            if (lastR.bottom > tR.bottom + 20) {
-              transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - tR.height + 40);
+            const visibleH = tR.height - barH;
+            if (lastR.bottom > tR.top + visibleH + 20) {
+              transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - visibleH + 40);
             }
           } else {
             transcript.scrollTop = userSnapScroll;
