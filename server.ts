@@ -1199,6 +1199,15 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
       // Ctrl hints
       /^(ctrl|⌃|esc to|press)/i.test(trimmed) ||
       /\bctrl\+[a-z]\b/i.test(trimmed) ||
+      // Mode indicators (plan mode, bypass permissions)
+      /^⏸\s+plan mode/i.test(trimmed) ||
+      /⏵⏵\s+bypass/i.test(trimmed) ||
+      /shift\+tab to cycle/i.test(trimmed) ||
+      // Tree-style agent output (├─, └─, │, ⎿)
+      /^[├└│⎿]/.test(trimmed) ||
+      // Agent completion summaries
+      /^\d+\s+Explore\s+agents?\s+finished/i.test(trimmed) ||
+      /Explore\s+.*finished.*ctrl/i.test(trimmed) ||
       // Tool summaries
       /^Read \d+ files?/i.test(trimmed) ||
       /^Searched for \d+/i.test(trimmed) ||
