@@ -792,6 +792,23 @@ function handleTtsDone() {
   currentTtsEntryId = null;
   broadcast({ type: "tts_highlight", entryId: null });
 
+  // Before going idle, check for any unspoken entries from the current turn.
+  // These may have been created after the TTS queue was built (e.g. late paragraphs
+  // from extractStructuredOutput that arrived after the initial queue was populated).
+  const unspoken = conversationEntries.filter(
+    e => e.role === "assistant" && e.turn === currentTurn && e.speakable && !e.spoken
+  );
+  if (unspoken.length > 0) {
+    console.log(`[tts] Queue empty but ${unspoken.length} unspoken entries remain — speaking them`);
+    for (const entry of unspoken) {
+      entry.spoken = true;
+      currentTtsEntryId = entry.id;
+      speakText(entry.text);
+    }
+    broadcast({ type: "entry", entries: conversationEntries, partial: false });
+    return;
+  }
+
   // If stream is still active but nothing queued, broadcast idle so client can listen
   // The stream may produce more TTS later which will re-trigger speaking state
   if (streamState === "WAITING" || streamState === "THINKING" || streamState === "RESPONDING") {
@@ -1405,6 +1422,10 @@ function broadcastCurrentOutput() {
 
   const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
   if (paragraphs.length === 0) return;
+  const speakableCount = paragraphs.filter(p => p.speakable).length;
+  if (paragraphs.length > 1) {
+    console.log(`[stream] Extracted ${paragraphs.length} paragraphs (${speakableCount} speakable): ${paragraphs.map(p => `[${p.speakable ? "S" : "N"}:${p.text.length}]`).join(" ")}`);
+  }
 
   // Normalize for change detection
   const normalized = normalizeSpinners(paragraphs.map(p => p.text).join("\n"));

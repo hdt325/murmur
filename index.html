@@ -5783,6 +5783,7 @@
     // =============================================
     // TTS Audio Playback (streamed from server)
     // =============================================
+    // Pipecat-inspired pipeline: silence trim → normalize → gapless queue.
     // Uses Web Audio API (decodeAudioData) as primary — works on iOS because the
     // AudioContext is already unlocked by the mic permission grant.
     // Falls back to HTML Audio element if Web Audio fails.
@@ -5792,6 +5793,58 @@
     let ttsAnalyser = null;
     let ttsDataArray = null;
     let ttsGainNode = null;
+    const ttsAudioQueue = []; // Client-side queue: [{buffer, blob, rawBuffer}]
+
+    // Trim leading/trailing silence from an AudioBuffer.
+    // Returns a new AudioBuffer with silence removed. Threshold is amplitude below
+    // which samples are considered silent.
+    function trimSilence(audioBuffer, threshold) {
+      if (!threshold) threshold = 0.01;
+      const ch = audioBuffer.getChannelData(0);
+      let start = 0;
+      let end = ch.length - 1;
+      // Find first non-silent sample
+      while (start < ch.length && Math.abs(ch[start]) < threshold) start++;
+      // Find last non-silent sample
+      while (end > start && Math.abs(ch[end]) < threshold) end--;
+      // Add tiny fade margins (2ms) to avoid clicks
+      const margin = Math.min(Math.floor(audioBuffer.sampleRate * 0.002), start);
+      start = Math.max(0, start - margin);
+      end = Math.min(ch.length - 1, end + margin);
+      const trimmedLength = end - start + 1;
+      if (trimmedLength >= ch.length * 0.9) return audioBuffer; // barely any silence, skip
+      const trimmed = ttsAudioCtx.createBuffer(
+        audioBuffer.numberOfChannels, trimmedLength, audioBuffer.sampleRate
+      );
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(start, end + 1));
+      }
+      rlog(`[tts] Trimmed silence: ${audioBuffer.duration.toFixed(2)}s → ${trimmed.duration.toFixed(2)}s`);
+      return trimmed;
+    }
+
+    // Normalize an AudioBuffer to a target RMS level.
+    // Prevents volume variation between Kokoro chunks.
+    function normalizeAudio(audioBuffer, targetRms) {
+      if (!targetRms) targetRms = 0.15;
+      const ch = audioBuffer.getChannelData(0);
+      let sumSq = 0;
+      for (let i = 0; i < ch.length; i++) sumSq += ch[i] * ch[i];
+      const rms = Math.sqrt(sumSq / ch.length);
+      if (rms < 0.001) return audioBuffer; // silence, don't amplify
+      const gain = targetRms / rms;
+      // Clamp gain to avoid extreme amplification or attenuation
+      const clampedGain = Math.max(0.5, Math.min(gain, 3.0));
+      if (Math.abs(clampedGain - 1.0) < 0.05) return audioBuffer; // already close enough
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) {
+        const data = audioBuffer.getChannelData(c);
+        for (let i = 0; i < data.length; i++) {
+          data[i] = Math.max(-1, Math.min(1, data[i] * clampedGain));
+        }
+      }
+      rlog(`[tts] Normalized: rms ${rms.toFixed(3)} → ${targetRms} (gain ${clampedGain.toFixed(2)}x)`);
+      return audioBuffer;
+    }
 
     function playTtsAudio(blob) {
       // In text-out mode, skip TTS playback entirely
@@ -5801,7 +5854,6 @@
         return;
       }
       // If user is currently recording, skip TTS — don't interrupt them
-      // Their new input will trigger a fresh response anyway.
       // Exception: if auto-listen started recording in the gap between sentences,
       // cancel it and play the audio (server is continuing its response).
       if (isRecording) {
@@ -5809,7 +5861,6 @@
           rlog(`[tts] Auto-listen recording in progress — cancelling to play server audio`);
           _discardRecording = true;
           stopRecording();
-          // Fall through to play audio; isRecording is now false after stopRecording sets it
         } else {
           rlog(`[tts] Skipping TTS (${blob.size} bytes) — user is recording`);
           if (ws && ws.readyState === WebSocket.OPEN) ws.send("tts_done");
@@ -5817,51 +5868,56 @@
         }
       }
 
-      // Stop any current playback without sending tts_done (we're replacing)
+      rlog(`[tts] Received audio: ${blob.size} bytes`);
+
+      // If currently playing, queue for gapless playback instead of interrupting
+      if (ttsPlaying && ttsCurrentSource) {
+        rlog(`[tts] Queuing audio (${blob.size} bytes) for gapless playback (${ttsAudioQueue.length} in queue)`);
+        ttsAudioQueue.push({ blob });
+        return;
+      }
+
+      _playNextTtsChunk(blob);
+    }
+
+    // Play a single TTS chunk through the audio pipeline:
+    // decode → trim silence → normalize → play via Web Audio (or fallback)
+    function _playNextTtsChunk(blob) {
       // Save pending highlight — stopTtsPlaybackInternal calls clearFlowWordHighlight
-      // which would wipe the ID that tts_highlight just set for the INCOMING chunk.
       const _savedPendingId = _pendingHighlightEntryId;
       const _savedPendingText = _pendingHighlightSpeakableText;
       stopTtsPlaybackInternal(false);
       _pendingHighlightEntryId = _savedPendingId;
       _pendingHighlightSpeakableText = _savedPendingText;
 
-      rlog(`[tts] Received audio: ${blob.size} bytes`);
-
-      let rawBuffer = null; // Store buffer for fallback path
+      let rawBuffer = null;
       blob.arrayBuffer().then(async buffer => {
         rawBuffer = buffer;
-        // Try Web Audio API first (works on iOS with mic-unlocked AudioContext)
         if (ttsAudioCtx) {
           rlog(`[tts] AudioContext state: ${ttsAudioCtx.state}, sampleRate: ${ttsAudioCtx.sampleRate}`);
-          // Resume AudioContext if suspended (iOS suspends until user gesture)
           if (ttsAudioCtx.state === "suspended") {
             console.log("[tts] Resuming suspended AudioContext");
             await ttsAudioCtx.resume();
           }
           return ttsAudioCtx.decodeAudioData(buffer.slice(0)).then(audioBuffer => {
-            rlog(`[tts] Decoded: ${audioBuffer.duration.toFixed(1)}s, ${audioBuffer.numberOfChannels}ch, ${audioBuffer.sampleRate}Hz`);
-            // Check if we were stopped/replaced while decoding
             if (ttsCurrentSource === "cancelled") { console.log("[tts] Cancelled during decode"); ttsCurrentSource = null; return; }
+
+            // Pipecat-inspired pipeline: trim silence → normalize
+            audioBuffer = trimSilence(audioBuffer, 0.01);
+            audioBuffer = normalizeAudio(audioBuffer, 0.15);
+
+            rlog(`[tts] Processed: ${audioBuffer.duration.toFixed(1)}s, ${audioBuffer.numberOfChannels}ch, ${audioBuffer.sampleRate}Hz`);
+
             const source = ttsAudioCtx.createBufferSource();
             source.buffer = audioBuffer;
             if (!ttsAnalyser) {
               ttsGainNode = ttsAudioCtx.createGain();
               ttsGainNode.gain.value = 1.4;
-              // Dynamics compressor — prevents Kokoro chunks from varying in loudness
-              // Gentle settings to avoid volume dip at start of each chunk
-              const compressor = ttsAudioCtx.createDynamicsCompressor();
-              compressor.threshold.value = -12;
-              compressor.knee.value = 12;
-              compressor.ratio.value = 2;
-              compressor.attack.value = 0.02;
-              compressor.release.value = 0.05;
               ttsAnalyser = ttsAudioCtx.createAnalyser();
               ttsAnalyser.fftSize = 256;
               ttsAnalyser.smoothingTimeConstant = 0.6;
               ttsDataArray = new Float32Array(ttsAnalyser.fftSize);
-              ttsGainNode.connect(compressor);
-              compressor.connect(ttsAnalyser);
+              ttsGainNode.connect(ttsAnalyser);
               ttsAnalyser.connect(ttsAudioCtx.destination);
             }
             source.connect(ttsGainNode);
@@ -5874,14 +5930,23 @@
               ttsCurrentSource = null;
               if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
               ttsEndedAt = Date.now();
-              idleFromTtsCompletion = true;
-              _msUpdate(false); // Update lock screen: done speaking
-              advanceBubbleHighlight();
-              if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
-              if (pendingIdle) applyIdleState();
+              _msUpdate(false);
+
+              // Gapless: if queue has next chunk, play it immediately
+              if (ttsAudioQueue.length > 0) {
+                rlog(`[tts] Gapless: playing next queued chunk (${ttsAudioQueue.length} remaining)`);
+                const next = ttsAudioQueue.shift();
+                advanceBubbleHighlight();
+                if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+                _playNextTtsChunk(next.blob);
+              } else {
+                idleFromTtsCompletion = true;
+                advanceBubbleHighlight();
+                if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+                if (pendingIdle) applyIdleState();
+              }
             };
 
-            // Safety timeout
             const duration = audioBuffer.duration * 1000 + 2000;
             ttsPlaybackTimer = setTimeout(() => {
               console.warn("[tts] Safety timeout — forcing done");
@@ -5889,16 +5954,15 @@
             }, Math.min(duration, 120000));
 
             source.start(0);
-            onTtsAudioStart(audioBuffer.duration * 1000); // Synced to exact audio duration
-            startBargeIn(); // Flow mode: listen for user speech to barge in
-            _msUpdate(true, null); // Signal iOS lock screen: playing
+            onTtsAudioStart(audioBuffer.duration * 1000);
+            startBargeIn();
+            _msUpdate(true, null);
             rlog(`[tts] Playing via Web Audio API (${audioBuffer.duration.toFixed(1)}s)`);
           });
         }
         throw new Error("No AudioContext");
       }).catch(err => {
         rlog("[tts] Web Audio failed, trying Audio element: " + err.message);
-        // Fallback: HTML Audio element — use rawBuffer (ArrayBuffer) if available, else original blob
         const typedBlob = new Blob([rawBuffer || blob], { type: "audio/mpeg" });
         const url = URL.createObjectURL(typedBlob);
         const audio = new Audio(url);
@@ -5912,10 +5976,19 @@
           URL.revokeObjectURL(url);
           if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
           ttsEndedAt = Date.now();
-          idleFromTtsCompletion = true;
-          advanceBubbleHighlight();
-          if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
-          if (pendingIdle) applyIdleState();
+
+          // Gapless fallback: play next queued chunk
+          if (ttsAudioQueue.length > 0) {
+            const next = ttsAudioQueue.shift();
+            advanceBubbleHighlight();
+            if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+            _playNextTtsChunk(next.blob);
+          } else {
+            idleFromTtsCompletion = true;
+            advanceBubbleHighlight();
+            if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+            if (pendingIdle) applyIdleState();
+          }
         }
         audio.onended = done;
         audio.onerror = done;
@@ -6081,6 +6154,7 @@
     function stopTtsPlaybackInternal(sendDone) {
       stopBargeIn();
       clearFlowWordHighlight();
+      ttsAudioQueue.splice(0, ttsAudioQueue.length); // Flush queued audio on stop/interrupt
       if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
       const wasPlaying = ttsPlaying;
       if (ttsCurrentSource) {
