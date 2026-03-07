@@ -598,8 +598,8 @@
     body.flow-mode #flowModeBtn {
       display: block;
       position: fixed;
-      top: max(14px, env(safe-area-inset-top));
-      left: 16px;
+      top: var(--flow-btn-top, max(14px, env(safe-area-inset-top)));
+      left: var(--flow-btn-left, 16px);
       z-index: 200;
       background: rgba(255, 255, 255, 0.7);
       border: 1px solid rgba(26, 26, 30, 0.15);
@@ -3197,9 +3197,15 @@
     }
     applyFlowMode();
     flowModeBtn.addEventListener("click", () => {
+      // Capture exact position before toggling so flow mode can match it
+      if (!flowMode) {
+        const r = flowModeBtn.getBoundingClientRect();
+        flowModeBtn.style.setProperty("--flow-btn-top", r.top + "px");
+        flowModeBtn.style.setProperty("--flow-btn-left", r.left + "px");
+      }
       flowMode = !flowMode;
       localStorage.setItem("murmur-flow-mode", flowMode ? "1" : "0");
-      if (!flowMode) { document.body.classList.remove("flow-recording"); stopBargeIn(); }
+      if (!flowMode) { document.body.classList.remove("flow-recording"); stopBargeIn(); flowModeBtn.style.removeProperty("--flow-btn-top"); flowModeBtn.style.removeProperty("--flow-btn-left"); }
       applyFlowMode();
       // Delay scroll to let CSS layout settle after flow mode transition
       requestAnimationFrame(() => { requestAnimationFrame(() => scrollTranscript(flowMode)); });
