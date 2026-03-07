@@ -1018,12 +1018,24 @@ function getLinesAfterInput(postSnapshot: string, preSnapshot: string, userInput
         startIdx = i + 1;
         continue;
       }
-      // Fallback: match near start of remaining unconsumed input (min 5 chars, within first 10 chars)
-      if (tNorm.length >= 5 && remaining.indexOf(tNorm) >= 0 && remaining.indexOf(tNorm) < 10) {
-        const idx = remaining.indexOf(tNorm);
-        consumedLen += idx + tNorm.length;
-        startIdx = i + 1;
-        continue;
+      // Fallback 1: tmux may break mid-word causing off-by-one at the seam.
+      // Check if tNorm appears anywhere in the remaining unconsumed input.
+      if (tNorm.length >= 3) {
+        const posInRemaining = remaining.indexOf(tNorm);
+        if (posInRemaining >= 0 && posInRemaining < 15) {
+          consumedLen += posInRemaining + tNorm.length;
+          startIdx = i + 1;
+          continue;
+        }
+      }
+      // Fallback 2: check if tNorm is a substring of the full input (handles edge wraps)
+      if (tNorm.length >= 5) {
+        const posInFull = inputNorm.indexOf(tNorm, Math.max(0, consumedLen - 5));
+        if (posInFull >= 0 && posInFull < consumedLen + 15) {
+          consumedLen = posInFull + tNorm.length;
+          startIdx = i + 1;
+          continue;
+        }
       }
     }
     break;

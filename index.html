@@ -721,9 +721,9 @@
       display: none;
     }
 
-    /* Hidden in flow mode — replaced by prelim bubble in transcript */
+    /* Visible during recording in flow mode */
     body.flow-mode.flow-recording .flow-live-transcription {
-      display: none;
+      display: block;
       position: fixed;
       bottom: calc(96px + env(safe-area-inset-bottom, 0px));
       right: 20px;
@@ -798,7 +798,7 @@
     }
 
     body.flow-mode .flow-live-transcript.active {
-      display: none; /* replaced by prelim bubble in transcript */
+      display: block; /* visible as fallback — prelim bubble also shows in transcript */
     }
 
     /* Each word fades in individually */
@@ -3027,14 +3027,14 @@
     // Reset when WebSocket reconnects or flow mode is re-entered.
     let _flowInitialRender = false;
 
-    function scrollTranscript() {
+    function scrollTranscript(forceUserSnap) {
       if (!document.body.classList.contains("flow-mode")) {
         transcript.scrollTop = transcript.scrollHeight;
         return;
       }
       // If TTS is actively speaking, scroll to the active entry instead of the user bubble
       const activeEntry = transcript.querySelector(".msg.bubble-active");
-      if (activeEntry && typeof ttsPlaying !== "undefined" && ttsPlaying) {
+      if (activeEntry && typeof ttsPlaying !== "undefined" && ttsPlaying && !forceUserSnap) {
         const cR = transcript.getBoundingClientRect();
         const eR = activeEntry.getBoundingClientRect();
         if (eR.top < cR.top || eR.bottom > cR.bottom) {
@@ -3042,46 +3042,39 @@
         }
         return;
       }
-      // Flow mode scroll strategy:
-      // 1. If all content fits in viewport — just scroll to bottom (show everything)
-      // 2. If content overflows — snap last user message to 20px from top
-      // 3. If assistant response grew past viewport after snap — scroll to show newest content
-      // Check both entry-bubble (renderEntries path) and plain .msg (addMessage/history path)
       const userBubbles = transcript.querySelectorAll(".msg.user");
       const lastUser = userBubbles.length ? userBubbles[userBubbles.length - 1] : null;
 
-      // Check if content overflows the viewport
       if (transcript.scrollHeight <= transcript.clientHeight + 10) {
-        // Everything fits — no scrolling needed, show all content
         transcript.scrollTop = 0;
       } else if (lastUser) {
-        // Content overflows — snap last user message to near top
+        // Snap last user message to near top
         transcript.scrollTop = 0;
-        void transcript.getBoundingClientRect(); // force reflow
+        void transcript.getBoundingClientRect();
         const cR = transcript.getBoundingClientRect();
         const eR = lastUser.getBoundingClientRect();
         const userSnapScroll = Math.max(0, eR.top - cR.top - 20);
 
-        // Find the last entry (newest content)
-        const allEntries = transcript.querySelectorAll(".msg.assistant, .msg.user");
-        const lastEntry = allEntries.length ? allEntries[allEntries.length - 1] : null;
-
-        if (lastEntry && lastEntry !== lastUser) {
-          // Check if snapping to user bubble would hide the latest content
+        if (forceUserSnap) {
+          // Opening flow mode — always snap to last user, don't override with assistant bottom
           transcript.scrollTop = userSnapScroll;
-          void transcript.getBoundingClientRect();
-          const lastR = lastEntry.getBoundingClientRect();
-          const tR = transcript.getBoundingClientRect();
-          if (lastR.bottom > tR.bottom + 20) {
-            // Latest content is below viewport — scroll to show it instead
-            transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - tR.height + 40);
-          }
-          // else: user snap is fine, latest content is visible
         } else {
-          transcript.scrollTop = userSnapScroll;
+          const allEntries = transcript.querySelectorAll(".msg.assistant, .msg.user");
+          const lastEntry = allEntries.length ? allEntries[allEntries.length - 1] : null;
+
+          if (lastEntry && lastEntry !== lastUser) {
+            transcript.scrollTop = userSnapScroll;
+            void transcript.getBoundingClientRect();
+            const lastR = lastEntry.getBoundingClientRect();
+            const tR = transcript.getBoundingClientRect();
+            if (lastR.bottom > tR.bottom + 20) {
+              transcript.scrollTop = Math.max(0, lastR.bottom - tR.top + transcript.scrollTop - tR.height + 40);
+            }
+          } else {
+            transcript.scrollTop = userSnapScroll;
+          }
         }
       } else {
-        // No user bubbles — scroll to bottom to show latest content
         transcript.scrollTop = transcript.scrollHeight;
       }
     }
@@ -3158,7 +3151,7 @@
       if (!flowMode) { document.body.classList.remove("flow-recording"); stopBargeIn(); }
       applyFlowMode();
       // Delay scroll to let CSS layout settle after flow mode transition
-      requestAnimationFrame(() => { requestAnimationFrame(() => scrollTranscript()); });
+      requestAnimationFrame(() => { requestAnimationFrame(() => scrollTranscript(flowMode)); });
     });
     flowExitBtn.addEventListener("click", () => {
       flowMode = false;
@@ -4501,6 +4494,7 @@
     // =============================================
     // Entry-based rendering — keyed update by entry ID
     // =============================================
+    let _prevUserEntryIds = new Set(); // Track user entry IDs to detect genuinely new entries
 
     function renderEntries(entries, partial) {
       // Capture before any mutation: is this the initial history render in flow mode?
@@ -4641,13 +4635,16 @@
         if (el) el.remove();
       });
 
-      // If live transcription is waiting for the user bubble to confirm, clear it now
-      if (_ltWaitingForBubble && entries.some(e => e.role === "user")) {
+      // If live transcription is waiting for the user bubble to confirm, clear it now.
+      // Only trigger on a genuinely NEW user entry (not old entries from prior turns).
+      const currentUserIds = new Set(entries.filter(e => e.role === "user").map(e => e.id));
+      const hasNewUser = [...currentUserIds].some(id => !_prevUserEntryIds.has(id));
+      _prevUserEntryIds = currentUserIds;
+
+      if (hasNewUser && _ltWaitingForBubble) {
         _clearLiveTranscription();
       }
-      // Always remove prelim bubble when real entries arrive (it has no data-entry-id so
-      // the stale-removal loop above won't catch it)
-      if (_prelimBubble && entries.some(e => e.role === "user")) {
+      if (hasNewUser && _prelimBubble) {
         _removePrelimBubble();
       }
 
@@ -5348,12 +5345,14 @@
     function _ltRenderText(text) {
       const trimmed = text.trim();
       if (!trimmed) return;
+      console.log(`[lt] _ltRenderText flowMode=${flowMode} text="${trimmed.slice(0, 40)}"`);
 
       if (flowMode) {
         // Flow mode: render into a prelim user bubble in the transcript
         const bubble = _ensurePrelimBubble();
         const textEl = bubble.querySelector(".entry-text");
         if (textEl) textEl.textContent = trimmed;
+        console.log(`[lt] prelim bubble created/updated, parent=${!!bubble.parentNode}`);
         // Scroll to keep the prelim bubble visible
         scrollTranscript();
       }
@@ -5379,6 +5378,7 @@
 
     function initLiveTranscription() {
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      console.log(`[lt] initLiveTranscription SR=${!!SR} el=${!!_liveTranscriptEl} recog=${!!_liveRecog}`);
       if (!SR || !_liveTranscriptEl || _liveRecog) return;
       try {
         _liveRecog = new SR();
@@ -5398,17 +5398,19 @@
             _liveTranscriptEl.classList.remove("active");
           }
         };
-        _liveRecog.onerror = () => {
+        _liveRecog.onerror = (ev) => {
+          console.error(`[lt] SpeechRecognition error: ${ev.error || "unknown"}`);
           if (!_ltWaitingForBubble) {
             _liveTranscriptEl.classList.remove("active");
             _liveTranscriptEl.innerHTML = "";
             _ltRenderedWords = 0;
           }
         };
-      } catch (e) { _liveRecog = null; }
+      } catch (e) { console.error("[lt] Failed to create SpeechRecognition:", e); _liveRecog = null; }
     }
 
     function startLiveTranscription() {
+      console.log(`[lt] startLiveTranscription recog=${!!_liveRecog} flowMode=${document.body.classList.contains("flow-mode")}`);
       if (!_liveRecog) initLiveTranscription();
       if (!_liveRecog || !document.body.classList.contains("flow-mode")) return;
       try {
@@ -5816,7 +5818,13 @@
       }
 
       // Stop any current playback without sending tts_done (we're replacing)
+      // Save pending highlight — stopTtsPlaybackInternal calls clearFlowWordHighlight
+      // which would wipe the ID that tts_highlight just set for the INCOMING chunk.
+      const _savedPendingId = _pendingHighlightEntryId;
+      const _savedPendingText = _pendingHighlightSpeakableText;
       stopTtsPlaybackInternal(false);
+      _pendingHighlightEntryId = _savedPendingId;
+      _pendingHighlightSpeakableText = _savedPendingText;
 
       rlog(`[tts] Received audio: ${blob.size} bytes`);
 
@@ -5841,12 +5849,13 @@
               ttsGainNode = ttsAudioCtx.createGain();
               ttsGainNode.gain.value = 1.4;
               // Dynamics compressor — prevents Kokoro chunks from varying in loudness
+              // Gentle settings to avoid volume dip at start of each chunk
               const compressor = ttsAudioCtx.createDynamicsCompressor();
-              compressor.threshold.value = -18;
-              compressor.knee.value = 6;
-              compressor.ratio.value = 4;
-              compressor.attack.value = 0.003;
-              compressor.release.value = 0.2;
+              compressor.threshold.value = -12;
+              compressor.knee.value = 12;
+              compressor.ratio.value = 2;
+              compressor.attack.value = 0.02;
+              compressor.release.value = 0.05;
               ttsAnalyser = ttsAudioCtx.createAnalyser();
               ttsAnalyser.fftSize = 256;
               ttsAnalyser.smoothingTimeConstant = 0.6;
