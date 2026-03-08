@@ -5320,13 +5320,17 @@
     interruptBtn.addEventListener("click", () => {
       const isActive = talkBtn.classList.contains("thinking") || talkBtn.classList.contains("responding") || talkBtn.classList.contains("speaking");
       if (isActive) {
-        // Claude is active — immediate interrupt regardless of armed state
+        // Claude is active — interrupt and flush all queued messages
         if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
         stopTtsPlayback();
         setTalkState("idle");
-        updateInterruptBtn(0);
+        // Don't clear badge yet — server will broadcast voice_queue as items drain
+      } else if (pendingVoiceCount > 0) {
+        // Claude idle but queue has items — flush all queued messages to Claude
+        if (ws?.readyState === WebSocket.OPEN) ws.send("flush_queue");
+        stopTtsPlayback();
       } else {
-        // Claude idle — toggle armed mode
+        // Claude idle, no queue — toggle armed mode
         interruptArmed = !interruptArmed;
         localStorage.setItem("murmur-interrupt-armed", interruptArmed ? "1" : "0");
         applyInterruptArmed();

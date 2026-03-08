@@ -897,17 +897,37 @@ function handleTtsDone() {
   // These may have been created after the TTS queue was built (e.g. late paragraphs
   // from extractStructuredOutput that arrived after the initial queue was populated).
   // Must check BEFORE sending tts_highlight:null to avoid null→real flicker.
-  const unspoken = conversationEntries.filter(
-    e => e.role === "assistant" && e.turn === currentTurn && e.speakable && !e.spoken
-  );
-  if (unspoken.length > 0) {
-    console.log(`[tts] Queue empty but ${unspoken.length} unspoken entries remain — speaking them`);
-    for (const entry of unspoken) {
-      // Don't mark spoken here — handleTtsDone will mark each entry when audio completes
-      currentTtsEntryId = entry.id;
-      speakText(entry.text);
+  //
+  // IMPORTANT: Only run this catch-all when streaming is NOT active.
+  // During streaming, sentence TTS (broadcastCurrentOutput) actively tracks entries
+  // via entryTtsCursor. Re-speaking them here would cause a loop: the entry has
+  // cursor > 0 but cursor < text.length (text is still growing), so handleTtsDone
+  // won't mark it spoken, and this block would re-queue it on every drain.
+  if (streamState !== "RESPONDING" && streamState !== "THINKING" && streamState !== "WAITING") {
+    const unspoken = conversationEntries.filter(
+      e => e.role === "assistant" && e.turn === currentTurn && e.speakable && !e.spoken
+    );
+    if (unspoken.length > 0) {
+      console.log(`[tts] Queue empty but ${unspoken.length} unspoken entries remain — speaking them`);
+      for (const entry of unspoken) {
+        const cursor = entryTtsCursor.get(entry.id) ?? 0;
+        currentTtsEntryId = entry.id;
+        if (cursor > 0) {
+          // Sentence TTS partially spoke this entry — only speak the remaining tail
+          const tail = entry.text.slice(cursor).trim();
+          if (tail.length > 0) {
+            entryTtsCursor.set(entry.id, entry.text.length);
+            speakText(tail);
+          } else {
+            entry.spoken = true; // Fully covered by sentence TTS
+          }
+        } else {
+          // Don't mark spoken here — handleTtsDone will mark each entry when audio completes
+          speakText(entry.text);
+        }
+      }
+      return;
     }
-    return;
   }
 
   // Clear TTS highlight — nothing left to speak
@@ -1272,9 +1292,10 @@ function addUserEntry(text: string, queued = false) {
   const dedupeWindowMs = 30000;
   const cutoff = Date.now() - dedupeWindowMs;
   const recent = conversationEntries.filter(e => e.role === "user" && e.ts >= cutoff);
+  console.log(`[entry] addUserEntry dedup check: normalized="${normalized.slice(0, 60)}" recent=${recent.length} total=${conversationEntries.length}`);
   const dup = recent.find(e => e.text.trim().toLowerCase().replace(/[\s]+/g, " ") === normalized);
   if (dup) {
-    console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}"`);
+    console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}" (matches id=${dup.id})`);
     return dup;
   }
   const entry: ConversationEntry = {
@@ -3407,7 +3428,9 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if ((ws as any)._isTestMode) {
           // Test mode: render user bubble in UI but do NOT forward to terminal
           console.log(`[terminal] Test mode text (not sent to Claude): "${text.slice(0, 60)}"`);
-          addUserEntry(text);
+          const testEntry = addUserEntry(text);
+          // Track test-created entries so test:clear-entries can remove them
+          if (testEntry.id > 0) (ws as any)._testEntryIds?.add(testEntry.id);
         } else if (interactivePromptActive) {
           // Interactive prompt — send keystroke directly
           console.log(`[terminal] Interactive response: "${text}"`);
