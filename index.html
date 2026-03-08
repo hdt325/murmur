@@ -6411,9 +6411,10 @@
 
       rlog(`[tts] Received audio: ${blob.size} bytes`);
 
-      // If currently playing, queue for gapless playback instead of interrupting
+      // With chunk-level ack, only one blob should arrive at a time.
+      // Guard: if still playing previous chunk, queue it (shouldn't normally happen).
       if (ttsPlaying && ttsCurrentSource) {
-        rlog(`[tts] Queuing audio (${blob.size} bytes) for gapless playback (${ttsAudioQueue.length} in queue)`);
+        rlog(`[tts] Queuing audio (${blob.size} bytes) — previous chunk still playing`);
         ttsAudioQueue.push({ blob });
         return;
       }
@@ -6468,23 +6469,18 @@
               ttsEndedAt = Date.now();
               _msUpdate(false);
 
-              // Gapless: if queue has next chunk, play it immediately
-              if (ttsAudioQueue.length > 0) {
-                rlog(`[tts] Gapless: playing next queued chunk (${ttsAudioQueue.length} remaining)`);
-                const next = ttsAudioQueue.shift();
-                // Within same entry's chunks: don't advance bubble or send done
-                const allChunksPlayed = _currentTtsEntry &&
-                  _currentTtsEntry.chunksReceived >= _currentTtsEntry.chunkCount;
-                if (allChunksPlayed) {
-                  // All chunks of current entry received — this queue item is from next entry
-                  advanceBubbleHighlight();
-                  _sendTtsDone();
+              // Chunk-level ack: tell server this chunk finished
+              if (_currentTtsEntry && _currentTtsEntry.chunksReceived < _currentTtsEntry.chunkCount) {
+                // More chunks expected — send chunk_done, server sends next chunk
+                const chunkIdx = _currentTtsEntry.chunksReceived - 1;
+                rlog(`[tts] chunk_done: entry=${_currentTtsEntry.entryId} chunk=${chunkIdx}`);
+                if (ws?.readyState === WebSocket.OPEN) {
+                  ws.send(`chunk_done:${_currentTtsEntry.entryId}:${chunkIdx}`);
                 }
-                _playNextTtsChunk(next.blob);
               } else {
+                // Last chunk (or single-chunk entry) — finalize
                 idleFromTtsCompletion = true;
                 advanceBubbleHighlight();
-                // Mark entry as bubble-spoken when last chunk finishes
                 if (_currentTtsEntry) {
                   const el = document.querySelector(`.entry-bubble[data-entry-id="${_currentTtsEntry.entryId}"]`);
                   if (el) {
@@ -6527,16 +6523,12 @@
           if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
           ttsEndedAt = Date.now();
 
-          // Gapless fallback: play next queued chunk
-          if (ttsAudioQueue.length > 0) {
-            const next = ttsAudioQueue.shift();
-            const allChunksPlayed = _currentTtsEntry &&
-              _currentTtsEntry.chunksReceived >= _currentTtsEntry.chunkCount;
-            if (allChunksPlayed) {
-              advanceBubbleHighlight();
-              _sendTtsDone();
+          // Chunk-level ack: tell server this chunk finished
+          if (_currentTtsEntry && _currentTtsEntry.chunksReceived < _currentTtsEntry.chunkCount) {
+            const chunkIdx = _currentTtsEntry.chunksReceived - 1;
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(`chunk_done:${_currentTtsEntry.entryId}:${chunkIdx}`);
             }
-            _playNextTtsChunk(next.blob);
           } else {
             idleFromTtsCompletion = true;
             advanceBubbleHighlight();

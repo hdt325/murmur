@@ -623,6 +623,7 @@ interface TtsJob {
   state: "fetching" | "ready" | "playing" | "done" | "failed";
   mode: "kokoro" | "local";
   generation: number;      // ttsGeneration when job was created
+  currentChunkIndex: number; // Index of chunk currently being played (chunk-level ack)
 }
 
 // --- New TTS state (v2) ---
@@ -701,9 +702,16 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
     chunk.state = "ready";
     plog("tts_chunk_ready", `job=${job.jobId} chunk=${chunkIndex} ${buf.length}B`);
 
-    // If all chunks ready, mark job ready
-    if (job.chunks.every(c => c.state === "ready")) {
-      job.state = "ready";
+    // If this chunk is the one the playing job is waiting for, send it now
+    if (ttsCurrentlyPlaying === job && job.state === "playing" && job.currentChunkIndex === chunkIndex) {
+      console.log(`[tts2] Chunk ${chunkIndex} ready — sending to waiting client`);
+      if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+      sendChunk(job, chunkIndex);
+    } else if (job.state === "fetching") {
+      // Not playing yet — check if chunk 0 is ready so drainAudioBuffer can start
+      if (chunkIndex === 0 || job.chunks.every(c => c.state === "ready")) {
+        job.state = "ready";
+      }
     }
   } catch (err) {
     if ((err as Error).name === "AbortError") {
@@ -833,6 +841,7 @@ function queueTts(entryId: number | null, text: string): void {
     state: mode === "local" ? "ready" : "fetching",
     mode,
     generation: ttsGeneration,
+    currentChunkIndex: 0,
   };
 
   ttsJobQueue.push(job);
@@ -882,10 +891,11 @@ function queueTts(entryId: number | null, text: string): void {
 
 /**
  * Send the next ready job's audio to the client.
- * Called after each chunk fetch completes and after handleTtsDone.
+ * Uses chunk-level ack protocol: sends ONE chunk at a time, waits for chunk_done.
+ * Called after each chunk fetch completes, after chunk_done, and after handleTtsDone.
  */
 function drainAudioBuffer(): void {
-  // Already playing — wait for client tts_done
+  // Already playing — wait for client chunk_done/tts_done
   if (ttsCurrentlyPlaying) return;
 
   // Evict completed/failed jobs from the front of the queue
@@ -899,8 +909,14 @@ function drainAudioBuffer(): void {
     return;
   }
 
-  // Find first job that's ready to play (all chunks fetched)
   const job = ttsJobQueue[0];
+
+  // For Kokoro jobs, we can start as soon as chunk 0 is ready (don't wait for all chunks)
+  if (job.state === "fetching" && job.mode === "kokoro") {
+    if (job.chunks[0]?.state === "ready") {
+      job.state = "ready"; // Promote — remaining chunks may still be fetching
+    }
+  }
   if (job.state !== "ready") return; // Still fetching — will be called again when chunks complete
 
   // Stale generation check
@@ -912,13 +928,14 @@ function drainAudioBuffer(): void {
 
   // Mark playing
   job.state = "playing";
+  job.currentChunkIndex = 0;
   ttsCurrentlyPlaying = job;
 
   console.log(`[tts2] Playing job=${job.jobId} entry=${job.entryId} mode=${job.mode} chunks=${job.chunks.length}`);
   plog("tts2_play", `job=${job.jobId} entry=${job.entryId} ${job.speakableText.slice(0, 80)}`);
 
   if (job.mode === "local") {
-    // Local TTS: send text to client for Web Speech API
+    // Local TTS: send text to client for Web Speech API (single chunk, no ack needed)
     sendToAudioClient({
       type: "tts_play",
       entryId: job.entryId,
@@ -941,7 +958,7 @@ function drainAudioBuffer(): void {
       }
     }, timeoutMs);
   } else {
-    // Kokoro: send tts_play metadata, then all binary chunks
+    // Kokoro: send tts_play metadata + ONLY chunk 0 binary (chunk-level ack protocol)
     const chunkWordCounts = job.chunks.map(c => c.wordCount);
     sendToAudioClient({
       type: "tts_play",
@@ -952,32 +969,85 @@ function drainAudioBuffer(): void {
       chunkWordCounts,
     });
 
-    // Send binary chunks sequentially
-    let totalBytes = 0;
-    for (const chunk of job.chunks) {
-      if (chunk.audioBuf) {
-        sendToAudioClient(chunk.audioBuf);
-        totalBytes += chunk.audioBuf.length;
-      }
-    }
-
+    sendChunk(job, 0);
     broadcast({ type: "voice_status", state: "speaking" });
-    slog("tts", "sent", { bytes: totalBytes, entry: job.entryId, chunks: job.chunks.length });
-    console.log(`[tts2] Sent ${totalBytes} bytes (${job.chunks.length} chunks) for entry=${job.entryId}`);
+  }
+}
 
-    // Safety timeout — estimate from total audio size (~12KB/s for Kokoro MP3)
-    const estimatedMs = Math.max(5000, (totalBytes / 12000) * 1000 + 2000);
-    ttsPlaybackTimeout2 = setTimeout(() => {
-      if (ttsCurrentlyPlaying === job) {
-        console.warn(`[tts2] Playback timeout (${(estimatedMs / 1000).toFixed(1)}s) — assuming done`);
-        handleTtsDone2(job.entryId);
-      }
-    }, estimatedMs);
+/** Send a single chunk's binary audio to the client with a per-chunk safety timeout. */
+function sendChunk(job: TtsJob, chunkIndex: number): void {
+  const chunk = job.chunks[chunkIndex];
+  if (!chunk || !chunk.audioBuf) {
+    console.warn(`[tts2] sendChunk: no audio for job=${job.jobId} chunk=${chunkIndex}`);
+    return;
+  }
+  const bytes = chunk.audioBuf.length;
+  sendToAudioClient(chunk.audioBuf);
+  chunk.audioBuf = null; // Free after sending
+  slog("tts", "chunk_sent", { bytes, entry: job.entryId, chunk: chunkIndex, of: job.chunks.length });
+  console.log(`[tts2] Sent chunk ${chunkIndex}/${job.chunks.length - 1} (${bytes}B) for entry=${job.entryId}`);
+
+  // Per-chunk safety timeout (~12KB/s for Kokoro audio)
+  if (ttsPlaybackTimeout2) clearTimeout(ttsPlaybackTimeout2);
+  const estimatedMs = Math.max(5000, (bytes / 12000) * 1000 + 3000);
+  ttsPlaybackTimeout2 = setTimeout(() => {
+    if (ttsCurrentlyPlaying === job && job.currentChunkIndex === chunkIndex) {
+      console.warn(`[tts2] Chunk ${chunkIndex} timeout (${(estimatedMs / 1000).toFixed(1)}s) — assuming done`);
+      handleChunkDone(job.entryId, chunkIndex);
+    }
+  }, estimatedMs);
+}
+
+/**
+ * Handle chunk_done from client — send next chunk or wait for tts_done.
+ */
+function handleChunkDone(entryId: number | null, chunkIndex: number): void {
+  if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+
+  const job = ttsCurrentlyPlaying;
+  if (!job || job.entryId !== entryId) {
+    console.warn(`[tts2] chunk_done for unknown entry=${entryId} chunk=${chunkIndex}`);
+    return;
   }
 
-  // Free chunk buffers after sending (no longer needed server-side)
-  for (const chunk of job.chunks) {
-    chunk.audioBuf = null;
+  // Stale generation check
+  if (job.generation !== ttsGeneration) {
+    console.log(`[tts2] chunk_done stale (gen ${job.generation} vs ${ttsGeneration}) — dropping job`);
+    job.state = "failed";
+    ttsCurrentlyPlaying = null;
+    drainAudioBuffer();
+    return;
+  }
+
+  const nextIndex = chunkIndex + 1;
+  if (nextIndex >= job.chunks.length) {
+    // All chunks sent and played — wait for tts_done from client
+    // (tts_done triggers handleTtsDone2 which cleans up)
+    console.log(`[tts2] All ${job.chunks.length} chunks played for entry=${entryId}, awaiting tts_done`);
+    return;
+  }
+
+  // Advance to next chunk
+  job.currentChunkIndex = nextIndex;
+  const nextChunk = job.chunks[nextIndex];
+
+  if (nextChunk.state === "ready" && nextChunk.audioBuf) {
+    // Next chunk already fetched — send immediately
+    sendChunk(job, nextIndex);
+  } else if (nextChunk.state === "failed") {
+    // Chunk fetch failed — skip to tts_done
+    console.warn(`[tts2] Chunk ${nextIndex} failed — ending entry ${entryId} early`);
+    handleTtsDone2(entryId);
+  } else {
+    // Chunk still fetching — it will be sent when fetchKokoroAudio completes
+    console.log(`[tts2] Chunk ${nextIndex} still fetching — waiting for fetch to complete`);
+    // Set a longer timeout while waiting for fetch
+    ttsPlaybackTimeout2 = setTimeout(() => {
+      if (ttsCurrentlyPlaying === job && job.currentChunkIndex === nextIndex) {
+        console.warn(`[tts2] Chunk ${nextIndex} fetch timeout — ending entry ${entryId}`);
+        handleTtsDone2(entryId);
+      }
+    }, 15000);
   }
 }
 
@@ -3250,7 +3320,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     // Only allow safe messages: test commands, logging, TTS feedback, audio control, settings.
     if ((ws as any)._isTestMode) {
       const safeTestPrefixes = [
-        "test:", "log:", "tts_done", "claim:audio", "speed:", "voice:",
+        "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
         "mute:", "replay:", "text:",  // text: is handled separately with its own testmode check
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
@@ -3388,6 +3458,18 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       } else {
         console.log(`[voice] flush_queue: nothing to flush (queue=${pendingVoiceInput.length}, stream=${streamState})`);
         broadcast({ type: "voice_queue", count: 0 });
+      }
+      return;
+    }
+
+    // Chunk-level ack: client finished playing one chunk, send next
+    // Format: "chunk_done:ENTRY_ID:CHUNK_INDEX"
+    if (msg.startsWith("chunk_done:")) {
+      const parts = msg.slice(11).split(":");
+      const chunkEntryId = parseInt(parts[0], 10);
+      const chunkIndex = parseInt(parts[1], 10);
+      if (!isNaN(chunkEntryId) && !isNaN(chunkIndex)) {
+        handleChunkDone(chunkEntryId, chunkIndex);
       }
       return;
     }
