@@ -1850,6 +1850,30 @@ async function testTask12_vadEnvironmentPresets() {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Task #19 — Center Murmur logo in toolbar
+// ──────────────────────────────────────────────────────────────
+async function testTask19_centeredLogo() {
+  console.log("\n[Task19] Center Murmur logo in toolbar");
+
+  const result = await page.evaluate(() => {
+    const brand = document.querySelector(".toolbar-brand") as HTMLElement;
+    if (!brand) return { exists: false };
+    const style = getComputedStyle(brand);
+    const isAbsolute = style.position === "absolute";
+    const hasLeft50 = style.left.includes("50") || style.left === "50%";
+    const hasTransform = style.transform.includes("matrix") || brand.style.transform.includes("translateX");
+    // Check via computed style that it uses absolute + translateX centering
+    const allSrc = document.documentElement.innerHTML;
+    const cssSection = allSrc.slice(allSrc.indexOf(".toolbar-brand"), allSrc.indexOf(".toolbar-brand") + 400);
+    const hasCenterCSS = cssSection.includes("left: 50%") && cssSection.includes("translateX(-50%)");
+    return { exists: true, isAbsolute, hasLeft50, hasTransform, hasCenterCSS };
+  });
+
+  report("Toolbar brand element exists", result.exists);
+  report("Brand uses absolute positioning for centering", result.exists && result.hasCenterCSS);
+}
+
+// ──────────────────────────────────────────────────────────────
 // Task #11 — tmux session/window name mismatch after selection
 // ──────────────────────────────────────────────────────────────
 async function testTask11_tmuxNameMismatch() {
@@ -2074,6 +2098,7 @@ async function main() {
   await testBug80v3_proseModTargetGuard();
   await testTask13_thinkModeSilenceTolerance();
   await testTask12_vadEnvironmentPresets();
+  await testTask19_centeredLogo();
   await testTask11_tmuxNameMismatch();
   await testTask15_flowMuteButton();
   await testTask14_streamingSTT();

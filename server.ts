@@ -1284,6 +1284,7 @@ function addUserEntry(text: string, queued = false, _source = "unknown") {
   console.log(`[DEDUP-TRACE] addUserEntry called from="${_source}" text="${text.slice(0, 80)}" queued=${queued} ts=${Date.now()} turn=${currentTurn} streamState=${streamState}`);
   // Suppress voice panel instruction messages from appearing in the conversation view
   if (MURMUR_CONTEXT_FILTER.test(text.trim())) {
+    if (/prose mode/i.test(text)) console.log(`[PROSE-LEAK-TRACE] addUserEntry FILTERED from="${_source}": "${text.slice(0, 80)}"`);
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
   // Suppress Claude Code team/agent messages
@@ -1361,7 +1362,10 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (/context left until/i.test(trimmed)) continue;
     if (/auto-compact/i.test(trimmed)) continue;
     // Filter leaked system context lines (wrapped tmux continuation lines)
-    if (MURMUR_CONTEXT_FILTER.test(trimmed)) continue;
+    if (MURMUR_CONTEXT_FILTER.test(trimmed)) {
+      if (/prose mode/i.test(trimmed)) console.log(`[PROSE-LEAK-TRACE] extractStructuredOutput FILTERED: "${trimmed.slice(0, 80)}"`);
+      continue;
+    }
     // Filter Claude Code team/agent messages — stateful block filter
     // Skips ALL lines between opening and closing tags, not just the tags themselves
     if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock = true; continue; }
@@ -1735,6 +1739,10 @@ function broadcastCurrentOutput() {
           turn: currentTurn,
         };
         conversationEntries.push(entry);
+        // Diagnostic: trace any entry containing prose mode text
+        if (/prose mode/i.test(para.text)) {
+          console.log(`[PROSE-LEAK-TRACE] Assistant entry created with prose mode text: "${para.text.slice(0, 120)}" turn=${currentTurn} id=${entry.id}`);
+        }
       }
     }
   }
