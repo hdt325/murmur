@@ -242,12 +242,20 @@ interface TtsHistoryEntry {
   ts: number;
   entryId: number | null;
   textSnippet: string;
+  speakableText: string;
   generation: number;
   source: string; // "queueTts" | "sentence" | "final" | "replay"
+  chunkCount: number;
+  chunkWordCounts: number[];
 }
 const _ttsHistory: TtsHistoryEntry[] = [];
-function ttslog(entryId: number | null, text: string, generation: number, source: string) {
-  _ttsHistory.push({ ts: Date.now(), entryId, textSnippet: text.slice(0, 120), generation, source });
+function ttslog(entryId: number | null, text: string, generation: number, source: string,
+  speakableText = "", chunkCount = 0, chunkWordCounts: number[] = []) {
+  _ttsHistory.push({
+    ts: Date.now(), entryId, textSnippet: text.slice(0, 120),
+    speakableText: speakableText.slice(0, 120), generation, source,
+    chunkCount, chunkWordCounts,
+  });
   if (_ttsHistory.length > 50) _ttsHistory.shift();
 }
 
@@ -262,6 +270,23 @@ const _entryLog: EntryLogEntry[] = [];
 function elog(id: number, role: string, sourceTag: string, text: string) {
   _entryLog.push({ ts: Date.now(), id, role, sourceTag, textSnippet: text.slice(0, 120) });
   if (_entryLog.length > 50) _entryLog.shift();
+}
+
+interface HighlightLogEntry {
+  ts: number;
+  entryId: number;
+  chunkIndex: number;
+  event: string; // "word_highlight_start" | "word_highlighted" | "word_highlight_end"
+  wordIndex: number;
+  totalWords: number;
+  flowWordPos: number;
+  spanCount: number;
+}
+const _highlightLog: HighlightLogEntry[] = []; // ring buffer, last 100
+function hlog(entryId: number, chunkIndex: number, event: string, wordIndex: number,
+  totalWords: number, flowWordPos: number, spanCount: number) {
+  _highlightLog.push({ ts: Date.now(), entryId, chunkIndex, event, wordIndex, totalWords, flowWordPos, spanCount });
+  if (_highlightLog.length > 100) _highlightLog.shift();
 }
 
 // VoiceMode log paths
@@ -951,10 +976,20 @@ function queueTts(entryId: number | null, text: string): void {
 
   // Split into chunks
   const chunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS);
+  // Compute word counts per chunk, ensuring sum matches total speakableText word count.
+  // This is critical for client-side karaoke — DOM spans are created from the full
+  // speakableText, so the sum of chunkWordCounts must equal the total span count.
+  const totalWords = speakableText.trim().split(/\s+/).filter(Boolean).length;
+  const rawCounts = chunkTexts.map(t => t.trim().split(/\s+/).filter(Boolean).length);
+  const rawSum = rawCounts.reduce((a, b) => a + b, 0);
+  // If raw counts don't sum to total (due to trimStart in splitIntoChunks), adjust last chunk
+  if (rawSum !== totalWords && rawCounts.length > 0) {
+    rawCounts[rawCounts.length - 1] += totalWords - rawSum;
+  }
   const chunks: TtsChunk[] = chunkTexts.map((t, i) => ({
     chunkIndex: i,
     text: t,
-    wordCount: t.trim().split(/\s+/).length,
+    wordCount: rawCounts[i],
     state: mode === "local" ? "ready" as const : "pending" as const,
     audioBuf: null,
     abortController: null,
@@ -982,7 +1017,7 @@ function queueTts(entryId: number | null, text: string): void {
       if (il && !il.ttsEntryIds.includes(entryId)) il.ttsEntryIds.push(entryId);
     }
   }
-  ttslog(entryId, text, ttsGeneration, "queueTts");
+  ttslog(entryId, text, ttsGeneration, "queueTts", speakableText, chunks.length, rawCounts);
   plog("tts2_queued", `job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} (${speakableText.length} chars)`);
   console.log(`[tts2] Queued job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} queue=${ttsJobQueue.length}`);
 
@@ -3725,6 +3760,16 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     }
 
     // Client-side log relay
+    if (msg.startsWith("log:highlight:")) {
+      // Client karaoke events: log:highlight:ENTRY_ID:CHUNK_INDEX:WORD_INDEX:TOTAL_WORDS:FLOW_POS:SPAN_COUNT:EVENT
+      const parts = msg.slice(14).split(":");
+      if (parts.length >= 7) {
+        hlog(parseInt(parts[0], 10), parseInt(parts[1], 10), parts[6],
+          parseInt(parts[2], 10), parseInt(parts[3], 10),
+          parseInt(parts[4], 10), parseInt(parts[5], 10));
+      }
+      return;
+    }
     if (msg.startsWith("log:")) {
       console.log(`[client] ${msg.slice(4)}`);
       return;
@@ -4292,7 +4337,7 @@ app.get("/debug/tts-history", (_req, res) => {
 });
 
 app.get("/debug/highlight-log", (_req, res) => {
-  res.json([]); // Removed — highlight is now client-driven
+  res.json(_highlightLog);
 });
 
 app.get("/debug/generation-log", (_req, res) => {

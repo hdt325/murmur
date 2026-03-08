@@ -5100,17 +5100,34 @@
       const textEl = entryEl.querySelector(".entry-text");
       if (!textEl) return;
 
-      const prevPos = _flowWordPos[entryId] || 0;
+      // Always ensure word spans exist and match speakableText
+      // Use speakableText as the canonical source — it matches the audio 1:1
+      const existingSpans = textEl.querySelectorAll(".tts-word, .tts-word-spoken");
+      const expectedWords = speakableText ? speakableText.trim().split(/\s+/).filter(Boolean) : [];
+      const expectedCount = expectedWords.length;
 
-      // If tts_play already set word spans, don't re-wrap — just ensure spans exist
-      if (!textEl.querySelector(".tts-word, .tts-word-spoken")) {
-        const rawText = textEl.textContent || "";
-        textEl.innerHTML = rawText
-          .split(/(\s+)/)
-          .map(tok => /\S/.test(tok) ? '<span class="tts-word">' + escHtml(tok) + '</span>' : tok)
-          .join("");
+      // Re-wrap if: no spans, or span count doesn't match expected word count
+      if (existingSpans.length === 0 || existingSpans.length !== expectedCount) {
+        // Preserve already-spoken count before re-wrapping
+        const spokenCount = textEl.querySelectorAll(".tts-word-spoken").length;
+        textEl.innerHTML = expectedWords
+          .map((w, i) => {
+            const cls = i < spokenCount ? "tts-word-spoken" : "tts-word";
+            return '<span class="' + cls + '">' + escHtml(w) + '</span>';
+          })
+          .join(" ");
       }
+
       const allWords = Array.from(textEl.querySelectorAll(".tts-word, .tts-word-spoken"));
+
+      // Derive prevPos from DOM state: count already-spoken spans
+      // This is more robust than trusting _flowWordPos which can drift
+      let prevPos = _flowWordPos[entryId] || 0;
+      const domSpokenCount = allWords.filter(s => s.classList.contains("tts-word-spoken")).length;
+      // If DOM state disagrees with cursor, trust the DOM
+      if (domSpokenCount > 0 && Math.abs(domSpokenCount - prevPos) > 1) {
+        prevPos = domSpokenCount;
+      }
 
       // Instantly restore already-spoken words from previous chunks
       for (let i = 0; i < prevPos && i < allWords.length; i++) {
@@ -5125,16 +5142,26 @@
           && chunkIndex < _currentTtsEntry.chunkWordCounts.length) {
         chunkWordCount = _currentTtsEntry.chunkWordCounts[chunkIndex];
       } else {
-        chunkWordCount = speakableText
-          ? speakableText.trim().split(/\s+/).filter(Boolean).length
-          : 0;
+        chunkWordCount = expectedCount;
       }
-      const endPos = prevPos + chunkWordCount;
+
+      // Clamp: don't go past actual span count
+      const endPos = Math.min(prevPos + chunkWordCount, allWords.length);
       _flowWordPos[entryId] = endPos; // advance position for next chunk
 
-      const chunkSpans = allWords.slice(prevPos, Math.min(endPos, allWords.length))
+      const chunkSpans = allWords.slice(prevPos, endPos)
         .filter(s => s.classList.contains("tts-word")); // only animate unspoken words
       if (!chunkSpans.length) return;
+
+      const totalSpans = allWords.length;
+      const ci = chunkIndex || 0;
+      // Send highlight log: entryId:chunkIndex:wordIndex:totalWords:flowWordPos:spanCount:event
+      const hlLog = (event, wIdx) => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(`log:highlight:${entryId}:${ci}:${wIdx}:${chunkSpans.length}:${_flowWordPos[entryId] || 0}:${totalSpans}:${event}`);
+        }
+      };
+      hlLog("word_highlight_start", prevPos);
 
       const msPerWord = durationMs / chunkSpans.length;
       let idx = 0;
@@ -5143,6 +5170,10 @@
         if (idx < chunkSpans.length) {
           const span = chunkSpans[idx];
           span.classList.replace("tts-word", "tts-word-spoken");
+          // Log every 5th word to avoid flooding
+          if (idx % 5 === 0 || idx === chunkSpans.length - 1) {
+            hlLog("word_highlighted", prevPos + idx);
+          }
           // Debounce scroll: only scroll every 5 words to avoid jitter from overlapping animations
           if (idx - lastScrollIdx >= 5 || idx === chunkSpans.length - 1) {
             span.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -5151,6 +5182,7 @@
           idx++;
           _flowWordTimer = setTimeout(advance, msPerWord);
         } else {
+          hlLog("word_highlight_end", prevPos + idx - 1);
           _flowWordTimer = null;
         }
       };
