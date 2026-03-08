@@ -1639,6 +1639,141 @@ async function testTask10_ttsNoReplayLoop() {
   );
 }
 
+async function testBug80_noExitOnTestDisconnect() {
+  console.log("\n[BUG-80] MURMUR_EXIT not sent when testmode client disconnects");
+
+  // Connect a testmode WebSocket, disconnect it, then verify no MURMUR_EXIT was sent
+  // by checking server state via API — contextSent should remain true (not reset by exit path)
+  const result = await page.evaluate(async () => {
+    // Get server state before test
+    const before = await (await fetch("http://localhost:3457/api/state")).json();
+
+    // Open a testmode WebSocket and immediately close it
+    return new Promise<{ contextSentBefore: boolean; contextSentAfter: boolean }>((resolve) => {
+      const ws = new WebSocket("ws://localhost:3457?testmode=1");
+      ws.onopen = () => {
+        // Close immediately — this simulates Playwright page close
+        ws.close();
+        // Wait for the 5s debounce to pass, then check state
+        setTimeout(async () => {
+          try {
+            const after = await (await fetch("http://localhost:3457/api/state")).json();
+            resolve({
+              contextSentBefore: before.contextSent ?? true,
+              contextSentAfter: after.contextSent ?? true,
+            });
+          } catch {
+            resolve({ contextSentBefore: true, contextSentAfter: false });
+          }
+        }, 6000);
+      };
+      ws.onerror = () => resolve({ contextSentBefore: true, contextSentAfter: true });
+    });
+  });
+
+  // If MURMUR_EXIT was sent, contextSent would be reset to false
+  // With the fix, testmode disconnect should NOT trigger exit, so contextSent stays true
+  report(
+    "Testmode client disconnect does not trigger MURMUR_EXIT",
+    result.contextSentAfter === true || result.contextSentAfter === result.contextSentBefore,
+    `contextSent before=${result.contextSentBefore} after=${result.contextSentAfter}`
+  );
+}
+
+async function testTask13_thinkModeSilenceTolerance() {
+  console.log("\n[TASK-13] Think mode uses silence tolerance, not hard timer");
+
+  // Verify via DOM inspection that the think mode implementation uses
+  // silence-based detection (checking RMS energy) rather than a hard countdown.
+  // The startThinkCountdown function should contain silence detection logic.
+
+  const result = await page.evaluate(() => {
+    // Check that the startThinkCountdown function source contains silence detection
+    // by inspecting the function body via toString()
+    const scripts = document.querySelectorAll("script");
+    let found = false;
+    let hasSilenceDetection = false;
+    let hasNoHardTimeout = true;
+    let hasRmsCheck = false;
+    let labelUpdated = false;
+
+    for (const script of scripts) {
+      const src = script.textContent || "";
+      if (src.includes("startThinkCountdown")) {
+        found = true;
+
+        // Extract the startThinkCountdown function body
+        const fnMatch = src.match(/function startThinkCountdown\(\)\s*\{[\s\S]*?(?=\n    function )/);
+        if (fnMatch) {
+          const fnBody = fnMatch[0];
+          // Should contain RMS energy checking (silence detection)
+          hasRmsCheck = fnBody.includes("micAnalyser") && fnBody.includes("rms");
+          // Should contain silence threshold comparison
+          hasSilenceDetection = fnBody.includes("silenceThreshold") || fnBody.includes("thinkSilenceStart");
+          // Should NOT have a hard setTimeout with thinkTimeout * 1000 as total duration
+          // (the old pattern was: setTimeout(() => stopRecording(), thinkTimeout * 1000 + 500))
+          hasNoHardTimeout = !fnBody.includes("thinkTimeout * 1000 + 500");
+          // Label should show remaining silence time, not total time
+          labelUpdated = fnBody.includes("remaining") || fnBody.includes("silentMs");
+        }
+        break;
+      }
+    }
+
+    return { found, hasSilenceDetection, hasRmsCheck, hasNoHardTimeout, labelUpdated };
+  });
+
+  report(
+    "startThinkCountdown function exists",
+    result.found,
+    ""
+  );
+
+  report(
+    "Think mode uses RMS energy checking for silence detection",
+    result.hasRmsCheck,
+    result.hasRmsCheck ? "" : "Should check micAnalyser RMS, not use hard timer"
+  );
+
+  report(
+    "Think mode detects silence via threshold comparison",
+    result.hasSilenceDetection,
+    result.hasSilenceDetection ? "" : "Should track silence start time and compare against threshold"
+  );
+
+  report(
+    "No hard timeout cap on total recording duration",
+    result.hasNoHardTimeout,
+    result.hasNoHardTimeout ? "" : "Found hard timeout pattern — timer should be silence-based only"
+  );
+
+  // Check the settings UI label says "Silence timeout" not "Max duration"
+  const settingsLabel = await page.evaluate(() => {
+    const row = document.getElementById("thinkTimeoutRow");
+    if (!row) return null;
+    const label = row.querySelector(".settings-label");
+    return label?.textContent || null;
+  });
+
+  report(
+    "Settings UI shows 'Silence timeout' label (not 'Max duration')",
+    settingsLabel === "Silence timeout",
+    `label="${settingsLabel}"`
+  );
+
+  // Check the description text
+  const desc = await page.evaluate(() => {
+    const el = document.getElementById("thinkModeDesc");
+    return el?.textContent || null;
+  });
+
+  report(
+    "Think mode description mentions silence-based behavior",
+    desc != null && desc.includes("silence"),
+    `desc="${desc}"`
+  );
+}
+
 // ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
@@ -1710,6 +1845,8 @@ async function main() {
   await testBugB_doubleTtsDrain();
   await testBugC_noBubbleDroppedDuringTts();
   await testTask10_ttsNoReplayLoop();
+  await testBug80_noExitOnTestDisconnect();
+  await testTask13_thinkModeSilenceTolerance();
 
   await teardown();
 }

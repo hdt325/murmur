@@ -3748,12 +3748,17 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     }
 
     // Last client disconnected — debounce exit message (5s) to avoid spam from rapid reconnects
-    if (clients.size === 0 && terminal.isSessionAlive() && !(ws as any)._isTestClient) {
+    // Guard: skip if the disconnecting client was a testmode connection (Playwright pages set
+    // _isTestMode via ?testmode=1 but not _isTestClient which requires explicit test:client msg)
+    if (clients.size === 0 && terminal.isSessionAlive() && !(ws as any)._isTestMode && !(ws as any)._isTestClient) {
       if (exitTimer) clearTimeout(exitTimer);
       exitTimer = setTimeout(() => {
         exitTimer = null;
-        // Only send if still no clients and not sent recently (30s debounce)
-        if (clients.size === 0 && Date.now() - exitSentAt > 30000) {
+        // Recheck: only send if still no real (non-test) clients and not sent recently
+        const realClients = Array.from(clients).filter(
+          c => c.readyState === WebSocket.OPEN && !(c as any)._isTestMode && !(c as any)._isTestClient
+        );
+        if (realClients.length === 0 && Date.now() - exitSentAt > 30000) {
           terminal.sendText(MURMUR_EXIT);
           contextSent = false; // Allow context resend if server restarts fresh
           exitSentAt = Date.now();
@@ -3836,6 +3841,7 @@ app.get("/api/state", (_req, res) => {
     lastEntries,
     pendingVoiceCount: pendingVoiceInput.length,
     lastPassiveSnapshotLength: lastPassiveSnapshot ? lastPassiveSnapshot.length : 0,
+    contextSent,
   });
 });
 
