@@ -1262,12 +1262,16 @@ function addUserEntry(text: string, queued = false) {
   if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification/.test(text.trim())) {
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
-  // Dedup: skip if an identical user entry already exists in the current or recent turn
+  // Dedup: skip if an identical user entry already exists recently
   // (prevents passive watcher re-adding text that was already added by text:/voice handler)
   // Normalize whitespace: collapse \n, \r, and multiple spaces to single space
   // (tmux preserves newlines, STT returns spaces — same speech, different whitespace)
+  // Use time-based window (30s) instead of turn-based — turn counter can jump during
+  // concurrent activity, causing the dedup to miss duplicates across turn boundaries.
   const normalized = text.trim().toLowerCase().replace(/[\s]+/g, " ");
-  const recent = conversationEntries.filter(e => e.role === "user" && e.turn >= currentTurn - 1);
+  const dedupeWindowMs = 30000;
+  const cutoff = Date.now() - dedupeWindowMs;
+  const recent = conversationEntries.filter(e => e.role === "user" && e.ts >= cutoff);
   const dup = recent.find(e => e.text.trim().toLowerCase().replace(/[\s]+/g, " ") === normalized);
   if (dup) {
     console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}"`);
@@ -3058,6 +3062,20 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
 
     const msg = raw.toString();
 
+    // Testmode guard: block ALL messages that touch the terminal or interrupt Claude.
+    // Only allow safe messages: test commands, logging, TTS feedback, audio control, settings.
+    if ((ws as any)._isTestMode) {
+      const safeTestPrefixes = [
+        "test:", "log:", "tts_done", "claim:audio", "speed:", "voice:",
+        "mute:", "replay:", "text:",  // text: is handled separately with its own testmode check
+      ];
+      const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
+      if (!isSafe) {
+        console.log(`[ws] Testmode blocked: "${msg.slice(0, 40)}"`);
+        return;
+      }
+    }
+
     // Pre-buffer marker — next binary is WAV pre-buffer, followed by main WebM audio
     if (msg === "voice:prebuffer") {
       (ws as any)._expectPreBuffer = true;
@@ -3161,6 +3179,20 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       broadcast({ type: "status", ...vmState });
       broadcast({ type: "voice_status", state: "idle" });
       broadcast({ type: "signal", name: "voice-stop" });
+      return;
+    }
+
+    // Flush queue — send all queued voice messages to Claude sequentially
+    // Used when Claude is idle but queue has items (user pressed interrupt to flush)
+    if (msg === "flush_queue") {
+      if (pendingVoiceInput.length > 0 && streamState === "IDLE") {
+        console.log(`[voice] Flushing ${pendingVoiceInput.length} queued messages`);
+        stopTts();
+        stopTmuxStreaming(); // Drains first item, cascade handles rest
+      } else {
+        console.log(`[voice] flush_queue: nothing to flush (queue=${pendingVoiceInput.length}, stream=${streamState})`);
+        broadcast({ type: "voice_queue", count: 0 });
+      }
       return;
     }
 
