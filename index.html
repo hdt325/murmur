@@ -198,6 +198,10 @@
       align-items: center;
       gap: 3px;
       pointer-events: none;
+      /* Center absolutely on screen, independent of button count on either side */
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
     }
 
     .toolbar-brand-icon {
@@ -894,8 +898,50 @@
       background: #fff5f5 !important;
     }
 
-    /* Gear: hidden outside flow mode (must beat .talk-bar button specificity) */
-    .talk-bar .flow-gear-btn {
+    /* Flow mute button — mirrors gear button on right side */
+    body.flow-mode .flow-mute-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: absolute;
+      right: 20px;
+      width: 44px;
+      height: 44px;
+      min-height: 44px;
+      border-radius: 22px;
+      border: 1.5px solid rgba(26, 26, 30, 0.12);
+      background: rgba(255, 255, 255, 0.75);
+      color: rgba(26, 26, 30, 0.45);
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      transition: background 0.2s, color 0.2s;
+    }
+
+    body.flow-mode .flow-mute-btn:hover {
+      background: rgba(255, 255, 255, 1);
+      color: rgba(26, 26, 30, 0.8);
+      border-color: rgba(26, 26, 30, 0.22);
+    }
+
+    body.flow-mode .flow-mute-btn.active {
+      background: rgba(231, 76, 60, 0.12);
+      color: rgba(231, 76, 60, 0.8);
+      border-color: rgba(231, 76, 60, 0.3);
+    }
+
+    .flow-mute-btn .flow-mute-slash {
+      display: none;
+      position: absolute;
+    }
+
+    .flow-mute-btn.active .flow-mute-slash {
+      display: block;
+    }
+
+    /* Gear + mute: hidden outside flow mode (must beat .talk-bar button specificity) */
+    .talk-bar .flow-gear-btn,
+    .talk-bar .flow-mute-btn {
       display: none;
     }
 
@@ -2014,6 +2060,12 @@
       gap: 4px;
     }
 
+    .settings-divider {
+      height: 1px;
+      background: #333338;
+      margin: 8px 0;
+    }
+
     .sopt {
       font-size: 11px;
       padding: 2px 8px;
@@ -2695,7 +2747,6 @@
   <div class="transcript" id="transcript">
     <div class="conv-toolbar" id="convToolbar">
       <button id="flowModeBtn" data-tip="Flow Mode — focused voice-only experience">Flow</button>
-      <span class="conv-toolbar-spacer"></span>
       <span class="toolbar-brand"><img src="/icon-256.png" class="toolbar-brand-icon" alt="">MURMUR</span>
       <span class="conv-toolbar-spacer"></span>
       <button id="chatZoomOut" data-tip="Decrease font size">−</button>
@@ -2751,6 +2802,19 @@
           d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
       </svg>
     </button>
+    <button id="flowMuteBtn" class="flow-mute-btn" aria-label="Mute microphone">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" y1="19" x2="12" y2="23" />
+        <line x1="8" y1="23" x2="16" y2="23" />
+      </svg>
+      <svg class="flow-mute-slash" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5"
+        stroke-linecap="round">
+        <line x1="3" y1="3" x2="21" y2="21" />
+      </svg>
+    </button>
     <div id="flowLiveTranscript" class="flow-live-transcript"></div>
     <button id="talkBtn" data-tip="Auto-listens when it detects your voice">
       <canvas id="talkWaveCanvas"></canvas>
@@ -2800,6 +2864,12 @@
         </div>
         <span class="fss-check" id="fssCheckPushToTalk"></span>
       </div>
+    </div>
+    <div class="fss-section-label">Mic Sensitivity</div>
+    <div class="fss-pills" id="fssSensitivityPills">
+      <button class="fss-pill" data-fss-vad="quiet">Quiet</button>
+      <button class="fss-pill" data-fss-vad="normal">Normal</button>
+      <button class="fss-pill" data-fss-vad="noisy">Noisy</button>
     </div>
     <div class="fss-section-label">Session</div>
     <div class="fss-rows" id="fssSessionRows">
@@ -2860,14 +2930,23 @@
       <span class="settings-label">Think mode</span>
       <button class="settings-toggle" id="thinkModeToggle">Off</button>
     </div>
-    <div class="settings-sublabel" id="thinkModeDesc">Disable auto-stop; tap Talk to submit or wait for timeout</div>
+    <div class="settings-sublabel" id="thinkModeDesc">Keep recording through long pauses; auto-stop after silence timeout</div>
     <div class="settings-row settings-timeout-row" id="thinkTimeoutRow">
-      <span class="settings-label">Max duration</span>
+      <span class="settings-label">Silence timeout</span>
       <div class="settings-opts">
         <button class="sopt" data-secs="15">15s</button>
         <button class="sopt" data-secs="30">30s</button>
         <button class="sopt" data-secs="60">1m</button>
         <button class="sopt" data-secs="120">2m</button>
+      </div>
+    </div>
+    <div class="settings-divider"></div>
+    <div class="settings-row settings-timeout-row" id="vadPresetRow">
+      <span class="settings-label">Mic sensitivity</span>
+      <div class="settings-opts">
+        <button class="sopt" data-vad="quiet">Quiet</button>
+        <button class="sopt" data-vad="normal">Normal</button>
+        <button class="sopt" data-vad="noisy">Noisy</button>
       </div>
     </div>
   </div>
@@ -3294,6 +3373,9 @@
         p.classList.toggle("selected", parseFloat(p.dataset.fssSpeed) === curSpeed));
       // Sync activation
       _syncFssActivation();
+      // Sync sensitivity pills
+      document.querySelectorAll("#fssSensitivityPills .fss-pill").forEach(p =>
+        p.classList.toggle("selected", p.dataset.fssVad === _vadPresetKey));
       flowSettingsOverlay.classList.add("open");
       flowSettingsSheet.classList.add("open");
     }
@@ -3313,6 +3395,19 @@
 
     flowGearBtn?.addEventListener("click", openFlowSettings);
     flowSettingsOverlay?.addEventListener("click", closeFlowSettings);
+
+    // Flow mute button — mirrors normal-mode muteBtn behavior
+    const flowMuteBtn = document.getElementById("flowMuteBtn");
+    flowMuteBtn?.addEventListener("click", () => {
+      muted = !muted;
+      flowMuteBtn.classList.toggle("active", muted);
+      muteBtn.classList.toggle("active", muted);
+      document.getElementById("micMeter").classList.toggle("muted", muted);
+      talkBtn.style.opacity = muted ? "0.4" : "1";
+      talkBtn.style.pointerEvents = muted ? "none" : "auto";
+      if (ws?.readyState === WebSocket.OPEN) ws.send("mute:" + (muted ? "1" : "0"));
+      if (muted && _modeReady && isRecording) stopRecording();
+    });
 
     // Drag-down-to-dismiss on the settings sheet (iOS bottom-sheet pattern)
     let _sheetDragStartY = null;
@@ -3410,6 +3505,18 @@
       _pushToTalkMode = true;
       localStorage.setItem("murmur-ptt-mode", "1");
       _syncFssActivation();
+    });
+
+    // Sensitivity pill selection
+    document.getElementById("fssSensitivityPills")?.addEventListener("click", e => {
+      const pill = e.target.closest(".fss-pill[data-fss-vad]");
+      if (!pill || !VAD_PRESETS[pill.dataset.fssVad]) return;
+      _vadPresetKey = pill.dataset.fssVad;
+      localStorage.setItem("murmur-vad-preset", _vadPresetKey);
+      ambientRmsBaseline = 0.006;
+      _noisySince = 0;
+      document.querySelectorAll("#fssSensitivityPills .fss-pill").forEach(p =>
+        p.classList.toggle("selected", p.dataset.fssVad === _vadPresetKey));
     });
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -3576,6 +3683,7 @@
       muteBtn.classList.toggle("active", muted);
       muteBtn.style.opacity = m.micOn ? "1" : "0.3";
       muteBtn.style.pointerEvents = m.micOn ? "auto" : "none";
+      document.getElementById("flowMuteBtn")?.classList.toggle("active", muted);
       // Disable stop button when TTS is off (Text mode)
       stopBtn.style.opacity = m.ttsOn ? "1" : "0.3";
       stopBtn.style.pointerEvents = m.ttsOn ? "auto" : "none";
@@ -4337,6 +4445,11 @@
           updateInterruptBtn(msg.count || 0);
         }
 
+        if (msg.type === "partial_transcription" && msg.text) {
+          // Update prelim bubble and live transcript with Whisper partial result
+          _ltRenderText(msg.text);
+        }
+
         // Legacy: spoken_text for backward compat (will be removed in cleanup phase)
         if (msg.type === "spoken_text" && voicedOnly) {
           removeThinkingBubble();
@@ -5060,7 +5173,7 @@
             baseline = baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
             return;
           }
-          const threshold = Math.max(baseline * 3.5, 10);
+          const threshold = Math.max(baseline * _vadPreset().speechMultiplier, 10);
           if (rms > threshold) {
             if (++speechFrames >= 3) { // ~300ms of sustained speech
               stopBargeIn();
@@ -5341,6 +5454,7 @@
     muteBtn.addEventListener("click", () => {
       muted = !muted;
       muteBtn.classList.toggle("active", muted);
+      document.getElementById("flowMuteBtn")?.classList.toggle("active", muted);
       document.getElementById("micMeter").classList.toggle("muted", muted);
       talkBtn.style.opacity = muted ? "0.4" : "1";
       talkBtn.style.pointerEvents = muted ? "none" : "auto";
@@ -5413,8 +5527,11 @@
       settingsBtn.classList.toggle("active", thinkMode);
       thinkTimeoutRow.style.opacity = thinkMode ? "1" : "0.4";
       thinkTimeoutRow.style.pointerEvents = thinkMode ? "auto" : "none";
-      settingsPopover.querySelectorAll(".sopt").forEach(btn => {
+      settingsPopover.querySelectorAll(".sopt[data-secs]").forEach(btn => {
         btn.classList.toggle("selected", parseInt(btn.dataset.secs) === thinkTimeout);
+      });
+      settingsPopover.querySelectorAll(".sopt[data-vad]").forEach(btn => {
+        btn.classList.toggle("selected", btn.dataset.vad === _vadPresetKey);
       });
       // Update talk button immediately if currently in idle state
       if (talkBtn.classList.contains("idle-state")) {
@@ -5456,8 +5573,16 @@
     if (settingsPopover) settingsPopover.addEventListener("click", (e) => {
       const opt = e.target.closest(".sopt");
       if (!opt) return;
-      thinkTimeout = parseInt(opt.dataset.secs);
-      localStorage.setItem("murmur-think-timeout", String(thinkTimeout));
+      if (opt.dataset.secs) {
+        thinkTimeout = parseInt(opt.dataset.secs);
+        localStorage.setItem("murmur-think-timeout", String(thinkTimeout));
+      } else if (opt.dataset.vad && VAD_PRESETS[opt.dataset.vad]) {
+        _vadPresetKey = opt.dataset.vad;
+        localStorage.setItem("murmur-vad-preset", _vadPresetKey);
+        // Reset baseline when switching presets so it adapts to new thresholds
+        ambientRmsBaseline = 0.006;
+        _noisySince = 0;
+      }
       applyThinkModeUI();
     });
 
@@ -5534,8 +5659,48 @@
     _modeReady = true;
     let silenceTimer = null;
     let silenceStart = 0;
-    const SILENCE_THRESHOLD_MIN = 0.010;  // Hard floor — dynamic threshold applied at runtime
-    const SILENCE_DURATION = 800;  // ms of silence before auto-stop (was 1500)
+    // ── VAD environment presets ──
+    const VAD_PRESETS = {
+      quiet: {
+        label: "Quiet",
+        speechThresholdMin: 0.008,
+        speechMultiplier: 2.5,
+        silenceThresholdMin: 0.006,
+        silenceMultiplier: 1.5,
+        silenceDuration: 1000,
+        speechConfirmMs: 400,
+        energyThresholdMin: 0.010,
+        sustainedNoiseMs: 8000,
+      },
+      normal: {
+        label: "Normal",
+        speechThresholdMin: 0.012,
+        speechMultiplier: 3.5,
+        silenceThresholdMin: 0.010,
+        silenceMultiplier: 2.0,
+        silenceDuration: 800,
+        speechConfirmMs: 500,
+        energyThresholdMin: 0.015,
+        sustainedNoiseMs: 5000,
+      },
+      noisy: {
+        label: "Noisy",
+        speechThresholdMin: 0.020,
+        speechMultiplier: 4.5,
+        silenceThresholdMin: 0.015,
+        silenceMultiplier: 2.5,
+        silenceDuration: 600,
+        speechConfirmMs: 600,
+        energyThresholdMin: 0.025,
+        sustainedNoiseMs: 3000,
+      },
+    };
+    let _vadPresetKey = localStorage.getItem("murmur-vad-preset") || "normal";
+    if (!VAD_PRESETS[_vadPresetKey]) _vadPresetKey = "normal";
+    function _vadPreset() { return VAD_PRESETS[_vadPresetKey]; }
+
+    const SILENCE_THRESHOLD_MIN = 0.010;  // Legacy reference — actual value from _vadPreset()
+    const SILENCE_DURATION = 800;  // Legacy reference — actual value from _vadPreset()
     const MIN_RECORDING_MS = 500;
     let recordingStartTime = 0;
 
@@ -5673,8 +5838,8 @@
     let autoListenEnabled = !_pushToTalkMode;
     let autoListenActive = false;
     let speechConfirmStart = 0;
-    const SPEECH_THRESHOLD_MIN = 0.012;  // Hard floor — dynamic threshold adapts to ambient noise
-    const SPEECH_CONFIRM_MS = 500;   // Sustained speech for 500ms before triggering recording
+    const SPEECH_THRESHOLD_MIN = 0.012;  // Legacy reference — actual value from _vadPreset()
+    const SPEECH_CONFIRM_MS = 500;   // Legacy reference — actual value from _vadPreset()
     let conversationHot = false;     // After Claude speaks, next speech goes direct (no wake word)
     let ttsStartedAt = 0;
     let ttsEndedAt = 0;
@@ -5825,7 +5990,7 @@
           // Pre-filter: skip sending to Whisper if audio was just noise.
           // Think mode bypasses this — user explicitly tapped to submit so always send.
           if (!thinkMode) {
-            const energyThreshold = Math.max(AUDIO_ENERGY_THRESHOLD_MIN, ambientRmsBaseline * 2.5);
+            const energyThreshold = Math.max(_vadPreset().energyThresholdMin, ambientRmsBaseline * 2.5);
             if (recordingPeakRms < energyThreshold) {
               rlog(`[rec] Skipping transcription — peak RMS ${recordingPeakRms.toFixed(4)} below threshold ${energyThreshold.toFixed(4)} (baseline=${ambientRmsBaseline.toFixed(4)})`);
               setTalkState("idle");
@@ -5849,6 +6014,7 @@
         recordingStartTime = Date.now();
 
         setTalkState("recording");
+        startStreamingSTT();
         if (thinkMode) {
           talkBtn.classList.add("think-recording");
           startThinkCountdown();
@@ -5883,6 +6049,7 @@
       stopSilenceDetection();
       stopThinkCountdown();
       stopLiveTranscription();
+      stopStreamingSTT();
       talkBtn.classList.remove("think-recording");
 
       if (mediaRecorder.state === "recording") {
@@ -5913,10 +6080,11 @@
           if (rms < ambientRmsBaseline * 2.0) {
             ambientRmsBaseline = ambientRmsBaseline * 0.98 + rms * 0.02;
           }
-          const silenceThreshold = Math.max(SILENCE_THRESHOLD_MIN, ambientRmsBaseline * 2.0);
+          const vp = _vadPreset();
+          const silenceThreshold = Math.max(vp.silenceThresholdMin, ambientRmsBaseline * vp.silenceMultiplier);
           if (rms < silenceThreshold && elapsed > MIN_RECORDING_MS) {
             if (silenceStart === 0) silenceStart = Date.now();
-            else if (Date.now() - silenceStart > SILENCE_DURATION) {
+            else if (Date.now() - silenceStart > vp.silenceDuration) {
               stopRecording();
               return;
             }
@@ -5939,36 +6107,100 @@
     }
 
     function startThinkCountdown() {
-      let remaining = thinkTimeout;
-      const updateLabel = () => {
+      // Think mode uses silence detection with a LONG silence tolerance (thinkTimeout).
+      // Recording continues indefinitely while the user is speaking — the timer is
+      // the silence duration before auto-submit, NOT a total recording time cap.
+      let thinkSilenceStart = 0;
+      recordingPeakRms = 0; // Reset peak tracker
+
+      const updateLabel = (silentSecs) => {
         const label = talkBtn.querySelector(".talk-wave-label");
-        if (label) label.textContent = `Tap to send · ${remaining}s`;
+        if (!label) return;
+        if (silentSecs > 0) {
+          const remaining = Math.max(0, thinkTimeout - silentSecs);
+          label.textContent = `Tap to send · ${remaining}s`;
+        } else {
+          // Show recording duration while speaking
+          const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+          label.textContent = `Tap to send · ${elapsed}s`;
+        }
       };
-      updateLabel();
-      const tick = () => {
+
+      function checkThinkSilence() {
         if (!isRecording) return;
-        remaining--;
-        if (remaining <= 0) {
-          console.log("[think] Timeout reached — auto-submitting");
-          stopRecording();
-          return;
+
+        if (micAnalyser && micDataArray) {
+          micAnalyser.getFloatTimeDomainData(micDataArray);
+          let sum = 0;
+          for (let i = 0; i < micDataArray.length; i++) sum += micDataArray[i] * micDataArray[i];
+          const rms = Math.sqrt(sum / micDataArray.length);
+          if (rms > recordingPeakRms) recordingPeakRms = rms;
+
+          // Update ambient baseline (slow EMA)
+          if (rms < ambientRmsBaseline * 2.0) {
+            ambientRmsBaseline = ambientRmsBaseline * 0.98 + rms * 0.02;
+          }
+
+          const tvp = _vadPreset();
+          const silenceThreshold = Math.max(tvp.silenceThresholdMin, ambientRmsBaseline * tvp.silenceMultiplier);
+          const elapsed = Date.now() - recordingStartTime;
+
+          if (rms < silenceThreshold && elapsed > MIN_RECORDING_MS) {
+            if (thinkSilenceStart === 0) thinkSilenceStart = Date.now();
+            const silentMs = Date.now() - thinkSilenceStart;
+            updateLabel(Math.floor(silentMs / 1000));
+            if (silentMs > thinkTimeout * 1000) {
+              console.log(`[think] Silence timeout (${thinkTimeout}s) — auto-submitting`);
+              stopRecording();
+              return;
+            }
+          } else {
+            // User is speaking — reset silence timer
+            thinkSilenceStart = 0;
+            updateLabel(0);
+          }
         }
-        updateLabel();
-        thinkCountdownTimer = setTimeout(tick, 1000);
-      };
-      thinkCountdownTimer = setTimeout(tick, 1000);
-      // Also set an absolute fallback timer
-      thinkModeTimer = setTimeout(() => {
-        if (isRecording) {
-          console.log("[think] Hard timeout — stopping recording");
-          stopRecording();
-        }
-      }, thinkTimeout * 1000 + 500);
+
+        thinkCountdownTimer = setTimeout(checkThinkSilence, 100);
+      }
+
+      thinkCountdownTimer = setTimeout(checkThinkSilence, MIN_RECORDING_MS);
     }
 
     function stopThinkCountdown() {
       if (thinkCountdownTimer) { clearTimeout(thinkCountdownTimer); thinkCountdownTimer = null; }
       if (thinkModeTimer) { clearTimeout(thinkModeTimer); thinkModeTimer = null; }
+    }
+
+    // ── Streaming STT: send partial audio to Whisper during recording ──
+    const STREAMING_STT_INTERVAL = 3000; // Send partial audio every 3s
+    let _streamingSTTTimer = null;
+    let _streamingSTTSeq = 0; // Track which partial send we're on
+
+    function startStreamingSTT() {
+      _streamingSTTSeq = 0;
+      if (_streamingSTTTimer) clearInterval(_streamingSTTTimer);
+      _streamingSTTTimer = setInterval(() => {
+        if (!isRecording || !mediaRecorder || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!audioChunks.length) return;
+        _streamingSTTSeq++;
+        // Build blob from ALL chunks so far (MediaRecorder chunks are only valid cumulatively)
+        const partialBlob = new Blob(audioChunks.slice(), { type: mediaRecorder.mimeType });
+        if (partialBlob.size < 1000) return; // Too small to transcribe meaningfully
+        rlog(`[streaming-stt] Sending partial #${_streamingSTTSeq}: ${partialBlob.size} bytes`);
+        ws.send("voice:partial");
+        partialBlob.arrayBuffer().then(buf => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(buf);
+        });
+      }, STREAMING_STT_INTERVAL);
+    }
+
+    function stopStreamingSTT() {
+      if (_streamingSTTTimer) {
+        clearInterval(_streamingSTTTimer);
+        _streamingSTTTimer = null;
+      }
+      _streamingSTTSeq = 0;
     }
 
     function sendAudioToServer(blob, preBufferBlob) {
@@ -6597,7 +6829,7 @@
     let autoListenDebugCounter = 0;
     // Audio pre-filter: track peak RMS during recording to skip noise-only audio
     let recordingPeakRms = 0;
-    const AUDIO_ENERGY_THRESHOLD_MIN = 0.015; // Hard floor for post-recording energy check
+    const AUDIO_ENERGY_THRESHOLD_MIN = 0.015; // Legacy reference — actual value from _vadPreset()
     // Adaptive ambient noise baseline: exponential moving average of idle mic RMS.
     // Adapts in both directions — including noisy environments (car, office, etc.)
     let ambientRmsBaseline = 0.006;
@@ -6647,7 +6879,8 @@
         // 1. Below speech threshold: normal bidirectional EMA (quiet/normal room)
         // 2. Sustained above threshold for >5s: likely ambient noise (car, fan, AC)
         //    → raise baseline so speech detection stays relative to environment
-        const dynSpeechThreshold = Math.max(SPEECH_THRESHOLD_MIN, ambientRmsBaseline * 3.5);
+        const vp = _vadPreset();
+        const dynSpeechThreshold = Math.max(vp.speechThresholdMin, ambientRmsBaseline * vp.speechMultiplier);
         const now = Date.now();
         if (rms < dynSpeechThreshold) {
           _noisySince = 0; // Reset sustained-noise timer when quiet
@@ -6655,28 +6888,28 @@
         } else {
           if (_noisySince === 0) _noisySince = now;
           const sustainedMs = now - _noisySince;
-          if (sustainedMs > 5000) {
+          if (sustainedMs > vp.sustainedNoiseMs) {
             // Sustained loud noise — treat as new ambient floor, not speech
             // Slow upward EMA so a genuine long speech doesn't inflate baseline too fast
             ambientRmsBaseline = ambientRmsBaseline * 0.98 + rms * 0.02;
-            if (sustainedMs > 5100) speechConfirmStart = 0; // Suppress false speech trigger
+            if (sustainedMs > vp.sustainedNoiseMs + 100) speechConfirmStart = 0; // Suppress false speech trigger
           }
         }
 
         // Recompute threshold after possible baseline update
-        const adjSpeechThreshold = Math.max(SPEECH_THRESHOLD_MIN, ambientRmsBaseline * 3.5);
+        const adjSpeechThreshold = Math.max(vp.speechThresholdMin, ambientRmsBaseline * vp.speechMultiplier);
 
         // Debug log every 5s (remote)
         if (shouldLog) {
           const ctxState = ttsAudioCtx ? ttsAudioCtx.state : "none";
           const noisyFor = _noisySince ? Math.round((now - _noisySince) / 1000) + "s" : "0s";
-          rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${adjSpeechThreshold.toFixed(4)} baseline=${ambientRmsBaseline.toFixed(4)} noisyFor=${noisyFor} hot=${conversationHot} ctxState=${ctxState}`);
+          rlog(`[auto-listen] rms=${rms.toFixed(4)} threshold=${adjSpeechThreshold.toFixed(4)} baseline=${ambientRmsBaseline.toFixed(4)} noisyFor=${noisyFor} preset=${_vadPresetKey} hot=${conversationHot} ctxState=${ctxState}`);
         }
 
-        if (rms > adjSpeechThreshold && (_noisySince === 0 || now - _noisySince < 5000)) {
+        if (rms > adjSpeechThreshold && (_noisySince === 0 || now - _noisySince < vp.sustainedNoiseMs)) {
           if (speechConfirmStart === 0) {
             speechConfirmStart = now;
-          } else if (now - speechConfirmStart > (inFlowMode && conversationHot ? 200 : SPEECH_CONFIRM_MS)) {
+          } else if (now - speechConfirmStart > (inFlowMode && conversationHot ? 200 : vp.speechConfirmMs)) {
             rlog(`[auto-listen] Speech detected! rms=${rms.toFixed(4)} hot=${conversationHot} — starting recording`);
             speechConfirmStart = 0;
             // In flow mode, interrupt TTS/Claude before recording

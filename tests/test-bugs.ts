@@ -2103,7 +2103,134 @@ async function main() {
   await testTask15_flowMuteButton();
   await testTask14_streamingSTT();
 
+  // Session 5 fixes
+  await testBug_pregenHighlightRace();
+  await testBug80v4_proseFilterWrappedLines();
+  await testBug_ttsQueueFlushOnDisconnect();
+  await testBug_debugApiEndpoints();
+
   await teardown();
+}
+
+// --- Session 5 regression tests ---
+
+async function testBug_pregenHighlightRace() {
+  console.log("\n[BUG-HIGHLIGHT] Pregen path captures entryId before async gap");
+
+  // The bug: handleTtsDone's pregen path used the mutable global currentTtsEntryId
+  // after an async gap (awaiting pregen promise). broadcastCurrentOutput could mutate
+  // currentTtsEntryId during the gap, causing tts_highlight to point to the wrong entry
+  // and _playingTtsEntryId to be wrong → duplicate TTS when catch-all re-speaks.
+  //
+  // The fix: capture nextEntryId into pregenEntryId BEFORE the async gap and use it.
+  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+
+  // Find handleTtsDone function body
+  const fnStart = serverSrc.indexOf("function handleTtsDone()");
+  const fnEnd = serverSrc.indexOf("broadcast({ type: \"voice_status\", state: \"idle\" })", fnStart);
+  if (fnStart < 0 || fnEnd < 0) {
+    report("handleTtsDone function found", false, "Could not locate function");
+    return;
+  }
+  const fn = serverSrc.slice(fnStart, fnEnd + 100);
+
+  // Check that pregenEntryId is captured before the async promise.then
+  const capturesEntryId = fn.includes("const pregenEntryId = nextEntryId");
+  report("Pregen path captures entryId before async gap", capturesEntryId);
+
+  // Check that tts_highlight uses the captured variable, not the mutable global
+  const usesCapture = fn.includes("entryId: pregenEntryId");
+  report("Pregen tts_highlight uses captured entryId (not global)", usesCapture);
+
+  // Check that _playingTtsEntryId uses the captured variable
+  const playingUsesCapture = fn.includes("_playingTtsEntryId = pregenEntryId");
+  report("Pregen _playingTtsEntryId uses captured entryId", playingUsesCapture);
+
+  // Check that currentTtsEntryId is restored before fallback speakText
+  const restoresBeforeFallback = fn.includes("currentTtsEntryId = pregenEntryId; // Restore before fresh generation");
+  report("Pregen restores currentTtsEntryId before fallback speakText", restoresBeforeFallback);
+}
+
+async function testBug80v4_proseFilterWrappedLines() {
+  console.log("\n[BUG-80v4] MURMUR_CONTEXT_FILTER catches tmux-wrapped continuation lines");
+
+  // The bug: when MURMUR_EXIT "Prose mode off — resume normal formatting." is wrapped
+  // by tmux across two lines, the second line "resume normal formatting." didn't match
+  // the regex. Similarly, MURMUR_CONTEXT_LINES wrapping "no markdown, short sentences."
+  //
+  // The fix: add continuation patterns to the regex.
+  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+
+  // Extract the MURMUR_CONTEXT_FILTER regex source
+  const filterMatch = serverSrc.match(/MURMUR_CONTEXT_FILTER\s*=\s*\/(.*?)\/i;/);
+  if (!filterMatch) {
+    report("MURMUR_CONTEXT_FILTER regex found", false, "Could not find regex");
+    return;
+  }
+  const regexSrc = filterMatch[1];
+
+  // Test that the filter catches the wrapped continuation lines
+  const filter = new RegExp(regexSrc, "i");
+
+  // Full lines (should always match)
+  report("Filter matches 'Prose mode off'", filter.test("Prose mode off — resume normal formatting."));
+  report("Filter matches 'Prose mode on'", filter.test("Prose mode on — no markdown, short sentences."));
+
+  // Wrapped continuation lines (the bug fix)
+  report("Filter matches wrapped 'resume normal formatting.'", filter.test("resume normal formatting."));
+  report("Filter matches wrapped 'no markdown, short sentences.'", filter.test("no markdown, short sentences."));
+
+  // Should NOT match normal prose
+  report("Filter does NOT match normal text", !filter.test("The weather is nice today."));
+  report("Filter does NOT match partial 'resume'", !filter.test("Let me resume the task."));
+}
+
+async function testBug_ttsQueueFlushOnDisconnect() {
+  console.log("\n[BUG-DISCONNECT] TTS queue flushed on last client disconnect");
+
+  // The bug: when all WS clients disconnect, ttsQueue stayed populated with nobody
+  // to play the audio. Monitor caught ttsQueue.length > 0 with ttsInProgress=false
+  // and ws clients = 0.
+  //
+  // The fix: on ws close, if no real clients remain, flush ttsQueue and bump ttsGeneration.
+  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+
+  // Find the ws close handler
+  const closeStart = serverSrc.indexOf('ws.on("close"');
+  const closeEnd = serverSrc.indexOf("ws.on(", closeStart + 20); // next event handler
+  const closeBody = serverSrc.slice(closeStart, closeEnd > closeStart ? closeEnd : closeStart + 2000);
+
+  // Check that the close handler flushes TTS queue when no real clients remain
+  const flushesQueue = closeBody.includes("ttsQueue.splice(0") || closeBody.includes("ttsQueue.length");
+  report("WS close handler checks TTS queue", flushesQueue);
+
+  const bumpsGen = closeBody.includes("ttsGeneration++");
+  report("WS close handler bumps ttsGeneration", bumpsGen);
+
+  const checksRealClients = closeBody.includes("_isTestClient") || closeBody.includes("_isTestMode");
+  report("WS close handler only counts real (non-test) clients", checksRealClients);
+}
+
+async function testBug_debugApiEndpoints() {
+  console.log("\n[DEBUG-API] New debug ring buffer endpoints exist and return arrays");
+
+  // Verify the 3 new debug endpoints return valid JSON arrays
+  const endpoints = ["/debug/tts-history", "/debug/highlight-log", "/debug/entry-log"];
+
+  for (const ep of endpoints) {
+    const result = await page.evaluate(async (url) => {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) return { ok: false, status: resp.status };
+        const data = await resp.json();
+        return { ok: true, isArray: Array.isArray(data), length: data.length };
+      } catch (e: any) {
+        return { ok: false, error: e.message };
+      }
+    }, `http://localhost:3457${ep}`);
+
+    report(`${ep} returns valid JSON array`, result.ok && result.isArray, JSON.stringify(result));
+  }
 }
 
 main().catch(err => {

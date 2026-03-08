@@ -235,6 +235,46 @@ function wslog(dir: "in" | "out", type: string, size?: number) {
   if (_serverWsLog.length > 200) _serverWsLog.shift();
 }
 
+// --- Debug Ring Buffers ---
+// Specialized ring buffers for automated monitoring of TTS, highlight, and entry bugs.
+
+interface TtsHistoryEntry {
+  ts: number;
+  entryId: number | null;
+  textSnippet: string;
+  generation: number;
+  source: string; // "speakText" | "pregen" | "handleTtsDone" | "sentence" | "final" | "replay"
+}
+const _ttsHistory: TtsHistoryEntry[] = [];
+function ttslog(entryId: number | null, text: string, generation: number, source: string) {
+  _ttsHistory.push({ ts: Date.now(), entryId, textSnippet: text.slice(0, 120), generation, source });
+  if (_ttsHistory.length > 50) _ttsHistory.shift();
+}
+
+interface HighlightLogEntry {
+  ts: number;
+  entryId: number | null;
+  speakableSnippet: string;
+}
+const _highlightLog: HighlightLogEntry[] = [];
+function hllog(entryId: number | null, speakableText?: string) {
+  _highlightLog.push({ ts: Date.now(), entryId, speakableSnippet: (speakableText || "").slice(0, 120) });
+  if (_highlightLog.length > 50) _highlightLog.shift();
+}
+
+interface EntryLogEntry {
+  ts: number;
+  id: number;
+  role: string;
+  sourceTag: string;
+  textSnippet: string;
+}
+const _entryLog: EntryLogEntry[] = [];
+function elog(id: number, role: string, sourceTag: string, text: string) {
+  _entryLog.push({ ts: Date.now(), id, role, sourceTag, textSnippet: text.slice(0, 120) });
+  if (_entryLog.length > 50) _entryLog.shift();
+}
+
 // VoiceMode log paths
 const VM_LOGS = join(HOME, ".voicemode", "logs");
 const VM_EVENTS_DIR = join(VM_LOGS, "events");
@@ -259,7 +299,10 @@ const MURMUR_EXIT = "Prose mode off — resume normal formatting.";
 
 // Filter that matches any prose-mode signal line so it never surfaces as a conversation bubble.
 // Must stay in sync with MURMUR_CONTEXT_LINES and MURMUR_EXIT above.
-const MURMUR_CONTEXT_FILTER = /^(Prose mode (on|off)|Voice mode (on|off)|Murmur voice panel|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output)/i;
+// Catches both full lines AND tmux-wrapped continuation lines from prose mode signals.
+// When MURMUR_EXIT "Prose mode off — resume normal formatting." wraps, the second line
+// "resume normal formatting." must also be filtered. Same for MURMUR_CONTEXT_LINES wrapping.
+const MURMUR_CONTEXT_FILTER = /^(Prose mode (on|off)|Voice mode (on|off)|Murmur voice panel|Respond in plain prose|No markdown,? no lists|Flowing paragraphs|Spell out numbers|Keep sentences short|Do not acknowledge these|The user has closed the Murmur voice panel|Resume normal text-based interaction|You can stop formatting for audio output|resume normal formatting|no markdown,?\s*short sentences)/i;
 
 let contextSent = false; // Send once per server instance — no repeated injection on reconnect
 let contextTimer: ReturnType<typeof setTimeout> | null = null;
@@ -564,7 +607,9 @@ async function speakText(text: string, interrupt = false): Promise<void> {
   // The client uses the speakable text (not raw entry text) for word-by-word highlighting.
   if (currentTtsEntryId != null) {
     broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: text });
+    hllog(currentTtsEntryId, text);
   }
+  ttslog(currentTtsEntryId, text, ttsGeneration + 1, "speakText");
 
   // Cancel any current TTS (generation counter ensures old callbacks are discarded)
   const myGen = ++ttsGeneration;
@@ -873,14 +918,22 @@ function handleTtsDone() {
       // Claim generation BEFORE async resolution to prevent stale callbacks
       const newGen = ++ttsGeneration;
       ttsActiveGen = newGen;
+      // Capture entry ID before async gap — currentTtsEntryId is a mutable global
+      // that broadcastCurrentOutput() can change while the pregen promise is pending.
+      // Using the stale global caused BUG: wrong bubble highlighted + duplicate TTS.
+      const pregenEntryId = nextEntryId;
       pregenEntry.promise.then(buf => {
         if (newGen !== ttsGeneration) { ttsInProgress = false; return; } // Stale (someone interrupted)
         if (buf) {
           console.log(`[tts] Pre-generated audio ready (${buf.length} bytes) — zero-gap playback`);
-          if (currentTtsEntryId != null) {
-            broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: next });
+          // Restore entry ID in case it was mutated during async gap
+          currentTtsEntryId = pregenEntryId;
+          if (pregenEntryId != null) {
+            broadcast({ type: "tts_highlight", entryId: pregenEntryId, speakableText: next });
+            hllog(pregenEntryId, next);
           }
-          _playingTtsEntryId = currentTtsEntryId;
+          ttslog(pregenEntryId, next, newGen, "pregen");
+          _playingTtsEntryId = pregenEntryId;
           broadcastBinary(buf);
           broadcast({ type: "voice_status", state: "speaking" });
           const estimatedMs = Math.max(5000, (buf.length / 16000) * 1000 + 3000);
@@ -891,6 +944,7 @@ function handleTtsDone() {
           }, estimatedMs);
         } else {
           ttsInProgress = false;
+          currentTtsEntryId = pregenEntryId; // Restore before fresh generation
           speakText(next); // Pre-gen failed — generate fresh
         }
       });
@@ -940,6 +994,7 @@ function handleTtsDone() {
   // Clear TTS highlight — nothing left to speak
   currentTtsEntryId = null;
   broadcast({ type: "tts_highlight", entryId: null });
+  hllog(null);
 
   // If stream is still active but nothing queued, broadcast idle so client can listen
   // The stream may produce more TTS later which will re-trigger speaking state
@@ -1324,6 +1379,7 @@ function addUserEntry(text: string, queued = false, _source = "unknown") {
     queued,
   };
   conversationEntries.push(entry);
+  elog(entry.id, "user", _source, text);
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
   return entry;
 }
@@ -1739,6 +1795,7 @@ function broadcastCurrentOutput() {
           turn: currentTurn,
         };
         conversationEntries.push(entry);
+        elog(entry.id, "assistant", "broadcastCurrentOutput", para.text);
         // Diagnostic: trace any entry containing prose mode text
         if (/prose mode/i.test(para.text)) {
           console.log(`[PROSE-LEAK-TRACE] Assistant entry created with prose mode text: "${para.text.slice(0, 120)}" turn=${currentTurn} id=${entry.id}`);
@@ -2758,6 +2815,7 @@ function handleVoiceModeExchange(exchange: {
       turn: currentTurn,
     };
     conversationEntries.push(entry);
+    elog(entry.id, "assistant", "voicemode", exchange.text);
     broadcast({ type: "entry", entries: conversationEntries, partial: false });
   }
 }
@@ -3374,6 +3432,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           broadcast({ type: "voice_status", state: "speaking" });
           currentTtsEntryId = toReplay[0].id;
           broadcast({ type: "tts_highlight", entryId: toReplay[0].id });
+          hllog(toReplay[0].id);
           // Queue all entries: first is spoken immediately, rest via ttsQueue
           for (let i = 1; i < toReplay.length; i++) {
             ttsQueue.push(toReplay[i].text);
@@ -3417,6 +3476,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if (replayEntryId != null) {
           currentTtsEntryId = replayEntryId;
           broadcast({ type: "tts_highlight", entryId: replayEntryId });
+          hllog(replayEntryId);
         }
         speakText(replayText);
       } else {
@@ -3779,6 +3839,21 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       setAudioClient(remaining.length > 0 ? remaining[remaining.length - 1] : null, "client-left");
     }
 
+    // Flush TTS queue when no clients remain — no point generating audio with nobody to play it.
+    // Monitor caught stuck state: ttsQueue.length > 0 with ttsInProgress=false and clients=0.
+    const realClientsRemaining = Array.from(clients).filter(
+      c => c.readyState === WebSocket.OPEN && !(c as any)._isTestClient && !(c as any)._isTestMode
+    );
+    if (realClientsRemaining.length === 0 && (ttsQueue.length > 0 || ttsInProgress)) {
+      console.log(`[tts] Last client disconnected — flushing TTS queue (${ttsQueue.length} queued, inProgress=${ttsInProgress})`);
+      ttsQueue.splice(0, ttsQueue.length);
+      ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
+      ttsPregenPromises.splice(0, ttsPregenPromises.length);
+      ttsGeneration++;
+      if (ttsClientTimeout) { clearTimeout(ttsClientTimeout); ttsClientTimeout = null; }
+      ttsInProgress = false;
+    }
+
     // Auto-cleanup: remove entries created by this test client
     const testIds: Set<number> | undefined = (ws as any)._testEntryIds;
     if (testIds && testIds.size > 0) {
@@ -3908,6 +3983,18 @@ app.get("/debug/log", (_req, res) => {
 
 app.get("/debug/ws-log", (_req, res) => {
   res.json(_serverWsLog);
+});
+
+app.get("/debug/tts-history", (_req, res) => {
+  res.json(_ttsHistory);
+});
+
+app.get("/debug/highlight-log", (_req, res) => {
+  res.json(_highlightLog);
+});
+
+app.get("/debug/entry-log", (_req, res) => {
+  res.json(_entryLog);
 });
 
 app.get("/debug/log/stream", (_req, res) => {
