@@ -1364,20 +1364,36 @@ function addUserEntry(text: string, queued = false, _source = "unknown") {
   }
   // Dedup: skip if an identical user entry already exists recently
   // (prevents passive watcher re-adding text that was already added by text:/voice handler)
-  // Normalize whitespace: collapse \n, \r, and multiple spaces to single space
-  // (tmux preserves newlines, STT returns spaces — same speech, different whitespace)
+  //
+  // Two-level normalization:
+  //   Level 1 (strict): collapse whitespace to single space — catches most duplicates
+  //   Level 2 (fuzzy):  strip ALL spaces — catches tmux wrap boundary mismatches
+  //     When passive watcher reconstructs text from tmux pane, it joins wrapped lines
+  //     with " ". If the wrap splits mid-word ("bro" + "wn"), the reconstructed text
+  //     has a spurious space ("bro wn" vs original "brown"). Stripping all spaces
+  //     makes both "bro wn fox" and "brown fox" → "brownfox" → match.
+  //
   // Use time-based window (30s) instead of turn-based — turn counter can jump during
   // concurrent activity, causing the dedup to miss duplicates across turn boundaries.
   const normalized = text.trim().toLowerCase().replace(/[\s]+/g, " ");
+  const normalizedNoSpaces = normalized.replace(/\s/g, "");
   const dedupeWindowMs = 30000;
   const cutoff = Date.now() - dedupeWindowMs;
   const recent = conversationEntries.filter(e => e.role === "user" && e.ts >= cutoff);
-  console.log(`[DEDUP-TRACE] dedup check: normalized="${normalized.slice(0, 60)}" recent=${recent.length} total=${conversationEntries.length} cutoff=${cutoff}`);
+  console.log(`[DEDUP-TRACE] dedup check: normalized="${normalized.slice(0, 60)}" noSpaces="${normalizedNoSpaces.slice(0, 40)}" recent=${recent.length} total=${conversationEntries.length}`);
   for (const e of recent) {
     const eNorm = e.text.trim().toLowerCase().replace(/[\s]+/g, " ");
-    console.log(`[DEDUP-TRACE]   compare id=${e.id} ts=${e.ts} eNorm="${eNorm.slice(0, 60)}" match=${eNorm === normalized}`);
+    const eNoSpaces = eNorm.replace(/\s/g, "");
+    const strictMatch = eNorm === normalized;
+    const fuzzyMatch = eNoSpaces === normalizedNoSpaces;
+    console.log(`[DEDUP-TRACE]   compare id=${e.id} ts=${e.ts} strict=${strictMatch} fuzzy=${fuzzyMatch} eNorm="${eNorm.slice(0, 60)}"`);
   }
-  const dup = recent.find(e => e.text.trim().toLowerCase().replace(/[\s]+/g, " ") === normalized);
+  const dup = recent.find(e => {
+    const eNorm = e.text.trim().toLowerCase().replace(/[\s]+/g, " ");
+    if (eNorm === normalized) return true; // Strict match
+    // Fuzzy match: same text modulo all whitespace (tmux wrap boundary mismatch)
+    return eNorm.replace(/\s/g, "") === normalizedNoSpaces;
+  });
   if (dup) {
     console.log(`[DEDUP-TRACE] DEDUP HIT: Skipping duplicate from="${_source}" text="${text.slice(0, 60)}" (matches id=${dup.id})`);
     return dup;
@@ -2434,7 +2450,7 @@ function startPassiveWatcher() {
       for (let i = lines.length - 1; i >= 0; i--) {
         const trimmed = lines[i].trim();
         if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
-          // Collect continuation lines that follow (tmux-wrapped input)
+          // Collect continuation lines that follow (tmux-wrapped input).
           const parts = [trimmed.slice(2).trim()];
           for (let j = i + 1; j < lines.length; j++) {
             const next = lines[j].trim();
