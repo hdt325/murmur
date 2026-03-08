@@ -27,6 +27,27 @@ const EXT_TO_MIME: Record<string, string> = {
   ogg: "audio/ogg",
 };
 
+// --- Whisper Debug Log ---
+export interface WhisperLog {
+  ts: number;
+  inputId?: string;
+  transcriptionStartTs: number;
+  transcriptionEndTs: number;
+  durationMs: number;
+  audioSizeBytes: number;
+  transcribedText: string;
+  noSpeechProb: number;
+  isRetry: boolean;
+  wasFiltered: boolean;
+  status: "success" | "failed" | "filtered";
+}
+export const whisperLog: WhisperLog[] = []; // ring buffer, last 30
+
+function logWhisper(entry: WhisperLog): void {
+  whisperLog.push(entry);
+  if (whisperLog.length > 30) whisperLog.shift();
+}
+
 /** Send audio to Whisper via async fetch (non-blocking). */
 async function whisperFetch(audioData: Buffer, audioExt: string, whisperUrl: string): Promise<any> {
   const mime = EXT_TO_MIME[audioExt] || "application/octet-stream";
@@ -68,14 +89,14 @@ async function whisperFetch(audioData: Buffer, audioExt: string, whisperUrl: str
   }
 }
 
-/** Parse Whisper response, apply hallucination filter. Returns text or empty string. */
-function parseWhisperResult(json: any): string {
+/** Parse Whisper response, apply hallucination filter. Returns { text, noSpeechProb, filtered }. */
+function parseWhisperResult(json: any): { text: string; noSpeechProb: number; filtered: boolean } {
   const noSpeechProb = json.segments?.[0]?.no_speech_prob ?? 0;
   if (noSpeechProb >= 0.6) {
     console.log(`[stt] Discarded -- no_speech_prob=${noSpeechProb.toFixed(2)} (likely hallucination)`);
-    return "";
+    return { text: "", noSpeechProb, filtered: true };
   }
-  return json.text?.trim() || "";
+  return { text: json.text?.trim() || "", noSpeechProb, filtered: false };
 }
 
 export async function transcribeAudio(
@@ -85,6 +106,7 @@ export async function transcribeAudio(
   serviceStatus: ServiceStatus,
   broadcast: BroadcastFn,
   checkService: (name: string, url: string) => Promise<boolean>,
+  inputId?: string,
 ): Promise<string> {
   if (!serviceStatus.whisper) {
     serviceStatus.whisper = await checkService("Whisper STT", whisperUrl);
@@ -96,31 +118,59 @@ export async function transcribeAudio(
   }
 
   const audioExt = detectAudioExt(audioData);
+  const sttStartTs = Date.now();
 
   try {
     plog("transcribe_start");
-    const sttStart = Date.now();
     slog("stt", "start", { bytes: audioData.length, ext: audioExt });
 
     const json = await whisperFetch(audioData, audioExt, whisperUrl);
-    const text = parseWhisperResult(json);
+    const { text, noSpeechProb, filtered } = parseWhisperResult(json);
+    const endTs = Date.now();
 
     plog("transcribe_done", text ? `"${text.slice(0, 100)}"` : "(empty)");
-    slog("stt", "done", { text: text.slice(0, 100), durationMs: Date.now() - sttStart });
+    slog("stt", "done", { text: text.slice(0, 100), durationMs: endTs - sttStartTs });
+
+    logWhisper({
+      ts: endTs, inputId, transcriptionStartTs: sttStartTs, transcriptionEndTs: endTs,
+      durationMs: endTs - sttStartTs, audioSizeBytes: audioData.length,
+      transcribedText: text.slice(0, 80), noSpeechProb, isRetry: false,
+      wasFiltered: filtered, status: filtered ? "filtered" : "success",
+    });
+
     return text;
   } catch (err) {
     console.warn("[stt] First attempt failed, retrying:", (err as Error).message);
+    const retryStartTs = Date.now();
     try {
       const retryJson = await whisperFetch(audioData, audioExt, whisperUrl);
-      const text = parseWhisperResult(retryJson);
+      const { text, noSpeechProb, filtered } = parseWhisperResult(retryJson);
+      const retryEndTs = Date.now();
       console.log(`[stt] Retry succeeded: "${text.slice(0, 60)}"`);
+
+      logWhisper({
+        ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
+        durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length,
+        transcribedText: text.slice(0, 80), noSpeechProb, isRetry: true,
+        wasFiltered: filtered, status: filtered ? "filtered" : "success",
+      });
+
       return text;
     } catch (retryErr) {
+      const retryEndTs = Date.now();
       console.error("Whisper transcription failed (after retry):", (retryErr as Error).message);
       plog("transcribe_error", (retryErr as Error).message);
       slog("stt", "error", { error: (retryErr as Error).message });
       serviceStatus.whisper = false;
       broadcast({ type: "voice_status", state: "error", message: "Whisper STT failed" });
+
+      logWhisper({
+        ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
+        durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length,
+        transcribedText: "", noSpeechProb: 0, isRetry: true,
+        wasFiltered: false, status: "failed",
+      });
+
       return "";
     }
   }

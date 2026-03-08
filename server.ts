@@ -464,7 +464,22 @@ async function whisperFetch(audioData: Buffer, audioExt: string): Promise<any> {
   }
 }
 
-async function transcribeAudio(audioData: Buffer): Promise<string> {
+interface WhisperLogEntry {
+  ts: number;
+  inputId?: string;
+  transcriptionStartTs: number;
+  transcriptionEndTs: number;
+  durationMs: number;
+  audioSizeBytes: number;
+  transcribedText: string;
+  noSpeechProb: number;
+  isRetry: boolean;
+  wasFiltered: boolean;
+  status: "success" | "failed" | "filtered";
+}
+const _whisperLog: WhisperLogEntry[] = []; // ring buffer, last 30
+
+async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<string> {
   if (!serviceStatus.whisper) {
     serviceStatus.whisper = await checkService("Whisper STT", WHISPER_URL);
     if (!serviceStatus.whisper) {
@@ -475,40 +490,64 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
   }
 
   const audioExt = detectAudioExt(audioData);
+  const sttStartTs = Date.now();
 
   try {
     plog("transcribe_start");
-    const sttStart = Date.now();
     slog("stt", "start", { bytes: audioData.length, ext: audioExt });
 
     const json = await whisperFetch(audioData, audioExt);
     const noSpeechProb = json.segments?.[0]?.no_speech_prob ?? 0;
+    const endTs = Date.now();
     if (noSpeechProb >= 0.6) {
       console.log(`[stt] Discarded — no_speech_prob=${noSpeechProb.toFixed(2)} (likely hallucination)`);
+      _whisperLog.push({ ts: endTs, inputId, transcriptionStartTs: sttStartTs, transcriptionEndTs: endTs,
+        durationMs: endTs - sttStartTs, audioSizeBytes: audioData.length, transcribedText: "",
+        noSpeechProb, isRetry: false, wasFiltered: true, status: "filtered" });
+      if (_whisperLog.length > 30) _whisperLog.shift();
       return "";
     }
     const text = json.text?.trim() || "";
     plog("transcribe_done", text ? `"${text.slice(0, 100)}"` : "(empty)");
-    slog("stt", "done", { text: text.slice(0, 100), durationMs: Date.now() - sttStart });
+    slog("stt", "done", { text: text.slice(0, 100), durationMs: endTs - sttStartTs });
+    _whisperLog.push({ ts: endTs, inputId, transcriptionStartTs: sttStartTs, transcriptionEndTs: endTs,
+      durationMs: endTs - sttStartTs, audioSizeBytes: audioData.length, transcribedText: text.slice(0, 80),
+      noSpeechProb, isRetry: false, wasFiltered: false, status: "success" });
+    if (_whisperLog.length > 30) _whisperLog.shift();
     return text;
   } catch (err) {
     console.warn("[stt] First attempt failed, retrying:", (err as Error).message);
+    const retryStartTs = Date.now();
     try {
       const retryJson = await whisperFetch(audioData, audioExt);
       const retryNoSpeech = retryJson.segments?.[0]?.no_speech_prob ?? 0;
+      const retryEndTs = Date.now();
       if (retryNoSpeech >= 0.6) {
         console.log(`[stt] Retry discarded — no_speech_prob=${retryNoSpeech.toFixed(2)} (likely hallucination)`);
+        _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
+          durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: "",
+          noSpeechProb: retryNoSpeech, isRetry: true, wasFiltered: true, status: "filtered" });
+        if (_whisperLog.length > 30) _whisperLog.shift();
         return "";
       }
       const text = retryJson.text?.trim() || "";
       console.log(`[stt] Retry succeeded: "${text.slice(0, 60)}"`);
+      _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
+        durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: text.slice(0, 80),
+        noSpeechProb: retryNoSpeech, isRetry: true, wasFiltered: false, status: "success" });
+      if (_whisperLog.length > 30) _whisperLog.shift();
       return text;
     } catch (retryErr) {
+      const retryEndTs = Date.now();
       console.error("Whisper transcription failed (after retry):", (retryErr as Error).message);
       plog("transcribe_error", (retryErr as Error).message);
       slog("stt", "error", { error: (retryErr as Error).message });
       serviceStatus.whisper = false;
       broadcast({ type: "voice_status", state: "error", message: "Whisper STT failed" });
+      _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
+        durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: "",
+        noSpeechProb: 0, isRetry: true, wasFiltered: false, status: "failed" });
+      if (_whisperLog.length > 30) _whisperLog.shift();
       return "";
     }
   }
@@ -533,6 +572,90 @@ function bumpGeneration(reason: GenerationEvent["reason"], entryId?: number): vo
   ttsGenerationLog.push(event);
   if (ttsGenerationLog.length > 20) ttsGenerationLog.shift();
   console.log(`[tts2] generation bumped to ${ttsGeneration} reason=${reason} entryId=${entryId ?? "none"}`);
+}
+
+// --- Debug Pipeline Observability ---
+
+interface KokoroFetchLog {
+  ts: number;
+  entryId: number | null;
+  chunkIndex: number;
+  text: string;
+  fetchStartTs: number;
+  fetchEndTs: number;
+  durationMs: number;
+  audioSizeBytes: number;
+  status: "success" | "failed" | "aborted";
+  error?: string;
+}
+const _kokoroLog: KokoroFetchLog[] = []; // ring buffer, last 50
+
+interface ChunkFlowLog {
+  ts: number;
+  event: "chunk_sent" | "chunk_done" | "tts_play_sent" | "tts_done_received";
+  entryId: number | null;
+  chunkIndex: number;
+  generation: number;
+  timeSinceLastEvent?: number;
+}
+const _chunkFlowLog: ChunkFlowLog[] = []; // ring buffer, last 100
+let _lastChunkFlowTs: Map<number, number> = new Map(); // entryId → last event ts
+
+interface ClientPlaybackState {
+  currentEntryId: number | null;
+  currentChunkIndex: number | null;
+  lastChunkDoneTs: number | null;
+  lastTtsDoneTs: number | null;
+  chunksPlayed: number;
+  entriesCompleted: number;
+}
+const _clientPlayback: ClientPlaybackState = {
+  currentEntryId: null, currentChunkIndex: null,
+  lastChunkDoneTs: null, lastTtsDoneTs: null,
+  chunksPlayed: 0, entriesCompleted: 0,
+};
+
+interface InputLog {
+  ts: number;
+  inputId: string;
+  source: "voice" | "text" | "passive";
+  userEntryId: number;
+  responseEntryIds: number[];
+  ttsEntryIds: number[];
+}
+const _inputLog: InputLog[] = []; // ring buffer, last 20
+
+function logChunkFlow(event: ChunkFlowLog["event"], entryId: number | null, chunkIndex: number): void {
+  const now = Date.now();
+  const key = entryId ?? -1;
+  const lastTs = _lastChunkFlowTs.get(key);
+  const entry: ChunkFlowLog = {
+    ts: now, event, entryId, chunkIndex, generation: ttsGeneration,
+    timeSinceLastEvent: lastTs ? now - lastTs : undefined,
+  };
+  _chunkFlowLog.push(entry);
+  if (_chunkFlowLog.length > 100) _chunkFlowLog.shift();
+  _lastChunkFlowTs.set(key, now);
+}
+
+function logKokoroFetch(entryId: number | null, chunkIndex: number, text: string,
+  startTs: number, audioSizeBytes: number, status: KokoroFetchLog["status"], error?: string): void {
+  const now = Date.now();
+  const entry: KokoroFetchLog = {
+    ts: now, entryId, chunkIndex, text: text.slice(0, 50),
+    fetchStartTs: startTs, fetchEndTs: now, durationMs: now - startTs,
+    audioSizeBytes, status, error,
+  };
+  _kokoroLog.push(entry);
+  if (_kokoroLog.length > 50) _kokoroLog.shift();
+}
+
+function logInput(inputId: string, source: InputLog["source"], userEntryId: number): void {
+  _inputLog.push({
+    ts: Date.now(), inputId, source, userEntryId,
+    responseEntryIds: [], ttsEntryIds: [],
+  });
+  if (_inputLog.length > 20) _inputLog.shift();
 }
 
 // Clean raw text for TTS — strips code, URLs, markdown, etc.
@@ -675,6 +798,7 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
   chunk.state = "fetching";
   chunk.abortController = new AbortController();
   _activeFetchCount++;
+  const fetchStartTs = Date.now();
 
   const settings = loadSettings();
   const voice = settings.voice || "af_heart";
@@ -695,11 +819,13 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
     // Stale check after async — generation may have changed
     if (job.generation !== ttsGeneration) {
       chunk.state = "failed";
+      logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
       return;
     }
 
     chunk.audioBuf = buf;
     chunk.state = "ready";
+    logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, buf.length, "success");
     plog("tts_chunk_ready", `job=${job.jobId} chunk=${chunkIndex} ${buf.length}B`);
 
     // If this chunk is the one the playing job is waiting for, send it now
@@ -716,12 +842,14 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
   } catch (err) {
     if ((err as Error).name === "AbortError") {
       chunk.state = "failed";
+      logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
       return;
     }
     console.error(`[tts2] Kokoro fetch failed (job=${job.jobId} chunk=${chunkIndex}):`, (err as Error).message);
     chunk.state = "failed";
     // If any chunk fails, mark the whole job failed
     job.state = "failed";
+    logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
   } finally {
     _activeFetchCount--;
     chunk.abortController = null;
@@ -845,6 +973,15 @@ function queueTts(entryId: number | null, text: string): void {
   };
 
   ttsJobQueue.push(job);
+  // Track which entries got TTS in input log
+  if (entryId != null) {
+    const entry = conversationEntries.find(e => e.id === entryId);
+    const pid = entry?.parentInputId;
+    if (pid) {
+      const il = _inputLog.find(l => l.inputId === pid);
+      if (il && !il.ttsEntryIds.includes(entryId)) il.ttsEntryIds.push(entryId);
+    }
+  }
   ttslog(entryId, text, ttsGeneration, "queueTts");
   plog("tts2_queued", `job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} (${speakableText.length} chars)`);
   console.log(`[tts2] Queued job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} queue=${ttsJobQueue.length}`);
@@ -968,6 +1105,7 @@ function drainAudioBuffer(): void {
       chunkCount: job.chunks.length,
       chunkWordCounts,
     });
+    logChunkFlow("tts_play_sent", job.entryId, 0);
 
     sendChunk(job, 0);
     broadcast({ type: "voice_status", state: "speaking" });
@@ -985,6 +1123,9 @@ function sendChunk(job: TtsJob, chunkIndex: number): void {
   sendToAudioClient(chunk.audioBuf);
   chunk.audioBuf = null; // Free after sending
   slog("tts", "chunk_sent", { bytes, entry: job.entryId, chunk: chunkIndex, of: job.chunks.length });
+  logChunkFlow("chunk_sent", job.entryId, chunkIndex);
+  _clientPlayback.currentEntryId = job.entryId;
+  _clientPlayback.currentChunkIndex = chunkIndex;
   console.log(`[tts2] Sent chunk ${chunkIndex}/${job.chunks.length - 1} (${bytes}B) for entry=${job.entryId}`);
 
   // Per-chunk safety timeout (~12KB/s for Kokoro audio)
@@ -1003,6 +1144,9 @@ function sendChunk(job: TtsJob, chunkIndex: number): void {
  */
 function handleChunkDone(entryId: number | null, chunkIndex: number): void {
   if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+  logChunkFlow("chunk_done", entryId, chunkIndex);
+  _clientPlayback.lastChunkDoneTs = Date.now();
+  _clientPlayback.chunksPlayed++;
 
   const job = ttsCurrentlyPlaying;
   if (!job || job.entryId !== entryId) {
@@ -1057,6 +1201,11 @@ function handleChunkDone(entryId: number | null, chunkIndex: number): void {
  */
 function handleTtsDone2(entryId: number | null): void {
   plog("tts2_done", `entry=${entryId}`);
+  logChunkFlow("tts_done_received", entryId, ttsCurrentlyPlaying?.currentChunkIndex ?? -1);
+  _clientPlayback.lastTtsDoneTs = Date.now();
+  _clientPlayback.entriesCompleted++;
+  _clientPlayback.currentEntryId = null;
+  _clientPlayback.currentChunkIndex = null;
   if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
 
   // Find the matching job — prefer currently-playing, fall back to queue search
@@ -1513,6 +1662,10 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   };
   conversationEntries.push(entry);
   elog(entry.id, "user", _source, text);
+  if (inputId) {
+    const source = _source === "voice" ? "voice" as const : _source === "passive" ? "passive" as const : "text" as const;
+    logInput(inputId, source, entry.id);
+  }
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
   return entry;
 }
@@ -1931,6 +2084,10 @@ function broadcastCurrentOutput() {
         };
         conversationEntries.push(entry);
         elog(entry.id, "assistant", "broadcastCurrentOutput", para.text);
+        if (_currentInputId) {
+          const il = _inputLog.find(l => l.inputId === _currentInputId);
+          if (il) il.responseEntryIds.push(entry.id);
+        }
         // Diagnostic: trace any entry containing prose mode text
         if (/prose mode/i.test(para.text)) {
           console.log(`[PROSE-LEAK-TRACE] Assistant entry created with prose mode text: "${para.text.slice(0, 120)}" turn=${currentTurn} id=${entry.id}`);
@@ -2264,8 +2421,9 @@ function handleStreamDone() {
       // Skip if identical text already exists in ANY turn (cross-turn dedup with scrollback)
       const isDup = conversationEntries.some(e => e.role === "assistant" && e.text === para.text);
       if (!isDup) {
+        const newId = ++entryIdCounter;
         conversationEntries.push({
-          id: ++entryIdCounter,
+          id: newId,
           role: "assistant",
           text: para.text,
           speakable: para.speakable,
@@ -2274,6 +2432,10 @@ function handleStreamDone() {
           turn: currentTurn,
           ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
         });
+        if (_currentInputId) {
+          const il = _inputLog.find(l => l.inputId === _currentInputId);
+          if (il) il.responseEntryIds.push(newId);
+        }
       }
     }
   }
@@ -3238,7 +3400,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       plog("audio_received", `${finalAudio.length} bytes`);
       broadcast({ type: "voice_status", state: "transcribing" });
 
-      const text = await transcribeAudio(finalAudio);
+      const text = await transcribeAudio(finalAudio, audioInputId);
 
       if (!text || text.length <= 1) {
         console.log("Blank transcription");
@@ -4085,6 +4247,12 @@ app.get("/debug", (_req, res) => {
     wsClients: clients.size,
     streamState,
     ttsPlaying: !!ttsCurrentlyPlaying,
+    ttsGeneration,
+    ttsQueueLength: ttsJobQueue.length,
+    playback: _clientPlayback,
+    kokoroFetchCount: _kokoroLog.length,
+    chunkFlowCount: _chunkFlowLog.length,
+    inputCount: _inputLog.length,
     vmState,
   });
 });
@@ -4133,6 +4301,49 @@ app.get("/debug/generation-log", (_req, res) => {
 
 app.get("/debug/entry-log", (_req, res) => {
   res.json(_entryLog);
+});
+
+app.get("/debug/kokoro-log", (_req, res) => {
+  res.json(_kokoroLog);
+});
+
+app.get("/debug/chunk-flow", (_req, res) => {
+  res.json(_chunkFlowLog);
+});
+
+app.get("/debug/playback-state", (_req, res) => {
+  res.json(_clientPlayback);
+});
+
+app.get("/debug/tts-jobs", (_req, res) => {
+  const jobs = ttsJobQueue.map(j => ({
+    jobId: j.jobId,
+    entryId: j.entryId,
+    state: j.state,
+    mode: j.mode,
+    generation: j.generation,
+    currentChunkIndex: j.currentChunkIndex,
+    chunkCount: j.chunks.length,
+    chunks: j.chunks.map(c => ({ index: c.chunkIndex, state: c.state, wordCount: c.wordCount, hasAudio: !!c.audioBuf })),
+    fullText: j.fullText.slice(0, 80),
+    speakableText: j.speakableText.slice(0, 80),
+  }));
+  const playing = ttsCurrentlyPlaying ? {
+    jobId: ttsCurrentlyPlaying.jobId,
+    entryId: ttsCurrentlyPlaying.entryId,
+    state: ttsCurrentlyPlaying.state,
+    currentChunkIndex: ttsCurrentlyPlaying.currentChunkIndex,
+    chunkCount: ttsCurrentlyPlaying.chunks.length,
+  } : null;
+  res.json({ playing, queued: jobs, queueLength: ttsJobQueue.length, generation: ttsGeneration });
+});
+
+app.get("/debug/input-log", (_req, res) => {
+  res.json(_inputLog);
+});
+
+app.get("/debug/whisper-log", (_req, res) => {
+  res.json(_whisperLog);
 });
 
 app.get("/debug/log/stream", (_req, res) => {
