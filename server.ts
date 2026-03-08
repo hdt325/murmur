@@ -776,13 +776,20 @@ function handleTtsDone() {
   ttsInProgress = false;
   console.log(`[tts] handleTtsDone (gen=${drainGen}, queue=${ttsQueue.length})`);
 
-  // Mark the entry that just finished playing as spoken and re-broadcast
+  // Mark the entry that just finished playing as spoken and re-broadcast.
+  // But NOT for sentence-level TTS — individual sentences don't mean the whole entry is spoken.
+  // An entry is fully spoken when: (a) it has no cursor (spoken as whole), or
+  // (b) the cursor has reached/exceeded the entry text length (all sentences done).
   if (_playingTtsEntryId != null) {
     const justSpoken = conversationEntries.find(e => e.id === _playingTtsEntryId);
     if (justSpoken && !justSpoken.spoken) {
-      justSpoken.spoken = true;
-      console.log(`[tts] Marked entry ${_playingTtsEntryId} as spoken`);
-      broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      const cursor = entryTtsCursor.get(justSpoken.id) ?? 0;
+      const isFullySpoken = cursor === 0 || cursor >= justSpoken.text.length;
+      if (isFullySpoken) {
+        justSpoken.spoken = true;
+        console.log(`[tts] Marked entry ${_playingTtsEntryId} as spoken`);
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+      }
     }
     _playingTtsEntryId = null;
   }
@@ -1585,8 +1592,9 @@ function broadcastCurrentOutput() {
         }
       }
     } else {
-      // New paragraph — create entry (but skip if identical text already exists in this turn)
-      const isDup = assistantEntries.some(e => e.text === para.text);
+      // New paragraph — create entry (but skip if identical text already exists in ANY turn,
+      // including scrollback entries from loadScrollbackEntries which have negative turns)
+      const isDup = conversationEntries.some(e => e.role === "assistant" && e.text === para.text);
       if (!isDup) {
         const entry: ConversationEntry = {
           id: ++entryIdCounter,
@@ -1927,8 +1935,8 @@ function handleStreamDone() {
       assistantEntries[i].text = para.text;
       assistantEntries[i].speakable = para.speakable;
     } else {
-      // Skip if identical text already exists in this turn (positional shift dedup)
-      const isDup = assistantEntries.some(e => e.text === para.text);
+      // Skip if identical text already exists in ANY turn (cross-turn dedup with scrollback)
+      const isDup = conversationEntries.some(e => e.role === "assistant" && e.text === para.text);
       if (!isDup) {
         conversationEntries.push({
           id: ++entryIdCounter,
@@ -1962,6 +1970,8 @@ function handleStreamDone() {
         if (tail.length > 0) {
           console.log(`[stream] Final tail TTS (id=${entry.id}, cursor=${cursor}, tail=${tail.length} chars): "${tail.slice(0, 80)}"`);
           plog("final_entry_tts_tail", `id=${entry.id} "${tail.slice(0, 80)}" (${tail.length} chars)`);
+          // Mark cursor as fully covered so handleTtsDone knows this entry is complete
+          entryTtsCursor.set(entry.id, entry.text.length);
           currentTtsEntryId = entry.id;
           speakText(tail);
         } else {
@@ -3781,6 +3791,18 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Terminal backend: ${terminal.constructor.name}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);
   console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
+  // Initialize passive snapshot to current pane content BEFORE starting the watcher.
+  // Without this, lastPassiveSnapshot is "" on startup. If a spinner is detected on the
+  // first poll (Claude already working), the synthesized pre-snapshot may be incomplete,
+  // causing extractStructuredOutput to treat old scrollback content as "new" — flooding
+  // the conversation with duplicate entries from previous turns.
+  try {
+    const initialPane = captureTmuxPane();
+    if (initialPane) {
+      lastPassiveSnapshot = initialPane;
+      console.log(`  Passive snapshot initialized (${initialPane.split("\n").length} lines)`);
+    }
+  } catch {}
   startPassiveWatcher();
   console.log(`  Passive pane watcher: active (2s poll)`);
 });

@@ -4174,6 +4174,9 @@
 
       ws.onclose = () => {
         setHeaderState("disconnected", "Disconnected");
+        // Stop TTS playback on disconnect — prevents ttsPlaying from being stuck true
+        // after server restart, which blocks idle state and auto-listen on reconnect
+        stopTtsPlayback();
         reconnectTimer = setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, 30000); // Exponential backoff, max 30s
       };
