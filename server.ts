@@ -657,7 +657,22 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     if (!serviceStatus.kokoro) {
       console.error("Kokoro is not running — cannot speak");
       ttsInProgress = false;
-      broadcast({ type: "voice_status", state: "error", message: "Kokoro TTS not running" });
+      // Mark entry spoken so it doesn't block the pipeline
+      if (currentTtsEntryId != null) {
+        const failedEntry = conversationEntries.find(e => e.id === currentTtsEntryId);
+        if (failedEntry && !failedEntry.spoken) { failedEntry.spoken = true; }
+      }
+      // Drain queue in case Kokoro comes back for later items
+      if (ttsQueue.length > 0) {
+        const next = ttsQueue.shift()!;
+        const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+        ttsPregenPromises.shift();
+        currentTtsEntryId = nextEntryId;
+        speakText(next);
+      } else {
+        broadcast({ type: "voice_status", state: "error", message: "Kokoro TTS not running" });
+        broadcastIdleIfSafe();
+      }
       return;
     }
   }
@@ -699,6 +714,11 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       } else {
         console.error(`[tts] curl failed with code ${code} — giving up after ${TTS_MAX_RETRIES} retries`);
         ttsRetryCount = 0;
+        // Mark current entry spoken so pipeline doesn't stall
+        if (currentTtsEntryId != null) {
+          const failedEntry = conversationEntries.find(e => e.id === currentTtsEntryId);
+          if (failedEntry && !failedEntry.spoken) { failedEntry.spoken = true; }
+        }
         // Clear stuck queue so future TTS calls work when Kokoro recovers
         ttsQueue.splice(0, ttsQueue.length);
         ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
@@ -714,7 +734,23 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       console.error("[tts] Produced empty/missing file");
       ttsRetryCount = 0; // Reset retry counter on empty file (curl succeeded but output bad)
       ttsInProgress = false;
-      broadcastIdleIfSafe();
+      // Mark entry spoken so it doesn't stall the pipeline
+      if (currentTtsEntryId != null) {
+        const failedEntry = conversationEntries.find(e => e.id === currentTtsEntryId);
+        if (failedEntry && !failedEntry.spoken) { failedEntry.spoken = true; }
+      }
+      // Drain queue — next item may be valid
+      if (ttsQueue.length > 0) {
+        const next = ttsQueue.shift()!;
+        const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+        ttsPregenPromises.shift();
+        currentTtsEntryId = nextEntryId;
+        console.log(`[tts] Empty file — playing next in queue (${ttsQueue.length} remaining)`);
+        speakText(next);
+      } else {
+        broadcast({ type: "entry", entries: conversationEntries, partial: false });
+        broadcastIdleIfSafe();
+      }
       return;
     }
 
@@ -745,7 +781,20 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     if (myGen !== ttsGeneration) return;
     console.error("[tts] curl spawn error:", err.message);
     ttsInProgress = false;
-    broadcastIdleIfSafe();
+    // Mark entry spoken so pipeline doesn't stall
+    if (currentTtsEntryId != null) {
+      const failedEntry = conversationEntries.find(e => e.id === currentTtsEntryId);
+      if (failedEntry && !failedEntry.spoken) { failedEntry.spoken = true; }
+    }
+    if (ttsQueue.length > 0) {
+      const next = ttsQueue.shift()!;
+      const nextEntryId = ttsEntryIdQueue.shift() ?? null;
+      ttsPregenPromises.shift();
+      currentTtsEntryId = nextEntryId;
+      speakText(next);
+    } else {
+      broadcastIdleIfSafe();
+    }
   });
 }
 
@@ -1279,6 +1328,18 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) continue;
     // Session feedback prompts
     if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) continue;
+    // Claude Code ink TUI status indicators (garbled tmux capture of redrawn regions)
+    if (/@(code|ma)\b/.test(trimmed)) continue;
+    if (/→\s*·/.test(trimmed)) continue;
+    // Garbled TUI text detector: multiple 3+ space runs between short fragments = partial frame capture
+    if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) continue;
+    // High non-alpha ratio: >50% non-alphanumeric+space on short lines = UI chrome, not prose
+    if (trimmed.length > 0 && trimmed.length < 100) {
+      const alphaCount = (trimmed.match(/[a-zA-Z0-9]/g) || []).length;
+      if (alphaCount / trimmed.length < 0.4) continue;
+    }
+    // Lines containing multiple TUI keywords mashed together (garbled ink redraws)
+    { const tuiKws = ["expand", "bypass", "permiss", "interrupt", "tasks", "team", "@code", "@ma", "ions"]; const hits = tuiKws.filter(k => trimmed.toLowerCase().includes(k)); if (hits.length >= 2) continue; }
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
