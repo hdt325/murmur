@@ -373,7 +373,7 @@ function initSignalFiles() {
 // --- TTS Control ---
 
 function stopTts() {
-  stopClientPlayback2();
+  stopClientPlayback2("user_stop");
   if (process.platform !== "win32") {
     try {
       execSync("pkill -x afplay 2>/dev/null; pkill -x say 2>/dev/null", { stdio: "ignore", timeout: 3000 });
@@ -516,7 +516,24 @@ async function transcribeAudio(audioData: Buffer): Promise<string> {
 
 // --- TTS Text Cleaning ---
 
-let ttsGeneration = 0; // Bumped ONLY by stopClientPlayback2 on user interruption
+let ttsGeneration = 0; // Bumped ONLY via bumpGeneration() on user interruption
+
+interface GenerationEvent {
+  gen: number;
+  reason: "user_stop" | "voice_change" | "new_input" | "session_switch" | "client_disconnect";
+  ts: number;
+  entryId?: number;
+}
+
+const ttsGenerationLog: GenerationEvent[] = []; // ring buffer, last 20
+
+function bumpGeneration(reason: GenerationEvent["reason"], entryId?: number): void {
+  ttsGeneration++;
+  const event: GenerationEvent = { gen: ttsGeneration, reason, ts: Date.now(), entryId };
+  ttsGenerationLog.push(event);
+  if (ttsGenerationLog.length > 20) ttsGenerationLog.shift();
+  console.log(`[tts2] generation bumped to ${ttsGeneration} reason=${reason} entryId=${entryId ?? "none"}`);
+}
 
 // Clean raw text for TTS — strips code, URLs, markdown, etc.
 function cleanTtsText(text: string): string {
@@ -967,11 +984,10 @@ function handleTtsDone2(entryId: number | null): void {
 
 /**
  * Stop all TTS playback — called on user interruption (stop button, new input).
- * This is the ONLY place ttsGeneration is bumped.
+ * Generation is bumped via bumpGeneration() with a tagged reason.
  */
-function stopClientPlayback2(): void {
-  ttsGeneration++;
-  console.log(`[tts2] stopClientPlayback2 — generation now ${ttsGeneration}`);
+function stopClientPlayback2(reason: GenerationEvent["reason"] = "user_stop", entryId?: number): void {
+  bumpGeneration(reason, entryId);
 
   // Abort all in-flight Kokoro fetches
   for (const job of ttsJobQueue) {
@@ -2042,7 +2058,7 @@ function startTmuxStreaming(userInput: string, inputId?: string) {
   }
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   streamFileOffset = 0;
-  stopClientPlayback2(); // Stop any current TTS before new input
+  stopClientPlayback2("new_input"); // Stop any current TTS before new input
   entryTtsCursor.clear(); // Reset sentence cursor AFTER TTS stop to avoid re-speaking tail
 
   // Take snapshot BEFORE terminal.sendText is called — captures the clean prompt state
@@ -2389,7 +2405,7 @@ function startPassiveWatcher() {
         console.log("[passive] Interrupted prompt detected — ending stream");
         streamState = "DONE";
         lastStreamEndTime = Date.now();
-        stopClientPlayback2();
+        stopClientPlayback2("new_input");
         broadcast({ type: "voice_status", state: "idle" });
       }
     }
@@ -2469,7 +2485,7 @@ function startPassiveWatcher() {
         lastStreamActivity = Date.now();
         sawActivity = true;
         streamFileOffset = 0;
-        stopClientPlayback2();
+        stopClientPlayback2("new_input");
 
         try { writeFileSync(STREAM_FILE, ""); } catch {}
         terminal.startPipeStream(STREAM_FILE);
@@ -3396,7 +3412,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         saveSettings({ voice });
         // Stop in-flight TTS and flush queue so old voice doesn't keep playing
         if (ttsCurrentlyPlaying || ttsJobQueue.length > 0) {
-          stopClientPlayback2();
+          stopClientPlayback2("voice_change");
           console.log(`[voice] Switched to ${voice} — stopped TTS and flushed queue`);
         }
       } else if (voice) {
@@ -3447,7 +3463,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           .filter(e => e.role === "assistant" && e.speakable && e.text.trim());
         if (toReplay.length > 0) {
           console.log(`[replay:all] Replaying ${toReplay.length} assistant entries`);
-          stopClientPlayback2();
+          stopClientPlayback2("user_stop");
           broadcast({ type: "voice_status", state: "speaking" });
           for (const e of toReplay) {
             queueTts(e.id, e.text);
@@ -3484,7 +3500,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       }
       if (replayText) {
         console.log(`[replay] Speaking (${replayText.length} chars): "${replayText.slice(0, 80)}..."`);
-        stopClientPlayback2();
+        stopClientPlayback2("user_stop");
         broadcast({ type: "voice_status", state: "speaking" });
         queueTts(replayEntryId, replayText);
       } else {
@@ -3524,7 +3540,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         }
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
         // Reset status indicators for the new session
-        stopClientPlayback2();
+        stopClientPlayback2("session_switch");
         broadcast({ type: "voice_status", state: "idle" });
         broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
         broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
@@ -3851,7 +3867,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     );
     if (realClientsRemaining.length === 0 && (ttsJobQueue.length > 0 || ttsCurrentlyPlaying)) {
       console.log(`[tts2] Last client disconnected — flushing TTS queue (${ttsJobQueue.length} queued, playing=${!!ttsCurrentlyPlaying})`);
-      stopClientPlayback2();
+      stopClientPlayback2("client_disconnect");
     }
 
     // Auto-cleanup: remove entries created by this test client
@@ -3990,6 +4006,10 @@ app.get("/debug/tts-history", (_req, res) => {
 
 app.get("/debug/highlight-log", (_req, res) => {
   res.json([]); // Removed — highlight is now client-driven
+});
+
+app.get("/debug/generation-log", (_req, res) => {
+  res.json({ current: ttsGeneration, log: ttsGenerationLog });
 });
 
 app.get("/debug/entry-log", (_req, res) => {

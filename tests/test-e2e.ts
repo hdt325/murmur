@@ -17,7 +17,8 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import WebSocket from "ws";
 
-const BASE = "http://localhost:3457?testmode=1";
+const BASE_ORIGIN = "http://localhost:3457";
+const BASE = `${BASE_ORIGIN}?testmode=1`;
 const BASE_TEST = BASE; // kept for backward compatibility — both use testmode
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = join(__dirname, "screenshots", "e2e");
@@ -881,7 +882,7 @@ async function testHttpEndpoints() {
   let allOk = true;
   for (const path of endpoints) {
     try {
-      const res = await fetch(`${BASE}${path}`);
+      const res = await fetch(`${BASE_ORIGIN}${path}`);
       if (!res.ok) allOk = false;
       statuses.push(`${path}=${res.status}`);
     } catch {
@@ -893,17 +894,17 @@ async function testHttpEndpoints() {
 }
 
 async function testVersionEndpoint() {
-  const json = await (await fetch(`${BASE}/version`)).json();
+  const json = await (await fetch(`${BASE_ORIGIN}/version`)).json();
   report("/version returns numeric version", typeof json.version === "number", `version=${json.version}`);
 }
 
 async function testInfoEndpoint() {
-  const json = await (await fetch(`${BASE}/info`)).json();
+  const json = await (await fetch(`${BASE_ORIGIN}/info`)).json();
   report("/info returns tmux status", "tmuxAlive" in json, `tmuxAlive=${json.tmuxAlive}`);
 }
 
 async function testDebugEndpoint() {
-  const json = await (await fetch(`${BASE}/debug`)).json();
+  const json = await (await fetch(`${BASE_ORIGIN}/debug`)).json();
   report("/debug returns server state", "wsClients" in json && "streamState" in json,
     `wsClients=${json.wsClients}, streamState=${json.streamState}`);
 }
