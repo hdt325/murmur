@@ -3747,14 +3747,15 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       }
     }
 
-    // Last client disconnected — debounce exit message (5s) to avoid spam from rapid reconnects
-    // Guard: skip if the disconnecting client was a testmode connection (Playwright pages set
-    // _isTestMode via ?testmode=1 but not _isTestClient which requires explicit test:client msg)
-    if (clients.size === 0 && terminal.isSessionAlive() && !(ws as any)._isTestMode && !(ws as any)._isTestClient) {
+    // Possibly last real client disconnected — debounce exit message (5s).
+    // Don't check the LEAVING ws for test flags — the real leak happens when a non-test
+    // client disconnects as a side effect of test activity. Let the debounce timer make
+    // the real decision by checking remaining connected clients at fire time.
+    if (terminal.isSessionAlive()) {
       if (exitTimer) clearTimeout(exitTimer);
       exitTimer = setTimeout(() => {
         exitTimer = null;
-        // Recheck: only send if still no real (non-test) clients and not sent recently
+        // Only send if no real (non-test) clients remain and not sent recently
         const realClients = Array.from(clients).filter(
           c => c.readyState === WebSocket.OPEN && !(c as any)._isTestMode && !(c as any)._isTestClient
         );
