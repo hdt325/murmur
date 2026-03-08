@@ -745,7 +745,43 @@ function queueTts(entryId: number | null, text: string): void {
       j => j.entryId === entryId && j.state !== "done" && j.state !== "failed"
     );
     if (existing) {
-      console.log(`[tts2] Skipping duplicate queue for entry ${entryId} (job=${existing.jobId})`);
+      // If the new text is longer than what's already queued, the entry grew.
+      // Update the existing job's text so final audio covers the complete text.
+      if (speakableText.length > existing.speakableText.length) {
+        console.log(`[tts2] Entry ${entryId} text grew (${existing.speakableText.length}→${speakableText.length} chars) — updating job=${existing.jobId}`);
+        existing.fullText = text;
+        existing.speakableText = speakableText;
+        // If still pending/fetching, re-chunk and re-fetch
+        if (existing.state === "fetching") {
+          // Abort existing fetches
+          for (const chunk of existing.chunks) {
+            if (chunk.abortController) {
+              try { chunk.abortController.abort(); } catch {}
+              chunk.abortController = null;
+            }
+          }
+          const newChunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS);
+          existing.chunks = newChunkTexts.map((t, i) => ({
+            chunkIndex: i,
+            text: t,
+            wordCount: t.trim().split(/\s+/).length,
+            state: existing.mode === "local" ? "ready" as const : "pending" as const,
+            audioBuf: null,
+            abortController: null,
+          }));
+          existing.state = existing.mode === "local" ? "ready" : "fetching";
+          // Re-fire Kokoro fetches for new chunks
+          if (existing.mode === "kokoro") {
+            for (const chunk of existing.chunks) {
+              fetchKokoroAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
+                console.error(`[tts2] drainAudioBuffer error after re-fetch: ${(err as Error).message}`);
+              });
+            }
+          }
+        }
+      } else {
+        console.log(`[tts2] Skipping duplicate queue for entry ${entryId} (job=${existing.jobId})`);
+      }
       return;
     }
     if (ttsCurrentlyPlaying?.entryId === entryId) {
@@ -1929,13 +1965,14 @@ function broadcastCurrentOutput() {
         const spokenSoFar = entryTtsCursor.get(freshLast.id) ?? 0;
         const tail = freshLast.text.slice(spokenSoFar).trim();
         if (tail.length > 0) {
-          freshLast.spoken = true;
+          // Don't mark spoken=true here — handleStreamDone will catch any remaining text
+          // that arrives between now and stream end. Only update the cursor.
+          entryTtsCursor.set(freshLast.id, freshLast.text.length);
           console.log(`[stream] Entry tail TTS (id=${freshLast.id}, tail=${tail.length} chars): "${tail.slice(0, 80)}"`);
           plog("entry_tts_tail", `id=${freshLast.id} "${tail.slice(0, 80)}" (${tail.length} chars)`);
           queueTts(freshLast.id, tail);
-        } else {
-          freshLast.spoken = true; // All sentences already spoken mid-stream
         }
+        // Don't mark spoken=true — text may still grow during streaming
       }
     }, ENTRY_TTS_DELAY_MS);
   }
