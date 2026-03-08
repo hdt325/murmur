@@ -4688,6 +4688,11 @@
         existingSeps.add(el.dataset.turnSep);
       });
 
+      // Check once per render pass: is TTS pipeline still active?
+      // If so, unspoken entries are likely queued — don't mark as dropped (red).
+      const _ttsStillActive = _pendingHighlightEntryId != null
+          || document.querySelector(".entry-bubble.bubble-active");
+
       let lastTurn = null;
       entries.forEach((entry, i) => {
         // Insert turn separator between different turns
@@ -4797,9 +4802,13 @@
         // Mark speakable entries as dropped ONLY on final (non-partial) broadcast
         // when server confirms spoken=false — meaning TTS completed and skipped this entry.
         // Never mark during partial (streaming) since TTS hasn't had a chance yet.
+        // Also skip if TTS pipeline is still active (pending highlight or active bubble) —
+        // unspoken entries are likely queued for TTS, not dropped. They'll be marked
+        // dropped only after the entire TTS queue drains and they still haven't been spoken.
         if (!partial && entry.role === "assistant" && entry.speakable && !entry.spoken
             && !div.classList.contains("bubble-spoken") && !div.classList.contains("bubble-active")
-            && document.body.classList.contains("flow-mode")) {
+            && document.body.classList.contains("flow-mode")
+            && !_ttsStillActive) {
           div.classList.add("bubble-dropped");
         }
 

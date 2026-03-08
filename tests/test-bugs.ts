@@ -1262,6 +1262,239 @@ async function testFeature_tmuxSubmissionFix() {
 }
 
 // ──────────────────────────────────────────────────────────────
+// BUG-044: WebSocket rate limiting
+// ──────────────────────────────────────────────────────────────
+async function testBug44_wsRateLimit() {
+  console.log("\n[BUG-044] WebSocket rate limiting");
+
+  // Open a raw WebSocket and send 150 rapid messages (limit is 100/sec)
+  const result = await page.evaluate(async () => {
+    return new Promise<{ sent: number; connOpen: boolean }>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:3457?testmode=1`);
+      ws.onopen = () => {
+        let sent = 0;
+        // Send 150 messages as fast as possible
+        for (let i = 0; i < 150; i++) {
+          try {
+            ws.send(`log:rate-test-${i}`);
+            sent++;
+          } catch { break; }
+        }
+        // Check connection is still open after flood
+        setTimeout(() => {
+          const connOpen = ws.readyState === WebSocket.OPEN;
+          ws.close();
+          resolve({ sent, connOpen });
+        }, 200);
+      };
+      ws.onerror = () => resolve({ sent: 0, connOpen: false });
+      // Timeout safety
+      setTimeout(() => resolve({ sent: 0, connOpen: false }), 3000);
+    });
+  });
+
+  report(
+    "Server accepts rapid messages without crashing",
+    result.sent === 150 && result.connOpen,
+    `sent=${result.sent}, connOpen=${result.connOpen}`
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
+// TASK-22: Test suite must not leak into live CLI (all test files use testmode)
+// ──────────────────────────────────────────────────────────────
+async function testTask22_testmodeEnforcement() {
+  console.log("\n[TASK-22] All test files use testmode");
+
+  // Verify test-e2e.ts BASE includes testmode=1
+  const fs = await import("fs");
+  const e2eSrc = fs.readFileSync("tests/test-e2e.ts", "utf-8");
+  const baseMatch = e2eSrc.match(/const BASE\s*=\s*"([^"]+)"/);
+  const baseHasTestmode = baseMatch ? baseMatch[1].includes("testmode=1") : false;
+
+  report(
+    "test-e2e.ts BASE URL includes testmode=1",
+    baseHasTestmode,
+    `BASE="${baseMatch?.[1] || "not found"}"`
+  );
+
+  // Verify all test files have testmode in BASE
+  const testFiles = ["test-smoke.ts", "test-flow.ts", "test-bugs.ts", "test-e2e.ts"];
+  let allGood = true;
+  for (const f of testFiles) {
+    try {
+      const src = fs.readFileSync(`tests/${f}`, "utf-8");
+      const m = src.match(/const BASE\s*=\s*"([^"]+)"/);
+      if (m && !m[1].includes("testmode=1")) {
+        allGood = false;
+        console.log(`    ${f}: BASE="${m[1]}" — MISSING testmode=1`);
+      }
+    } catch {}
+  }
+
+  report(
+    "All test files have testmode=1 in BASE URL",
+    allGood
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-A: Duplicate user bubble — whitespace normalization in dedup
+// ──────────────────────────────────────────────────────────────
+async function testBugA_userEntryWhitespaceDedup() {
+  console.log("\n[BUG-A] User entry whitespace dedup");
+
+  // Fresh page + reset to avoid stale entries from prior tests
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
+  await page.goto(BASE, { waitUntil: "networkidle" });
+  await page.waitForTimeout(500);
+
+  // Reset server entries and wait for broadcast
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("test:reset-entries");
+  });
+  await page.waitForTimeout(500);
+
+  // Verify clean slate
+  const before = await page.evaluate(() =>
+    document.querySelectorAll(".entry-bubble.user").length
+  );
+
+  // Send first text with newlines (simulating tmux capture)
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("text:broken and\nneeds fixing");
+  });
+  await page.waitForTimeout(500);
+
+  // Send same text with spaces (simulating STT result)
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("text:broken and  needs fixing");
+  });
+  await page.waitForTimeout(500);
+
+  // Count user entry bubbles — should be 1 more than before, not 2
+  const after = await page.evaluate(() =>
+    document.querySelectorAll(".entry-bubble.user").length
+  );
+
+  report(
+    "Same speech with different whitespace creates only 1 entry",
+    after - before === 1,
+    `before=${before}, after=${after}, diff=${after - before} (expected 1)`
+  );
+
+  // Cleanup
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send("test:reset-entries");
+  });
+  await page.waitForTimeout(200);
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-C: Red text / highlight flicker — bubble-dropped not applied while TTS active
+// ──────────────────────────────────────────────────────────────
+async function testBugC_noBubbleDroppedDuringTts() {
+  console.log("\n[BUG-C] No bubble-dropped while TTS pipeline active");
+
+  // Switch to flow mode for this test
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "1"));
+  await page.goto(BASE, { waitUntil: "networkidle" });
+  await page.waitForTimeout(1000);
+
+  // Reset entries first
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === 1) ws.send("test:reset-entries");
+  });
+  await page.waitForTimeout(300);
+
+  // Set _pendingHighlightEntryId to simulate TTS pipeline being active.
+  // This is the variable renderEntries checks in _ttsStillActive.
+  // We set it BEFORE injecting entries so it's present when renderEntries runs.
+  await page.evaluate(() => {
+    if ((window as any).__murmur) {
+      (window as any).__murmur.pendingHighlightEntryId = 999;
+    }
+  });
+
+  // Inject unspoken entries — renderEntries will run with _ttsStillActive = true
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === 1) {
+      ws.send("test:entries-mixed:" + JSON.stringify([
+        { text: "First paragraph spoken.", spoken: false, speakable: true },
+        { text: "Second paragraph queued.", spoken: false, speakable: true },
+        { text: "Third paragraph queued.", spoken: false, speakable: true },
+      ]));
+    }
+  });
+  await page.waitForTimeout(500);
+
+  const droppedCount = await page.evaluate(() =>
+    document.querySelectorAll(".entry-bubble.bubble-dropped").length
+  );
+
+  report(
+    "Unspoken entries not marked dropped while TTS highlight pending",
+    droppedCount === 0,
+    `dropped=${droppedCount} (expected 0)`
+  );
+
+  // Cleanup: clear pending highlight and entries
+  await page.evaluate(() => {
+    if ((window as any).__murmur) {
+      (window as any).__murmur.pendingHighlightEntryId = null;
+    }
+    const ws = (window as any)._ws;
+    if (ws && ws.readyState === 1) ws.send("test:reset-entries");
+  });
+  await page.waitForTimeout(200);
+
+  // Restore normal mode
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
+  await page.goto(BASE, { waitUntil: "networkidle" });
+  await page.waitForTimeout(500);
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-B: Double TTS drain — rapid tts_done within ms should be deduplicated
+// ──────────────────────────────────────────────────────────────
+async function testBugB_doubleTtsDrain() {
+  console.log("\n[BUG-B] Double tts_done deduplication");
+
+  // Send two tts_done messages rapidly via raw WebSocket (simulating duplicate client callback)
+  const result = await page.evaluate(async () => {
+    return new Promise<{ sent: boolean }>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:3457?testmode=1`);
+      ws.onopen = () => {
+        // Send two tts_done messages 5ms apart
+        ws.send("tts_done");
+        setTimeout(() => {
+          ws.send("tts_done");
+          setTimeout(() => {
+            const connOpen = ws.readyState === WebSocket.OPEN;
+            ws.close();
+            resolve({ sent: connOpen });
+          }, 100);
+        }, 5);
+      };
+      ws.onerror = () => resolve({ sent: false });
+      setTimeout(() => resolve({ sent: false }), 3000);
+    });
+  });
+
+  report(
+    "Server handles rapid duplicate tts_done without crashing",
+    result.sent,
+    `connection stayed open: ${result.sent}`
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
 // Main
 // ──────────────────────────────────────────────────────────────
 async function main() {
@@ -1323,6 +1556,13 @@ async function main() {
 
   // Session 4 features (new)
   await testFeature_tmuxSubmissionFix();
+
+  // Bug fixes
+  await testBug44_wsRateLimit();
+  await testTask22_testmodeEnforcement();
+  await testBugA_userEntryWhitespaceDedup();
+  await testBugB_doubleTtsDrain();
+  await testBugC_noBubbleDroppedDuringTts();
 
   await teardown();
 }

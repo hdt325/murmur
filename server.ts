@@ -462,6 +462,7 @@ let ttsGeneration = 0;
 let ttsClientTimeout: ReturnType<typeof setTimeout> | null = null;
 let ttsInProgress = false;
 let ttsActiveGen = 0; // Generation of the audio currently playing on client
+let _lastTtsDrainTs = 0; // Timestamp of last handleTtsDone drain (double-drain guard)
 let ttsQueue: string[] = []; // Queue of texts waiting to be spoken
 let ttsEntryIdQueue: (number | null)[] = []; // Entry IDs corresponding to queued texts
 let ttsRetryCount = 0;
@@ -817,7 +818,15 @@ function handleTtsDone() {
     console.log(`[tts] Ignoring stale tts_done (active=${ttsActiveGen} current=${ttsGeneration})`);
     return;
   }
-  // Prevent double-drain: timeout + late client tts_done for the same chunk.
+  // Prevent double-drain: client can send tts_done twice within ms (onended + fallback).
+  // After the first drain triggers speakText() → new ttsActiveGen, the second tts_done
+  // would pass the stale check and drain the NEXT item prematurely.
+  const now = Date.now();
+  if (now - _lastTtsDrainTs < 50) {
+    console.log(`[tts] Ignoring duplicate tts_done (${now - _lastTtsDrainTs}ms since last drain)`);
+    return;
+  }
+  _lastTtsDrainTs = now;
   // Bump activeGen so the second call fails the stale check above.
   const drainGen = ttsActiveGen;
   ttsActiveGen = -1; // Invalidate — next speakText will set it fresh
@@ -884,13 +893,10 @@ function handleTtsDone() {
     return;
   }
 
-  // Clear TTS highlight when nothing left to speak
-  currentTtsEntryId = null;
-  broadcast({ type: "tts_highlight", entryId: null });
-
-  // Before going idle, check for any unspoken entries from the current turn.
+  // Before clearing highlight, check for any unspoken entries from the current turn.
   // These may have been created after the TTS queue was built (e.g. late paragraphs
   // from extractStructuredOutput that arrived after the initial queue was populated).
+  // Must check BEFORE sending tts_highlight:null to avoid null→real flicker.
   const unspoken = conversationEntries.filter(
     e => e.role === "assistant" && e.turn === currentTurn && e.speakable && !e.spoken
   );
@@ -903,6 +909,10 @@ function handleTtsDone() {
     }
     return;
   }
+
+  // Clear TTS highlight — nothing left to speak
+  currentTtsEntryId = null;
+  broadcast({ type: "tts_highlight", entryId: null });
 
   // If stream is still active but nothing queued, broadcast idle so client can listen
   // The stream may produce more TTS later which will re-trigger speaking state
@@ -1254,9 +1264,11 @@ function addUserEntry(text: string, queued = false) {
   }
   // Dedup: skip if an identical user entry already exists in the current or recent turn
   // (prevents passive watcher re-adding text that was already added by text:/voice handler)
-  const normalized = text.trim().toLowerCase();
+  // Normalize whitespace: collapse \n, \r, and multiple spaces to single space
+  // (tmux preserves newlines, STT returns spaces — same speech, different whitespace)
+  const normalized = text.trim().toLowerCase().replace(/[\s]+/g, " ");
   const recent = conversationEntries.filter(e => e.role === "user" && e.turn >= currentTurn - 1);
-  const dup = recent.find(e => e.text.trim().toLowerCase() === normalized);
+  const dup = recent.find(e => e.text.trim().toLowerCase().replace(/[\s]+/g, " ") === normalized);
   if (dup) {
     console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}"`);
     return dup;
@@ -2911,8 +2923,28 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   // Pre-buffer: WAV audio captured before recording started (speech onset)
   let pendingPreBuffer: Buffer | null = null;
 
+  // Rate limiting: max 100 text messages per second per client (binary audio exempt)
+  let _rateMsgCount = 0;
+  let _rateWindowStart = Date.now();
+  const RATE_LIMIT_MAX = 100;
+  const RATE_LIMIT_WINDOW_MS = 1000;
+
   ws.on("message", async (raw, isBinary) => {
     wslog("in", isBinary ? "binary" : (raw.toString().split(":")[0] || "unknown"), isBinary ? (raw as Buffer).length : raw.toString().length);
+
+    // Rate limit text messages (binary audio is exempt)
+    if (!isBinary) {
+      const now = Date.now();
+      if (now - _rateWindowStart > RATE_LIMIT_WINDOW_MS) {
+        _rateMsgCount = 0;
+        _rateWindowStart = now;
+      }
+      _rateMsgCount++;
+      if (_rateMsgCount > RATE_LIMIT_MAX) {
+        wslog("in", "rate-limited", _rateMsgCount);
+        return;
+      }
+    }
     // Binary message = audio data to transcribe
     if (isBinary) {
       const audioData = raw as Buffer;

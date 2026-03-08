@@ -17,8 +17,8 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import WebSocket from "ws";
 
-const BASE = "http://localhost:3457";
-const BASE_TEST = "http://localhost:3457/?testmode=1"; // text input blocked from reaching Claude
+const BASE = "http://localhost:3457?testmode=1";
+const BASE_TEST = BASE; // kept for backward compatibility — both use testmode
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = join(__dirname, "screenshots", "e2e");
 const HEADLESS = process.env.HEADLESS === "1";
@@ -82,7 +82,9 @@ async function setup() {
   });
   page = await ctx.newPage();
   // Default to normal mode — flow mode tests explicitly enable it
-  await page.goto(BASE, { waitUntil: "domcontentloaded" });
+  // MUST use BASE_TEST (with ?testmode=1) to prevent test WS connections from
+  // forwarding text to the live Claude CLI session (BUG-003 / Task #22)
+  await page.goto(BASE_TEST, { waitUntil: "domcontentloaded" });
   await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
 }
 
