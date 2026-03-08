@@ -603,12 +603,10 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     ttsPregenPromises.splice(0, ttsPregenPromises.length);
   }
 
-  // Broadcast highlight + speakable text for the entry we're about to speak.
-  // The client uses the speakable text (not raw entry text) for word-by-word highlighting.
-  if (currentTtsEntryId != null) {
-    broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: text });
-    hllog(currentTtsEntryId, text);
-  }
+  // NOTE: tts_highlight is deferred to AFTER audio is successfully generated.
+  // Previously it was broadcast here (before curl), so failed TTS still lit up bubbles.
+  // Now it's sent in the Kokoro success path and the local TTS path only.
+  const _highlightText = text; // Capture for use in async curl callback
   ttslog(currentTtsEntryId, text, ttsGeneration + 1, "speakText");
 
   // Cancel any current TTS (generation counter ensures old callbacks are discarded)
@@ -668,6 +666,11 @@ async function speakText(text: string, interrupt = false): Promise<void> {
       plog("tts_local", `"${ttsText.slice(0, 100)}" (${ttsText.length} chars)`);
       slog("tts", "local", { chars: ttsText.length, text: ttsText.slice(0, 80) });
       console.log(`[tts] Local TTS (${ttsText.length} chars) — sending text to audio client`);
+      // Highlight on local TTS send (client will play it)
+      if (currentTtsEntryId != null) {
+        broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: _highlightText });
+        hllog(currentTtsEntryId, _highlightText);
+      }
       ttsActiveGen = myGen;
       _playingTtsEntryId = currentTtsEntryId;
       sendToAudioClient({ type: "local_tts", text: ttsText, entryId: currentTtsEntryId });
@@ -723,6 +726,10 @@ async function speakText(text: string, interrupt = false): Promise<void> {
         currentTtsEntryId = nextEntryId;
         speakText(next);
       } else {
+        // Clear highlight — Kokoro is down, nothing will play
+        currentTtsEntryId = null;
+        broadcast({ type: "tts_highlight", entryId: null });
+        hllog(null);
         broadcast({ type: "voice_status", state: "error", message: "Kokoro TTS not running" });
         broadcastIdleIfSafe();
       }
@@ -777,6 +784,10 @@ async function speakText(text: string, interrupt = false): Promise<void> {
         ttsEntryIdQueue.splice(0, ttsEntryIdQueue.length);
         ttsPregenPromises.splice(0, ttsPregenPromises.length);
         serviceStatus.kokoro = false; // Force re-check on next call
+        // Clear any stale highlight — TTS failed, nothing is playing
+        currentTtsEntryId = null;
+        broadcast({ type: "tts_highlight", entryId: null });
+        hllog(null);
         broadcastIdleIfSafe();
       }
       return;
@@ -814,6 +825,11 @@ async function speakText(text: string, interrupt = false): Promise<void> {
     console.log(`[tts] Streaming ${audioData.length} bytes to ${clients.size} clients`);
     plog("tts_audio_sent", `${audioData.length} bytes`);
     slog("tts", "sent", { bytes: audioData.length, durationMs: Date.now() - ttsStartTime });
+    // Highlight ONLY on success — deferred from pre-curl to avoid ghost highlights on failure
+    if (currentTtsEntryId != null) {
+      broadcast({ type: "tts_highlight", entryId: currentTtsEntryId, speakableText: _highlightText });
+      hllog(currentTtsEntryId, _highlightText);
+    }
     ttsActiveGen = myGen;
     _playingTtsEntryId = currentTtsEntryId;
     broadcastBinary(audioData);
