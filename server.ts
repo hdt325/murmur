@@ -3747,11 +3747,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       }
     }
 
-    // Possibly last real client disconnected — debounce exit message (5s).
+    // Possibly last real client disconnected — debounce exit message.
+    // Use 15s debounce to survive reconnect exponential backoff (starts ~1s, doubles to 30s max).
     // Don't check the LEAVING ws for test flags — the real leak happens when a non-test
     // client disconnects as a side effect of test activity. Let the debounce timer make
     // the real decision by checking remaining connected clients at fire time.
-    if (terminal.isSessionAlive()) {
+    if (terminal.isSessionAlive() && contextSent) {
       if (exitTimer) clearTimeout(exitTimer);
       exitTimer = setTimeout(() => {
         exitTimer = null;
@@ -3765,7 +3766,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           exitSentAt = Date.now();
           console.log("[context] Sent Murmur exit message to Claude");
         }
-      }, 5000);
+      }, 15000);
     }
   });
 }

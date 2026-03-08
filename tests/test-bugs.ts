@@ -1406,20 +1406,15 @@ async function testTask9_flushQueue() {
 async function testBugA_userEntryWhitespaceDedup() {
   console.log("\n[BUG-A] User entry whitespace dedup");
 
-  // Fresh page + reset to avoid stale entries from prior tests
-  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
-  await page.goto(BASE, { waitUntil: "networkidle" });
-  await page.waitForTimeout(500);
-
-  // Reset server entries and wait for broadcast
-  await page.evaluate(() => {
-    const ws = (window as any)._ws;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send("test:clear-entries");
-  });
-  await page.waitForTimeout(500);
-
-  // Use a unique test phrase to avoid passive watcher contamination
+  // Use a unique test phrase to avoid contamination from live session or prior test runs
   const testPhrase = `dedup-test-${Date.now()}`;
+
+  // Get server entry count before test
+  const beforeCount = await page.evaluate(async () => {
+    const resp = await fetch("http://localhost:3457/api/state");
+    const state = await resp.json();
+    return state.entryCount as number;
+  });
 
   // Send first text with newlines (simulating tmux capture)
   await page.evaluate((phrase) => {
@@ -1435,21 +1430,21 @@ async function testBugA_userEntryWhitespaceDedup() {
   }, testPhrase);
   await page.waitForTimeout(500);
 
-  // Count user entry bubbles containing our unique test phrase — should be exactly 1
-  const matchCount = await page.evaluate((phrase) => {
-    const bubbles = document.querySelectorAll(".entry-bubble.user");
-    let count = 0;
-    bubbles.forEach(b => { if (b.textContent?.includes(phrase)) count++; });
-    return count;
-  }, testPhrase);
+  // Check server-side entry count — should have increased by exactly 1 (dedup caught the second)
+  const afterCount = await page.evaluate(async () => {
+    const resp = await fetch("http://localhost:3457/api/state");
+    const state = await resp.json();
+    return state.entryCount as number;
+  });
 
+  const diff = afterCount - beforeCount;
   report(
     "Same speech with different whitespace creates only 1 entry",
-    matchCount === 1,
-    `entries with test phrase: ${matchCount} (expected 1)`
+    diff === 1,
+    `server entries before=${beforeCount} after=${afterCount} diff=${diff} (expected 1)`
   );
 
-  // Cleanup
+  // Cleanup: remove the test entry via test:clear-entries
   await page.evaluate(() => {
     const ws = (window as any)._ws;
     if (ws && ws.readyState === WebSocket.OPEN) ws.send("test:clear-entries");
@@ -1468,54 +1463,43 @@ async function testBugC_noBubbleDroppedDuringTts() {
   await page.goto(BASE, { waitUntil: "networkidle" });
   await page.waitForTimeout(1000);
 
-  // Reset entries first
-  await page.evaluate(() => {
-    const ws = (window as any)._ws;
-    if (ws && ws.readyState === 1) ws.send("test:clear-entries");
-  });
-  await page.waitForTimeout(300);
+  // Test renderEntries directly to avoid race with server tts_stop broadcasts
+  // (passive watcher can send tts_stop between setting pendingHighlightEntryId and
+  // the server's entry broadcast arriving, clearing the ID and causing false drops)
+  const droppedCount = await page.evaluate(() => {
+    const murmur = (window as any).__murmur;
+    if (!murmur) return -1;
 
-  // Set _pendingHighlightEntryId to simulate TTS pipeline being active.
-  // This is the variable renderEntries checks in _ttsStillActive.
-  // We set it BEFORE injecting entries so it's present when renderEntries runs.
-  await page.evaluate(() => {
-    if ((window as any).__murmur) {
-      (window as any).__murmur.pendingHighlightEntryId = 999;
-    }
-  });
+    // Set pending highlight ID to simulate TTS pipeline being active
+    murmur.pendingHighlightEntryId = 999;
 
-  // Inject unspoken entries — renderEntries will run with _ttsStillActive = true
-  await page.evaluate(() => {
-    const ws = (window as any)._ws;
-    if (ws && ws.readyState === 1) {
-      ws.send("test:entries-mixed:" + JSON.stringify([
-        { text: "First paragraph spoken.", spoken: false, speakable: true },
-        { text: "Second paragraph queued.", spoken: false, speakable: true },
-        { text: "Third paragraph queued.", spoken: false, speakable: true },
-      ]));
-    }
-  });
-  await page.waitForTimeout(500);
+    // Build mock entries matching what test:entries-mixed would create
+    const mockEntries = [
+      { id: 9001, role: "assistant", text: "First paragraph spoken.", spoken: false, speakable: true, turn: 99, ts: Date.now() },
+      { id: 9002, role: "assistant", text: "Second paragraph queued.", spoken: false, speakable: true, turn: 99, ts: Date.now() },
+      { id: 9003, role: "assistant", text: "Third paragraph queued.", spoken: false, speakable: true, turn: 99, ts: Date.now() },
+    ];
 
-  const droppedCount = await page.evaluate(() =>
-    document.querySelectorAll(".entry-bubble.bubble-dropped").length
-  );
+    // Call renderEntries directly — no WS roundtrip, no race
+    murmur.renderEntries(mockEntries, false);
+
+    const dropped = document.querySelectorAll(".entry-bubble.bubble-dropped").length;
+
+    // Cleanup: clear pending highlight and remove mock entries
+    murmur.pendingHighlightEntryId = null;
+    document.querySelectorAll('.entry-bubble[data-entry-id="9001"], .entry-bubble[data-entry-id="9002"], .entry-bubble[data-entry-id="9003"]').forEach(el => {
+      const wrap = el.closest(".msg-wrap");
+      if (wrap) wrap.remove(); else el.remove();
+    });
+
+    return dropped;
+  });
 
   report(
     "Unspoken entries not marked dropped while TTS highlight pending",
     droppedCount === 0,
     `dropped=${droppedCount} (expected 0)`
   );
-
-  // Cleanup: clear pending highlight and entries
-  await page.evaluate(() => {
-    if ((window as any).__murmur) {
-      (window as any).__murmur.pendingHighlightEntryId = null;
-    }
-    const ws = (window as any)._ws;
-    if (ws && ws.readyState === 1) ws.send("test:clear-entries");
-  });
-  await page.waitForTimeout(200);
 
   // Restore normal mode
   await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
@@ -1683,94 +1667,56 @@ async function testBug80_noExitOnTestDisconnect() {
 async function testTask13_thinkModeSilenceTolerance() {
   console.log("\n[TASK-13] Think mode uses silence tolerance, not hard timer");
 
-  // Verify via DOM inspection that the think mode implementation uses
-  // silence-based detection (checking RMS energy) rather than a hard countdown.
-  // The startThinkCountdown function should contain silence detection logic.
-
+  // Scan all inline script content for startThinkCountdown patterns.
+  // Use substring search on the full page source rather than fragile regex extraction.
   const result = await page.evaluate(() => {
-    // Check that the startThinkCountdown function source contains silence detection
-    // by inspecting the function body via toString()
-    const scripts = document.querySelectorAll("script");
-    let found = false;
-    let hasSilenceDetection = false;
-    let hasNoHardTimeout = true;
-    let hasRmsCheck = false;
-    let labelUpdated = false;
+    // Collect all inline script content
+    let allSrc = "";
+    document.querySelectorAll("script").forEach(s => { allSrc += (s.textContent || ""); });
 
-    for (const script of scripts) {
-      const src = script.textContent || "";
-      if (src.includes("startThinkCountdown")) {
-        found = true;
+    const found = allSrc.includes("startThinkCountdown");
 
-        // Extract the startThinkCountdown function body
-        const fnMatch = src.match(/function startThinkCountdown\(\)\s*\{[\s\S]*?(?=\n    function )/);
-        if (fnMatch) {
-          const fnBody = fnMatch[0];
-          // Should contain RMS energy checking (silence detection)
-          hasRmsCheck = fnBody.includes("micAnalyser") && fnBody.includes("rms");
-          // Should contain silence threshold comparison
-          hasSilenceDetection = fnBody.includes("silenceThreshold") || fnBody.includes("thinkSilenceStart");
-          // Should NOT have a hard setTimeout with thinkTimeout * 1000 as total duration
-          // (the old pattern was: setTimeout(() => stopRecording(), thinkTimeout * 1000 + 500))
-          hasNoHardTimeout = !fnBody.includes("thinkTimeout * 1000 + 500");
-          // Label should show remaining silence time, not total time
-          labelUpdated = fnBody.includes("remaining") || fnBody.includes("silentMs");
-        }
-        break;
-      }
-    }
+    // Find the section between startThinkCountdown and stopThinkCountdown
+    const startIdx = allSrc.indexOf("function startThinkCountdown");
+    const endIdx = allSrc.indexOf("function stopThinkCountdown");
+    const fnBody = (startIdx >= 0 && endIdx > startIdx) ? allSrc.slice(startIdx, endIdx) : "";
 
-    return { found, hasSilenceDetection, hasRmsCheck, hasNoHardTimeout, labelUpdated };
+    return {
+      found,
+      fnBodyLength: fnBody.length,
+      // Should contain RMS energy checking (silence detection)
+      hasRmsCheck: fnBody.includes("micAnalyser") && fnBody.includes("rms"),
+      // Should contain silence threshold comparison
+      hasSilenceDetection: fnBody.includes("silenceThreshold") || fnBody.includes("thinkSilenceStart"),
+      // Should NOT have a hard setTimeout with thinkTimeout * 1000 as total duration
+      hasNoHardTimeout: !fnBody.includes("thinkTimeout * 1000 + 500"),
+      // Label should show remaining silence time
+      hasLabel: fnBody.includes("remaining") || fnBody.includes("silentMs"),
+    };
   });
 
-  report(
-    "startThinkCountdown function exists",
-    result.found,
-    ""
-  );
+  report("startThinkCountdown function exists", result.found, `bodyLen=${result.fnBodyLength}`);
+  report("Think mode uses RMS energy checking for silence detection", result.hasRmsCheck, "");
+  report("Think mode detects silence via threshold comparison", result.hasSilenceDetection, "");
+  report("No hard timeout cap on total recording duration", result.hasNoHardTimeout, "");
 
-  report(
-    "Think mode uses RMS energy checking for silence detection",
-    result.hasRmsCheck,
-    result.hasRmsCheck ? "" : "Should check micAnalyser RMS, not use hard timer"
-  );
-
-  report(
-    "Think mode detects silence via threshold comparison",
-    result.hasSilenceDetection,
-    result.hasSilenceDetection ? "" : "Should track silence start time and compare against threshold"
-  );
-
-  report(
-    "No hard timeout cap on total recording duration",
-    result.hasNoHardTimeout,
-    result.hasNoHardTimeout ? "" : "Found hard timeout pattern — timer should be silence-based only"
-  );
-
-  // Check the settings UI label says "Silence timeout" not "Max duration"
-  const settingsLabel = await page.evaluate(() => {
+  // Check settings UI labels
+  const uiResult = await page.evaluate(() => {
     const row = document.getElementById("thinkTimeoutRow");
-    if (!row) return null;
-    const label = row.querySelector(".settings-label");
-    return label?.textContent || null;
+    const label = row?.querySelector(".settings-label")?.textContent || null;
+    const desc = document.getElementById("thinkModeDesc")?.textContent || null;
+    return { label, desc };
   });
 
   report(
-    "Settings UI shows 'Silence timeout' label (not 'Max duration')",
-    settingsLabel === "Silence timeout",
-    `label="${settingsLabel}"`
+    "Settings UI shows 'Silence timeout' label",
+    uiResult.label === "Silence timeout",
+    `label="${uiResult.label}"`
   );
-
-  // Check the description text
-  const desc = await page.evaluate(() => {
-    const el = document.getElementById("thinkModeDesc");
-    return el?.textContent || null;
-  });
-
   report(
     "Think mode description mentions silence-based behavior",
-    desc != null && desc.includes("silence"),
-    `desc="${desc}"`
+    uiResult.desc != null && uiResult.desc.includes("silence"),
+    `desc="${uiResult.desc}"`
   );
 }
 
