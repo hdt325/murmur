@@ -789,6 +789,10 @@
     body.flow-mode .msg.assistant .tts-word-spoken {
       color: #1a1a1e !important;
     }
+    body.flow-mode .msg.assistant .tts-word-dropped {
+      color: #c0392b !important;
+      opacity: 0.7 !important;
+    }
 
     /* Talk button: normal flow — handles its own bottom safe area */
     body.flow-mode .talk-bar {
@@ -4391,7 +4395,7 @@
         if (msg.type === "entry") {
           removeThinkingBubble();
           emptyState.style.display = "none";
-          renderEntries(msg.entries, msg.partial);
+          renderEntries(msg.entries, msg.partial, msg.ttsPendingIds || []);
         }
 
         // Tool call status — show current tool during thinking/responding
@@ -4799,7 +4803,8 @@
     // =============================================
     let _prevUserEntryIds = new Set(); // Track user entry IDs to detect genuinely new entries
 
-    function renderEntries(entries, partial) {
+    function renderEntries(entries, partial, ttsPendingIds) {
+      const _ttsPendingSet = new Set(ttsPendingIds || []);
       // Clear legacy history bubbles (from restoreHistory/addMessage) that lack entry-bubble class.
       // The entry system is the single source of truth — legacy bubbles cause duplicates.
       transcript.querySelectorAll(".msg:not(.entry-bubble)").forEach(el => {
@@ -4853,7 +4858,7 @@
           const newText = entryTextToHtml(entry.text);
           const hasActiveWordSpans = document.body.classList.contains("flow-mode") &&
             (div.classList.contains("bubble-active") || div.classList.contains("bubble-spoken")) &&
-            textEl && textEl.querySelector(".tts-word, .tts-word-spoken");
+            textEl && textEl.querySelector(".tts-word, .tts-word-spoken, .tts-word-dropped");
           if (textEl && textEl.innerHTML !== newText && !hasActiveWordSpans) {
             textEl.innerHTML = newText;
           }
@@ -4933,17 +4938,33 @@
         // Don't un-gray entries that were already spoken client-side
         // (server may re-broadcast with spoken:false during streaming updates)
 
-        // Mark speakable entries as dropped ONLY on final (non-partial) broadcast
-        // when server confirms spoken=false — meaning TTS completed and skipped this entry.
-        // Never mark during partial (streaming) since TTS hasn't had a chance yet.
-        // Also skip if TTS pipeline is still active (pending highlight or active bubble) —
-        // unspoken entries are likely queued for TTS, not dropped. They'll be marked
-        // dropped only after the entire TTS queue drains and they still haven't been spoken.
+        // Mark speakable entries as dropped ONLY when TTS has genuinely FAILED for them:
+        // - Non-partial (final) broadcast, server confirms spoken=false
+        // - Entry has NO pending TTS job (not in ttsPendingIds from server)
+        // - TTS pipeline is not globally active
+        // Red (dropped) = failure indicator, not a pending state.
+        const entryHasPendingTts = _ttsPendingSet.has(entry.id);
         if (!partial && entry.role === "assistant" && entry.speakable && !entry.spoken
             && !div.classList.contains("bubble-spoken") && !div.classList.contains("bubble-active")
             && document.body.classList.contains("flow-mode")
-            && !_ttsStillActive) {
+            && !_ttsStillActive && !entryHasPendingTts) {
           div.classList.add("bubble-dropped");
+        }
+
+        // Grey pending state: if entry has TTS in flight (fetching/ready), show word
+        // spans as grey immediately so user knows audio is coming.
+        if (entry.role === "assistant" && entry.speakable && !entry.spoken
+            && entryHasPendingTts
+            && document.body.classList.contains("flow-mode")
+            && !div.classList.contains("bubble-active") && !div.classList.contains("bubble-spoken")) {
+          const textEl = div.querySelector(".entry-text");
+          if (textEl && !textEl.querySelector(".tts-word, .tts-word-spoken, .tts-word-dropped")) {
+            // Wrap words in grey spans to show pending state
+            const words = entry.text.trim().split(/\s+/).filter(Boolean);
+            if (words.length > 0) {
+              textEl.innerHTML = words.map(w => '<span class="tts-word">' + escHtml(w) + '</span>').join(" ");
+            }
+          }
         }
 
         // Partial opacity on last entry when streaming
@@ -5017,10 +5038,11 @@
       if (_flowWordTimer) {
         clearTimeout(_flowWordTimer);
         _flowWordTimer = null;
-        // Upgrade any remaining grey spans so words don't stay dim after animation is interrupted
+        // Mark remaining grey (unspoken) words as dropped (red) — they were never spoken.
+        // Only words that were highlighted during playback should be black (tts-word-spoken).
         if (_flowActiveEl) {
           _flowActiveEl.querySelectorAll(".tts-word").forEach(function (s) {
-            s.classList.replace("tts-word", "tts-word-spoken");
+            s.classList.replace("tts-word", "tts-word-dropped");
           });
         }
       }
@@ -5102,7 +5124,7 @@
 
       // Always ensure word spans exist and match speakableText
       // Use speakableText as the canonical source — it matches the audio 1:1
-      const existingSpans = textEl.querySelectorAll(".tts-word, .tts-word-spoken");
+      const existingSpans = textEl.querySelectorAll(".tts-word, .tts-word-spoken, .tts-word-dropped");
       const expectedWords = speakableText ? speakableText.trim().split(/\s+/).filter(Boolean) : [];
       const expectedCount = expectedWords.length;
 
@@ -5118,7 +5140,7 @@
           .join(" ");
       }
 
-      const allWords = Array.from(textEl.querySelectorAll(".tts-word, .tts-word-spoken"));
+      const allWords = Array.from(textEl.querySelectorAll(".tts-word, .tts-word-spoken, .tts-word-dropped"));
 
       // Derive prevPos from DOM state: count already-spoken spans
       // This is more robust than trusting _flowWordPos which can drift
@@ -6720,9 +6742,9 @@
           clearTimeout(safetyTimer);
           rlog("[local-tts] onerror: " + ev.error);
           if (ev.error === "interrupted") return; // We cancelled it ourselves — don't send tts_done
-          // Mark any remaining words as spoken on error too
+          // Mark any remaining words as dropped on error (they were never spoken)
           if (_localWordSpans) {
-            _localWordSpans.forEach(s => s.classList.replace("tts-word", "tts-word-spoken"));
+            _localWordSpans.forEach(s => s.classList.replace("tts-word", "tts-word-dropped"));
           }
           ttsPlaying = false;
           localTtsUtterance = null;
@@ -7028,8 +7050,12 @@
           } else if (now - speechConfirmStart > (inFlowMode && conversationHot ? 200 : vp.speechConfirmMs)) {
             rlog(`[auto-listen] Speech detected! rms=${rms.toFixed(4)} hot=${conversationHot} — starting recording`);
             speechConfirmStart = 0;
-            // In flow mode, interrupt TTS/Claude before recording
-            if (inFlowMode && (ttsPlaying || btnClass.includes("speaking") || btnClass.includes("thinking") || btnClass.includes("responding"))) {
+            // In flow mode, interrupt Claude if thinking/responding, but DON'T
+            // send stop during active TTS playback — brief noise/echo/laughter
+            // can false-trigger the VAD and kill mid-playback (e.g. multi-part joke).
+            // Instead, just start recording; the transcribed text will naturally
+            // interrupt via the new_input path when it's sent to the terminal.
+            if (inFlowMode && (btnClass.includes("thinking") || btnClass.includes("responding"))) {
               if (ws?.readyState === WebSocket.OPEN) ws.send("stop");
               stopTtsPlayback();
             }

@@ -357,6 +357,7 @@ interface PanelSettings {
   voice?: string;
   speed?: number;
   tmuxTarget?: string; // "session:windowIndex" — last used tmux session
+  fillerAudio?: boolean; // Enable predictive filler audio while Claude thinks (default: true)
 }
 
 function loadSettings(): PanelSettings {
@@ -783,21 +784,24 @@ let _activeFetchCount = 0;                        // In-flight Kokoro fetch coun
 
 const TTS_MAX_PARALLEL = 10;
 const TTS_CHUNK_MAX_CHARS = 200;
+const TTS_FIRST_CHUNK_MAX = 100; // Smaller first chunk → faster initial audio from Kokoro
 const TTS_MAX_QUEUE = 50;
 
-/** Split text into chunks at word boundaries, each ≤ maxChars. */
-function splitIntoChunks(text: string, maxChars: number): string[] {
-  if (text.length <= maxChars) return [text];
+/** Split text into chunks at word boundaries, each ≤ maxChars.
+ *  Optional firstChunkMax allows a smaller first chunk for faster initial audio. */
+function splitIntoChunks(text: string, maxChars: number, firstChunkMax?: number): string[] {
+  if (text.length <= (firstChunkMax ?? maxChars)) return [text];
   const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > 0) {
-    if (remaining.length <= maxChars) {
+    const limit = chunks.length === 0 && firstChunkMax ? firstChunkMax : maxChars;
+    if (remaining.length <= limit) {
       chunks.push(remaining);
       break;
     }
-    // Find last space within maxChars window
-    let splitAt = remaining.lastIndexOf(" ", maxChars);
-    if (splitAt <= 0) splitAt = maxChars; // No space found — hard split
+    // Find last space within limit window
+    let splitAt = remaining.lastIndexOf(" ", limit);
+    if (splitAt <= 0) splitAt = limit; // No space found — hard split
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).trimStart();
   }
@@ -885,6 +889,11 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
  * Queue text for TTS playback, labeled with an entry ID.
  */
 function queueTts(entryId: number | null, text: string): void {
+  // Stop filler audio when real response audio is queued
+  if (entryId !== FILLER_ENTRY_ID && entryId != null) {
+    stopFillerIfActive();
+  }
+
   // Clean text for TTS
   const speakableText = cleanTtsText(text);
 
@@ -921,7 +930,7 @@ function queueTts(entryId: number | null, text: string): void {
               chunk.abortController = null;
             }
           }
-          const newChunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS);
+          const newChunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS, TTS_FIRST_CHUNK_MAX);
           existing.chunks = newChunkTexts.map((t, i) => ({
             chunkIndex: i,
             text: t,
@@ -974,8 +983,8 @@ function queueTts(entryId: number | null, text: string): void {
   }
   const mode: "kokoro" | "local" = useLocal ? "local" : "kokoro";
 
-  // Split into chunks
-  const chunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS);
+  // Split into chunks (first chunk smaller for faster initial audio)
+  const chunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS, TTS_FIRST_CHUNK_MAX);
   // Compute word counts per chunk, ensuring sum matches total speakableText word count.
   // This is critical for client-side karaoke — DOM spans are created from the full
   // speakableText, so the sum of chunkWordCounts must equal the total span count.
@@ -1059,6 +1068,64 @@ function queueTts(entryId: number | null, text: string): void {
 
   // Try to drain immediately (local jobs are already ready)
   drainAudioBuffer();
+}
+
+// --- Predictive Filler Audio ---
+// Play a short filler phrase while Claude thinks, so there's no dead silence.
+
+const FILLER_PHRASES = [
+  "Let me think about that.",
+  "One moment.",
+  "Sure, let me work on that.",
+  "Good question.",
+];
+const FILLER_ENTRY_ID = -999; // Sentinel entryId for filler jobs
+let _fillerActive = false;
+
+/** Queue a filler phrase for playback while Claude processes input. */
+function queueFillerAudio(): void {
+  const settings = loadSettings();
+  // fillerAudio defaults to true if unset
+  if (settings.fillerAudio === false) return;
+
+  // Don't play filler if TTS is already playing or queued
+  if (ttsCurrentlyPlaying || ttsJobQueue.length > 0) return;
+
+  const phrase = FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
+  console.log(`[tts2] Queueing filler: "${phrase}"`);
+  ttslog(FILLER_ENTRY_ID, phrase, ttsGeneration, "filler");
+  _fillerActive = true;
+  queueTts(FILLER_ENTRY_ID, phrase);
+}
+
+/** Stop filler playback when real response audio arrives. */
+function stopFillerIfActive(): void {
+  if (!_fillerActive) return;
+  _fillerActive = false;
+
+  // Check if filler job is still in queue or playing
+  const fillerIdx = ttsJobQueue.findIndex(j => j.entryId === FILLER_ENTRY_ID);
+  if (fillerIdx >= 0) {
+    const fillerJob = ttsJobQueue[fillerIdx];
+    for (const chunk of fillerJob.chunks) {
+      if (chunk.abortController) {
+        try { chunk.abortController.abort(); } catch {}
+        chunk.abortController = null;
+      }
+      chunk.audioBuf = null;
+    }
+    ttsJobQueue.splice(fillerIdx, 1);
+    console.log("[tts2] Filler removed from queue (real audio arriving)");
+  }
+
+  if (ttsCurrentlyPlaying?.entryId === FILLER_ENTRY_ID) {
+    // Filler is currently playing — stop it
+    ttsCurrentlyPlaying = null;
+    if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+    broadcast({ type: "tts_stop" });
+    console.log("[tts2] Filler playback stopped (real audio arriving)");
+    ttslog(FILLER_ENTRY_ID, "", ttsGeneration, "filler_replaced");
+  }
 }
 
 /**
@@ -2103,9 +2170,9 @@ function broadcastCurrentOutput() {
         }
       }
     } else {
-      // New paragraph — create entry (but skip if identical text already exists in ANY turn,
-      // including scrollback entries from loadScrollbackEntries which have negative turns)
-      const isDup = conversationEntries.some(e => e.role === "assistant" && e.text === para.text);
+      // New paragraph — create entry (but skip if identical text already exists in the CURRENT turn.
+      // Cross-turn dedup was blocking repeated content when user asks Claude to repeat something.)
+      const isDup = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.text === para.text);
       if (!isDup) {
         const entry: ConversationEntry = {
           id: ++entryIdCounter,
@@ -2192,10 +2259,23 @@ function broadcastCurrentOutput() {
     }
   }
 
+  // Speculative TTS: during streaming, speculatively queue the last (growing) entry
+  // so Kokoro starts generating audio before the entry is finalized. The dedup in
+  // queueTts prevents double-generation; the re-queue logic handles text growth.
+  const lastEntry = currentAssistant[currentAssistant.length - 1];
+  if (streamState === "RESPONDING" && lastEntry && lastEntry.speakable && !lastEntry.spoken) {
+    const speakable = cleanTtsText(lastEntry.text);
+    if (speakable && speakable.length >= 50) {
+      // queueTts dedup will skip if already queued; re-queue logic handles text growth
+      console.log(`[stream] Speculative TTS queue (id=${lastEntry.id}, ${speakable.length} chars)`);
+      ttslog(lastEntry.id, lastEntry.text, ttsGeneration, "speculative", speakable);
+      queueTts(lastEntry.id, lastEntry.text);
+    }
+  }
+
   // Sentence-level TTS for the last (still-growing) entry.
   // Speak each complete sentence as it arrives rather than waiting for the full entry.
   // A sentence boundary is: [.!?] followed by whitespace + uppercase, or [.!?] + end of text.
-  const lastEntry = currentAssistant[currentAssistant.length - 1];
   if (lastEntry && lastEntry.speakable && !lastEntry.spoken) {
     const cursor = entryTtsCursor.get(lastEntry.id) ?? 0;
     const remaining = lastEntry.text.slice(cursor);
@@ -2453,8 +2533,8 @@ function handleStreamDone() {
       assistantEntries[i].text = para.text;
       assistantEntries[i].speakable = para.speakable;
     } else {
-      // Skip if identical text already exists in ANY turn (cross-turn dedup with scrollback)
-      const isDup = conversationEntries.some(e => e.role === "assistant" && e.text === para.text);
+      // Skip if identical text already exists in the CURRENT turn (same-turn dedup only)
+      const isDup = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.text === para.text);
       if (!isDup) {
         const newId = ++entryIdCounter;
         conversationEntries.push({
@@ -3210,6 +3290,17 @@ initExchangesLog();
 const clients = new Set<WebSocket>();
 
 function broadcast(msg: Record<string, unknown>) {
+  // Automatically attach pending TTS entry IDs to entry broadcasts so the client
+  // knows which entries have in-flight TTS (and shouldn't be marked as dropped/red).
+  if (msg.type === "entry" && !msg.ttsPendingIds) {
+    const pendingIds = ttsJobQueue
+      .filter(j => j.entryId != null && j.entryId !== FILLER_ENTRY_ID && j.state !== "done" && j.state !== "failed")
+      .map(j => j.entryId);
+    if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.entryId != null && ttsCurrentlyPlaying.entryId !== FILLER_ENTRY_ID) {
+      pendingIds.push(ttsCurrentlyPlaying.entryId);
+    }
+    msg.ttsPendingIds = pendingIds;
+  }
   wslog("out", (msg.type as string) || "unknown", JSON.stringify(msg).length);
   const data = JSON.stringify(msg);
   let sent = 0;
@@ -3484,6 +3575,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text, audioInputId);
           addUserEntry(text, false, "stt-wake-word", audioInputId);
           terminal.sendText(text);
+          queueFillerAudio();
         } else {
           console.log(`No wake word in: "${text}"`);
           broadcast({ type: "voice_status", state: "wake_no_match" });
@@ -3495,6 +3587,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text, audioInputId);
           addUserEntry(text, false, "stt-direct", audioInputId);
           terminal.sendText(text);
+          queueFillerAudio();
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
           const queuedEntry = addUserEntry(text, true, "stt-queue", audioInputId);
@@ -3707,6 +3800,15 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
+    // Filler audio toggle
+    if (msg.startsWith("filler_audio:")) {
+      const val = msg.slice(13).trim();
+      const enabled = val !== "0" && val !== "false";
+      saveSettings({ fillerAudio: enabled });
+      console.log(`[settings] Filler audio: ${enabled}`);
+      return;
+    }
+
     // Client reports available local voices for TTS fallback decisions
     if (msg.startsWith("local_voices:")) {
       const voiceNames = msg.slice(13).split(",").filter(Boolean);
@@ -3894,6 +3996,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text);
           addUserEntry(text, false, "text-direct");
           terminal.sendText(text);
+          queueFillerAudio();
         } else {
           // Claude is active — queue typed text same as voice
           const queuedEntry = addUserEntry(text, true, "text-queue");

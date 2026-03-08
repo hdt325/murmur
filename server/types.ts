@@ -54,6 +54,7 @@ export interface PanelSettings {
   voice?: string;
   speed?: number;
   tmuxTarget?: string;
+  fillerAudio?: boolean; // Enable predictive filler audio while Claude thinks (default: true)
 }
 
 // --- Stream State Machine ---
