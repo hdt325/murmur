@@ -1268,6 +1268,17 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock = false; continue; }
     if (inAgentBlock) continue;
     if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) continue;
+    // Claude Code TUI chrome — status bar, menus, navigation hints, permission prompts
+    if (/expand\s+permiss/i.test(trimmed)) continue;
+    if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) continue;
+    if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) continue;
+    // Lines that are mostly Unicode box-drawing / arrow / UI decoration (not prose)
+    if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) continue;
+    // Claude Code menu/status fragments — short lines with navigation chrome
+    if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) continue;
+    if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) continue;
+    // Session feedback prompts
+    if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) continue;
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
@@ -1303,7 +1314,13 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
       // File paths
       (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100) ||
       // Numbered choice menus (e.g. "1: Bad  2: Fine  3: Good  0: Dismiss")
-      /^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed);
+      /^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed) ||
+      // Claude Code TUI fragments that slip through skip filters (partial lines, wrapped)
+      /permission/i.test(trimmed) && /allow|deny|grant|expand/i.test(trimmed) ||
+      // Arrow-heavy navigation hints
+      /[↓↑←→]{2,}/.test(trimmed) ||
+      // Status bar fragments (e.g. "Opus  Auto  >" or "compact  12% context")
+      (/\b(opus|sonnet|haiku|auto|compact|context)\b/i.test(trimmed) && trimmed.length < 40);
 
     // ── Tool block tracking ──
     if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
@@ -3049,6 +3066,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       vmState.ttsPlaying = false;
       vmState.micActive = false;
       broadcast({ type: "status", ...vmState });
+      broadcast({ type: "voice_status", state: "idle" });
       broadcast({ type: "signal", name: "voice-stop" });
       return;
     }
@@ -3652,6 +3670,24 @@ app.get("/debug", (_req, res) => {
     streamState,
     ttsPlaying: ttsInProgress,
     vmState,
+  });
+});
+
+app.get("/api/state", (_req, res) => {
+  const lastEntries = conversationEntries.slice(-3).map(e => ({
+    id: e.id, role: e.role, text: e.text.slice(0, 120), speakable: e.speakable, spoken: e.spoken, turn: e.turn,
+  }));
+  res.json({
+    ttsQueueLength: ttsQueue.length,
+    ttsInProgress,
+    ttsGeneration,
+    currentTtsEntryId,
+    _playingTtsEntryId,
+    streamState,
+    entryCount: conversationEntries.length,
+    lastEntries,
+    pendingVoiceCount: pendingVoiceInput.length,
+    lastPassiveSnapshotLength: lastPassiveSnapshot ? lastPassiveSnapshot.length : 0,
   });
 });
 

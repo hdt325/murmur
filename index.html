@@ -5314,6 +5314,8 @@
         // Claude is active — immediate interrupt regardless of armed state
         if (ws?.readyState === WebSocket.OPEN) ws.send("interrupt");
         stopTtsPlayback();
+        setTalkState("idle");
+        updateInterruptBtn(0);
       } else {
         // Claude idle — toggle armed mode
         interruptArmed = !interruptArmed;
