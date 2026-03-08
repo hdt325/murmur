@@ -23,12 +23,19 @@ export function loadSettings(settingsFile: string): PanelSettings {
   return {};
 }
 
+let _saveLock: Promise<void> = Promise.resolve();
+
 export function saveSettings(settingsFile: string, updates: Partial<PanelSettings>) {
-  const current = loadSettings(settingsFile);
-  const merged = { ...current, ...updates };
-  const tmpFile = settingsFile + ".tmp";
-  writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
-  renameSync(tmpFile, settingsFile);
+  _saveLock = _saveLock.catch(() => {}).then(() => {
+    const current = loadSettings(settingsFile);
+    const merged = { ...current, ...updates };
+    const tmpFile = settingsFile + ".tmp";
+    writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
+    renameSync(tmpFile, settingsFile);
+  }).catch((err) => {
+    console.error("Settings save failed:", (err as Error).message);
+    throw err; // Re-throw to maintain mutex integrity — next call's .catch(() => {}) absorbs it
+  });
 }
 
 export function initSignalFiles(settingsFile: string, signalDir: string = SIGNAL_DIR) {

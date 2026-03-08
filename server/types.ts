@@ -44,6 +44,8 @@ export interface ConversationEntry {
   ts: number;
   turn: number;
   queued?: boolean;
+  inputId?: string;          // Unique ID for this voice/text input (user entries)
+  parentInputId?: string;    // Links assistant responses to the user input that triggered them
 }
 
 // --- Settings ---
@@ -56,7 +58,7 @@ export interface PanelSettings {
 
 // --- Stream State Machine ---
 
-export type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "DONE";
+export type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "FINALIZING" | "DONE";
 
 // --- VoiceMode ---
 

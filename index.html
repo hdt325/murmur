@@ -4301,6 +4301,11 @@
         if (e.data instanceof Blob) {
           _wsLog.push({ ts: Date.now(), dir: "in", type: "binary", size: e.data.size, data: `(audio ${e.data.size}b)` });
           if (_wsLog.length > 200) _wsLog.shift();
+          // Pair with tts_play metadata if available
+          if (_currentTtsEntry) {
+            _currentTtsEntry.chunksReceived++;
+            _currentPlayingEntryId = _currentTtsEntry.entryId;
+          }
           playTtsAudio(e.data);
           return;
         }
@@ -4387,43 +4392,6 @@
           removeThinkingBubble();
           emptyState.style.display = "none";
           renderEntries(msg.entries, msg.partial);
-        }
-
-        // Server-driven TTS highlight
-        if (msg.type === "tts_highlight") {
-          if (document.body.classList.contains("flow-mode")) {
-            // Flow mode: defer to source.start() so highlight syncs with actual audio playback
-            // Only update pending ID when non-null — server sends tts_highlight(null) from
-            // handleTtsDone when queue drains between sentences, which would wipe the ID
-            // for sentence 2 that was set moments earlier.
-            if (msg.entryId !== null && msg.entryId !== undefined) {
-              _pendingHighlightEntryId = msg.entryId;
-              _pendingHighlightSpeakableText = msg.speakableText || null;
-              // Remove bubble-dropped — this entry is about to be spoken
-              const targetEl = document.querySelector(`.entry-bubble[data-entry-id="${msg.entryId}"]`);
-              if (targetEl) {
-                targetEl.classList.remove("bubble-dropped");
-                targetEl.classList.add("bubble-active");
-              }
-            }
-            // Move previous active → spoken immediately so already-spoken entries stay dark
-            document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
-              if (msg.entryId != null && el.dataset.entryId === String(msg.entryId)) return;
-              el.classList.remove("bubble-active");
-              el.classList.add("bubble-spoken");
-            });
-          } else {
-            // Normal mode: apply whole-bubble highlight right away
-            if (msg.entryId != null) {
-              highlightEntry(msg.entryId);
-            } else {
-              // Null highlight = TTS chain done — mark last active as spoken
-              document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
-                el.classList.remove("bubble-active");
-                el.classList.add("bubble-spoken");
-              });
-            }
-          }
         }
 
         // Tool call status — show current tool during thinking/responding
@@ -4555,7 +4523,53 @@
           }
         }
 
+        // New TTS v2: entry-labeled audio metadata arrives before binary chunks
+        if (msg.type === "tts_play") {
+          _currentTtsEntry = {
+            entryId: msg.entryId,
+            fullText: msg.fullText,
+            speakableText: msg.speakableText,
+            chunkCount: msg.chunkCount,
+            chunkWordCounts: msg.chunkWordCounts || [],
+            chunksReceived: 0,
+            localTts: !!msg.localTts,
+          };
+          _currentPlayingEntryId = msg.entryId;
+
+          if (msg.entryId !== null && msg.entryId !== undefined) {
+            _pendingHighlightEntryId = msg.entryId;
+            _pendingHighlightSpeakableText = msg.speakableText || null;
+
+            const targetEl = document.querySelector(`.entry-bubble[data-entry-id="${msg.entryId}"]`);
+            if (targetEl) {
+              targetEl.classList.remove("bubble-dropped");
+              targetEl.classList.add("bubble-active");
+
+              // Flow mode: replace displayed text with speakableText as grey word spans
+              // speakableText is the clean text that matches audio 1:1
+              if (document.body.classList.contains("flow-mode") && msg.speakableText) {
+                const textEl = targetEl.querySelector(".entry-text");
+                if (textEl) {
+                  textEl.innerHTML = msg.speakableText
+                    .split(/(\s+)/)
+                    .map(tok => /\S/.test(tok) ? '<span class="tts-word">' + escHtml(tok) + '</span>' : tok)
+                    .join("");
+                }
+              }
+            }
+          }
+          // Move previous active → spoken immediately
+          document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+            if (msg.entryId != null && el.dataset.entryId === String(msg.entryId)) return;
+            el.classList.remove("bubble-active");
+            el.classList.add("bubble-spoken");
+          });
+          return;
+        }
+
         if (msg.type === "tts_stop") {
+          _currentTtsEntry = null;
+          _currentPlayingEntryId = null;
           stopTtsPlayback();
           resetFlowWordHighlight(); // clear per-entry word positions for next response
           // Clear entry-bubble highlights (clearBubbleHighlights skips these)
@@ -4726,13 +4740,13 @@
 
     function clearBubbleHighlights() {
       // Mark any still-active bubbles as spoken before clearing
-      // Skip entry-bubbles — those are managed by server-driven tts_highlight
+      // Skip entry-bubbles — those are managed by tts_play messages
       document.querySelectorAll(".msg.bubble-active:not(.entry-bubble)").forEach(el => {
         el.classList.remove("bubble-active");
         el.classList.add("bubble-spoken");
       });
       // NOTE: do NOT call resetFlowWordHighlight() here — it would wipe _pendingHighlightEntryId
-      // which is set by tts_highlight BEFORE audio decode completes. Reset happens on tts_stop only.
+      // which is set by tts_play BEFORE audio decode completes. Reset happens on tts_stop only.
       activeSpeakBubbles = [];
       activeSpeakIdx = 0;
     }
@@ -4808,7 +4822,9 @@
 
       // Check once per render pass: is TTS pipeline still active?
       // If so, unspoken entries are likely queued — don't mark as dropped (red).
-      const _ttsStillActive = _pendingHighlightEntryId != null
+      const _ttsStillActive = _currentPlayingEntryId != null
+          || _currentTtsEntry != null
+          || _pendingHighlightEntryId != null
           || document.querySelector(".entry-bubble.bubble-active");
 
       let lastTurn = null;
@@ -4836,7 +4852,7 @@
           const textEl = div.querySelector(".entry-text");
           const newText = entryTextToHtml(entry.text);
           const hasActiveWordSpans = document.body.classList.contains("flow-mode") &&
-            div.classList.contains("bubble-active") &&
+            (div.classList.contains("bubble-active") || div.classList.contains("bubble-spoken")) &&
             textEl && textEl.querySelector(".tts-word, .tts-word-spoken");
           if (textEl && textEl.innerHTML !== newText && !hasActiveWordSpans) {
             textEl.innerHTML = newText;
@@ -5022,16 +5038,29 @@
     }
 
     // Called at source.start(0) — audio is actually playing now.
+    // Handles both flow mode (word karaoke) and regular mode (bubble highlight).
     function onTtsAudioStart(durationMs) {
       haptic([10, 40, 10]); // double-pulse on first word of response
+
+      // Compute chunkIndex: how many chunks have been received so far (0-based)
+      const chunkIndex = _currentTtsEntry ? _currentTtsEntry.chunksReceived - 1 : 0;
+
+      // Determine entryId: prefer _currentTtsEntry (chunk-aware), fallback to pending
+      const entryId = _currentTtsEntry ? _currentTtsEntry.entryId
+        : _pendingHighlightEntryId;
+      const speakableText = _currentTtsEntry ? _currentTtsEntry.speakableText
+        : _pendingHighlightSpeakableText;
+
+      // Regular mode: bubble-active is already set by tts_play handler
       if (!document.body.classList.contains("flow-mode")) return;
-      if (_pendingHighlightEntryId == null) return;
-      const entryId = _pendingHighlightEntryId;
-      const speakableText = _pendingHighlightSpeakableText;
+      if (entryId == null) return;
+
+      // Clear pending highlight — _currentTtsEntry is the source of truth now
       _pendingHighlightEntryId = null;
       _pendingHighlightSpeakableText = null;
 
       let _retryTimer = null;
+      const capturedChunkIndex = chunkIndex; // capture for closure
       const apply = (retries) => {
         const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
         if (!el) {
@@ -5048,21 +5077,24 @@
         el.classList.remove("bubble-spoken");
         el.classList.remove("bubble-dropped"); // Entry is being spoken — not dropped
 
-        // Scroll speaking entry to near top of transcript
-        void transcript.getBoundingClientRect();
-        const cR = transcript.getBoundingClientRect();
-        const eR = el.getBoundingClientRect();
-        transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 96), behavior: "smooth" });
+        // Scroll speaking entry to near top of transcript (only on first chunk to avoid jitter)
+        if (capturedChunkIndex === 0) {
+          void transcript.getBoundingClientRect();
+          const cR = transcript.getBoundingClientRect();
+          const eR = el.getBoundingClientRect();
+          transcript.scrollTo({ top: Math.max(0, eR.top - cR.top + transcript.scrollTop - 96), behavior: "smooth" });
+        }
 
         // Word-by-word highlight for this chunk
-        startFlowWordHighlight(el, speakableText, durationMs, entryId);
+        startFlowWordHighlight(el, speakableText, durationMs, entryId, capturedChunkIndex);
       };
       apply(10);
     }
 
-    // Animates the words corresponding to THIS TTS chunk (speakableText) in the entry.
+    // Animates the words corresponding to THIS TTS chunk in the entry.
     // Continues from where the previous chunk left off (tracked by _flowWordPos[entryId]).
-    function startFlowWordHighlight(entryEl, speakableText, durationMs, entryId) {
+    // chunkIndex is used to look up word count from _currentTtsEntry.chunkWordCounts.
+    function startFlowWordHighlight(entryEl, speakableText, durationMs, entryId, chunkIndex) {
       clearFlowWordHighlight();
       _flowActiveEl = entryEl;
       const textEl = entryEl.querySelector(".entry-text");
@@ -5070,24 +5102,38 @@
 
       const prevPos = _flowWordPos[entryId] || 0;
 
-      // Re-wrap entry text into word spans (streaming updates may have reset innerHTML)
-      const rawText = textEl.textContent || "";
-      textEl.innerHTML = rawText.replace(/(\S+)/g, (m) => '<span class="tts-word">' + escHtml(m) + '</span>');
-      const allWords = Array.from(textEl.querySelectorAll(".tts-word"));
+      // If tts_play already set word spans, don't re-wrap — just ensure spans exist
+      if (!textEl.querySelector(".tts-word, .tts-word-spoken")) {
+        const rawText = textEl.textContent || "";
+        textEl.innerHTML = rawText
+          .split(/(\s+)/)
+          .map(tok => /\S/.test(tok) ? '<span class="tts-word">' + escHtml(tok) + '</span>' : tok)
+          .join("");
+      }
+      const allWords = Array.from(textEl.querySelectorAll(".tts-word, .tts-word-spoken"));
 
       // Instantly restore already-spoken words from previous chunks
       for (let i = 0; i < prevPos && i < allWords.length; i++) {
-        allWords[i].classList.replace("tts-word", "tts-word-spoken");
+        if (allWords[i].classList.contains("tts-word")) {
+          allWords[i].classList.replace("tts-word", "tts-word-spoken");
+        }
       }
 
-      // Words in THIS chunk (count by speakableText word count)
-      const chunkWordCount = speakableText
-        ? speakableText.trim().split(/\s+/).filter(Boolean).length
-        : 0;
+      // Word count for THIS chunk: use chunkWordCounts array if available, else fallback
+      let chunkWordCount;
+      if (_currentTtsEntry && _currentTtsEntry.chunkWordCounts && chunkIndex != null
+          && chunkIndex < _currentTtsEntry.chunkWordCounts.length) {
+        chunkWordCount = _currentTtsEntry.chunkWordCounts[chunkIndex];
+      } else {
+        chunkWordCount = speakableText
+          ? speakableText.trim().split(/\s+/).filter(Boolean).length
+          : 0;
+      }
       const endPos = prevPos + chunkWordCount;
       _flowWordPos[entryId] = endPos; // advance position for next chunk
 
-      const chunkSpans = allWords.slice(prevPos, Math.min(endPos, allWords.length));
+      const chunkSpans = allWords.slice(prevPos, Math.min(endPos, allWords.length))
+        .filter(s => s.classList.contains("tts-word")); // only animate unspoken words
       if (!chunkSpans.length) return;
 
       const msPerWord = durationMs / chunkSpans.length;
@@ -5320,7 +5366,7 @@
             }
           };
           tryStartTtsWave(20);
-          // Don't call startBubbleHighlight() — server drives highlights via tts_highlight messages
+          // Don't call startBubbleHighlight() — highlights driven by tts_play messages
           setHeaderState("speaking", "Speaking");
           removeThinkingBubble();
           updateInterruptBtn(pendingVoiceCount);
@@ -5658,6 +5704,7 @@
     let audioChunks = [];
     let isRecording = false;
     let _discardRecording = false; // Set before stopRecording() to discard audio without sending
+    let _currentInputId = null;    // Unique ID for current recording session (links input → response)
     let _lastTapTime = 0;          // For double-tap cancel detection
     // Haptic helper — silently no-ops on desktop or where not supported
     function haptic(pattern) { try { if (navigator.vibrate) navigator.vibrate(pattern); } catch {} }
@@ -5942,6 +5989,8 @@
     async function startRecording(isAutoListen) {
       if (isRecording || _recordingStarting) return;
       _recordingStarting = true;
+      _currentInputId = (typeof crypto !== "undefined" && crypto.randomUUID)
+        ? crypto.randomUUID() : Date.now() + "-" + Math.random().toString(36).slice(2, 8);
       haptic(30); // short pulse on mic start
       console.log(`[rec] Starting recording (autoListen=${isAutoListen})`);
       // Show prelim bubble immediately in flow mode (don't wait for SpeechRecognition)
@@ -6222,6 +6271,10 @@
         ws.send("stop");
         stopTtsPlayback();
       }
+      // Send inputId before audio so server can tag the entry
+      if (_currentInputId) {
+        ws.send("voice:inputid:" + _currentInputId);
+      }
       if (preBufferBlob) {
         // Signal pre-buffer, then send WAV pre-buffer, then main WebM audio
         // Use async/await to guarantee order and check WS state before each send
@@ -6268,6 +6321,20 @@
     let ttsDataArray = null;
     let ttsGainNode = null;
     const ttsAudioQueue = []; // Client-side queue: [{buffer, blob, rawBuffer}]
+
+    // New TTS v2: entry-labeled audio metadata from tts_play messages
+    let _currentTtsEntry = null;    // { entryId, fullText, speakableText, chunkCount, chunkWordCounts, chunksReceived }
+    let _currentPlayingEntryId = null; // entryId of audio currently playing on client
+
+    /** Send labeled tts_done to server and clear playing state */
+    function _sendTtsDone() {
+      const id = _currentPlayingEntryId;
+      _currentPlayingEntryId = null;
+      _currentTtsEntry = null;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(id != null ? "tts_done:" + id : "tts_done");
+      }
+    }
 
     // Trim leading/trailing silence from an AudioBuffer.
     // Returns a new AudioBuffer with silence removed. Threshold is amplitude below
@@ -6324,7 +6391,7 @@
       // In text-out mode, skip TTS playback entirely
       if (ttsMuted) {
         rlog(`[tts] Skipping TTS (${blob.size} bytes) — text-out mode`);
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send("tts_done");
+        _sendTtsDone();
         return;
       }
       // If user is currently recording, skip TTS — don't interrupt them
@@ -6337,7 +6404,7 @@
           stopRecording();
         } else {
           rlog(`[tts] Skipping TTS (${blob.size} bytes) — user is recording`);
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send("tts_done");
+          _sendTtsDone();
           return;
         }
       }
@@ -6357,12 +6424,7 @@
     // Play a single TTS chunk through the audio pipeline:
     // decode → trim silence → normalize → play via Web Audio (or fallback)
     function _playNextTtsChunk(blob) {
-      // Save pending highlight — stopTtsPlaybackInternal calls clearFlowWordHighlight
-      const _savedPendingId = _pendingHighlightEntryId;
-      const _savedPendingText = _pendingHighlightSpeakableText;
       stopTtsPlaybackInternal(false);
-      _pendingHighlightEntryId = _savedPendingId;
-      _pendingHighlightSpeakableText = _savedPendingText;
 
       let rawBuffer = null;
       blob.arrayBuffer().then(async buffer => {
@@ -6410,13 +6472,27 @@
               if (ttsAudioQueue.length > 0) {
                 rlog(`[tts] Gapless: playing next queued chunk (${ttsAudioQueue.length} remaining)`);
                 const next = ttsAudioQueue.shift();
-                advanceBubbleHighlight();
-                if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+                // Within same entry's chunks: don't advance bubble or send done
+                const allChunksPlayed = _currentTtsEntry &&
+                  _currentTtsEntry.chunksReceived >= _currentTtsEntry.chunkCount;
+                if (allChunksPlayed) {
+                  // All chunks of current entry received — this queue item is from next entry
+                  advanceBubbleHighlight();
+                  _sendTtsDone();
+                }
                 _playNextTtsChunk(next.blob);
               } else {
                 idleFromTtsCompletion = true;
                 advanceBubbleHighlight();
-                if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+                // Mark entry as bubble-spoken when last chunk finishes
+                if (_currentTtsEntry) {
+                  const el = document.querySelector(`.entry-bubble[data-entry-id="${_currentTtsEntry.entryId}"]`);
+                  if (el) {
+                    el.classList.remove("bubble-active");
+                    el.classList.add("bubble-spoken");
+                  }
+                }
+                _sendTtsDone();
                 if (pendingIdle) applyIdleState();
               }
             };
@@ -6454,13 +6530,24 @@
           // Gapless fallback: play next queued chunk
           if (ttsAudioQueue.length > 0) {
             const next = ttsAudioQueue.shift();
-            advanceBubbleHighlight();
-            if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+            const allChunksPlayed = _currentTtsEntry &&
+              _currentTtsEntry.chunksReceived >= _currentTtsEntry.chunkCount;
+            if (allChunksPlayed) {
+              advanceBubbleHighlight();
+              _sendTtsDone();
+            }
             _playNextTtsChunk(next.blob);
           } else {
             idleFromTtsCompletion = true;
             advanceBubbleHighlight();
-            if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+            if (_currentTtsEntry) {
+              const el = document.querySelector(`.entry-bubble[data-entry-id="${_currentTtsEntry.entryId}"]`);
+              if (el) {
+                el.classList.remove("bubble-active");
+                el.classList.add("bubble-spoken");
+              }
+            }
+            _sendTtsDone();
             if (pendingIdle) applyIdleState();
           }
         }
@@ -6483,17 +6570,17 @@
     function playLocalTts(text, entryId) {
       if (ttsMuted) {
         rlog("[local-tts] Skipping — text-out mode");
-        if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        _sendTtsDone();
         return;
       }
       if (isRecording) {
         rlog("[local-tts] Skipping — user is recording");
-        if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        _sendTtsDone();
         return;
       }
       if (!window.speechSynthesis) {
         rlog("[local-tts] speechSynthesis not available — sending tts_done");
-        if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+        _sendTtsDone();
         return;
       }
 
@@ -6561,11 +6648,11 @@
 
         // Track whether tts_done has been sent to avoid double-sending (safety timer + onerror race)
         let _ttsDoneSent = false;
-        const _sendTtsDone = () => {
+        const _localTtsDone = () => {
           if (_ttsDoneSent) return;
           _ttsDoneSent = true;
           clearInterval(_synthKeepAlive);
-          if (ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+          _sendTtsDone();
         };
 
         // Safety: if onstart doesn't fire within 6s, assume speechSynthesis failed silently
@@ -6578,7 +6665,7 @@
             ttsPlaying = false;
             localTtsUtterance = null;
             window.speechSynthesis.cancel();
-            _sendTtsDone();
+            _localTtsDone();
             if (pendingIdle) applyIdleState();
           }
         }, 6000);
@@ -6601,7 +6688,7 @@
           ttsEndedAt = Date.now();
           idleFromTtsCompletion = true;
           advanceBubbleHighlight();
-          _sendTtsDone();
+          _localTtsDone();
           if (pendingIdle) applyIdleState();
         };
         utter.onerror = (ev) => {
@@ -6616,7 +6703,7 @@
           ttsPlaying = false;
           localTtsUtterance = null;
           ttsEndedAt = Date.now();
-          _sendTtsDone();
+          _localTtsDone();
           if (pendingIdle) applyIdleState();
         };
 
@@ -6646,7 +6733,7 @@
       ttsPlaying = false;
       ttsEndedAt = Date.now();
       _msUpdate(false);
-      if (sendDone && wasPlaying && ws?.readyState === WebSocket.OPEN) ws.send("tts_done");
+      if (sendDone && wasPlaying) _sendTtsDone();
     }
 
     function stopTtsPlayback() {
@@ -7552,6 +7639,8 @@
         set pendingHighlightEntryId(v) { _pendingHighlightEntryId = v; },
         get pendingHighlightSpeakableText() { return _pendingHighlightSpeakableText; },
         set pendingHighlightSpeakableText(v) { _pendingHighlightSpeakableText = v; },
+        get currentPlayingEntryId() { return _currentPlayingEntryId; },
+        get currentTtsEntry() { return _currentTtsEntry; },
         scrollUserEntryToTop(el) {
           void transcript.getBoundingClientRect(); // force reflow before reading scrollTop
           const cR = transcript.getBoundingClientRect();

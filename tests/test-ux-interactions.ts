@@ -167,8 +167,8 @@ async function testDroppedRemovedWhenActive() {
     { id: 1, role: "user", text: "Q", speakable: false, spoken: false, ts: Date.now(), turn: 1 },
     { id: 2, role: "assistant", text: "Dropped text.", speakable: true, spoken: false, ts: Date.now(), turn: 1 },
   ], false);
-  // Now simulate TTS highlight — should remove dropped and add active
-  await broadcastJson({ type: "tts_highlight", entryId: 2 });
+  // Now simulate TTS play — should remove dropped and add active
+  await broadcastJson({ type: "tts_play", entryId: 2, fullText: "Dropped text.", speakableText: "Dropped text.", chunkCount: 1, chunkWordCounts: [2] });
   await page.waitForTimeout(300);
   const result = await page.evaluate(() => {
     const el = document.querySelector('.entry-bubble[data-entry-id="2"]');
@@ -177,7 +177,7 @@ async function testDroppedRemovedWhenActive() {
       hasActive: el?.classList.contains("bubble-active") || false,
     };
   });
-  report("bubble-dropped removed when bubble-active is added via tts_highlight", !result.hasDropped && result.hasActive);
+  report("bubble-dropped removed when bubble-active is added via tts_play", !result.hasDropped && result.hasActive);
 }
 
 // ======================================================
@@ -192,17 +192,17 @@ async function testTtsHighlightChain() {
     { id: 12, role: "assistant", text: "There was a dragon.", speakable: true, spoken: false, ts: Date.now(), turn: 1 },
   ], false);
 
-  // Highlight entry 11
-  await broadcastJson({ type: "tts_highlight", entryId: 11 });
+  // tts_play entry 11 — should get bubble-active
+  await broadcastJson({ type: "tts_play", entryId: 11, fullText: "Once upon a time.", speakableText: "Once upon a time.", chunkCount: 1, chunkWordCounts: [5] });
   await page.waitForTimeout(300);
   const step1 = await page.evaluate(() => {
     const e11 = document.querySelector('.entry-bubble[data-entry-id="11"]');
     return { active: e11?.classList.contains("bubble-active") || false };
   });
-  report("TTS highlight: entry 11 gets bubble-active", step1.active);
+  report("TTS play: entry 11 gets bubble-active", step1.active);
 
-  // Highlight entry 12 — entry 11 should become spoken
-  await broadcastJson({ type: "tts_highlight", entryId: 12 });
+  // tts_play entry 12 — entry 11 should become spoken
+  await broadcastJson({ type: "tts_play", entryId: 12, fullText: "There was a dragon.", speakableText: "There was a dragon.", chunkCount: 1, chunkWordCounts: [5] });
   await page.waitForTimeout(300);
   const step2 = await page.evaluate(() => {
     const e11 = document.querySelector('.entry-bubble[data-entry-id="11"]');
@@ -213,11 +213,11 @@ async function testTtsHighlightChain() {
       e12Active: e12?.classList.contains("bubble-active") || false,
     };
   });
-  report("TTS highlight chain: entry 11 becomes bubble-spoken", step2.e11Spoken && !step2.e11Active);
-  report("TTS highlight chain: entry 12 becomes bubble-active", step2.e12Active);
+  report("TTS play chain: entry 11 becomes bubble-spoken", step2.e11Spoken && !step2.e11Active);
+  report("TTS play chain: entry 12 becomes bubble-active", step2.e12Active);
 
-  // Highlight null — last entry should become spoken
-  await broadcastJson({ type: "tts_highlight", entryId: null });
+  // tts_stop — last entry should become spoken
+  await broadcastJson({ type: "tts_stop" });
   await page.waitForTimeout(300);
   const step3 = await page.evaluate(() => {
     const e12 = document.querySelector('.entry-bubble[data-entry-id="12"]');
@@ -226,7 +226,7 @@ async function testTtsHighlightChain() {
       e12Active: e12?.classList.contains("bubble-active") || false,
     };
   });
-  report("TTS highlight null: last entry becomes bubble-spoken", step3.e12Spoken && !step3.e12Active);
+  report("TTS stop: last entry becomes bubble-spoken", step3.e12Spoken && !step3.e12Active);
   await screenshot("tts-highlight-chain");
 }
 
@@ -620,7 +620,7 @@ async function testTtsStopClearsHighlights() {
   await injectEntries([
     { id: 80, role: "assistant", text: "Being spoken.", speakable: true, spoken: false, ts: Date.now(), turn: 1 },
   ], false);
-  await broadcastJson({ type: "tts_highlight", entryId: 80 });
+  await broadcastJson({ type: "tts_play", entryId: 80, fullText: "Being spoken.", speakableText: "Being spoken.", chunkCount: 1, chunkWordCounts: [2] });
   await page.waitForTimeout(300);
 
   // Verify active before tts_stop
@@ -631,8 +631,7 @@ async function testTtsStopClearsHighlights() {
   // Send tts_stop
   await broadcastJson({ type: "tts_stop" });
   await page.waitForTimeout(300);
-  // tts_stop causes stopTtsPlayback which calls clearBubbleHighlights on next setTalkState
-  // Simulate idle state after stop
+  // tts_stop causes stopTtsPlayback which clears highlights
   await broadcastJson({ type: "voice_status", state: "idle" });
   await page.waitForTimeout(300);
 
@@ -643,7 +642,7 @@ async function testTtsStopClearsHighlights() {
       hasSpoken: el?.classList.contains("bubble-spoken") || false,
     };
   });
-  report("tts_highlight sets bubble-active before stop", beforeStop);
+  report("tts_play sets bubble-active before stop", beforeStop);
   report("voice_status idle after tts_stop clears bubble-active", !afterStop.hasActive);
   await screenshot("tts-stop-clear");
 }

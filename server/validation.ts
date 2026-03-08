@@ -40,9 +40,10 @@ export function validateVoice(voice: string | undefined, fallback = "af_heart"):
   return VALID_VOICES.has(voice) ? voice : fallback;
 }
 
-/** Sanitize text for shell-safe tmux send-keys (strip embedded newlines). */
+/** Sanitize text for shell-safe tmux send-keys (strip ANSI escapes and embedded newlines). */
 export function sanitizeForTerminal(text: string): string {
-  return text.replace(/[\r\n]+/g, " ").trim();
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[_^][^\x1b]*\x1b\\|\x9b[0-9;]*[A-Za-z]/g, "").replace(/[\r\n]+/g, " ").trim();
 }
 
 /** Force integer from untrusted input (prevents injection in shell interpolation). */

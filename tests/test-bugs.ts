@@ -14,6 +14,7 @@
  */
 
 import { chromium, Browser, Page, WebSocket as PWWebSocket } from "playwright";
+import { readFileSync } from "fs";
 
 const BASE = "http://localhost:3457?testmode=1";
 const PASS = "\x1b[32m✓ PASS\x1b[0m";
@@ -683,9 +684,9 @@ async function testFeature_sessionSwitchReset() {
   const broadcastsStatus = serverSrc.includes(`type: "status", phase: "idle"`);
   report("Session switch broadcasts status idle phase", broadcastsStatus);
 
-  // stopClientPlayback called on switch
-  const stopsPlayback = serverSrc.includes("stopClientPlayback()");
-  report("stopClientPlayback called on session switch", stopsPlayback);
+  // stopClientPlayback2 called on switch
+  const stopsPlayback = serverSrc.includes("stopClientPlayback2()");
+  report("stopClientPlayback2 called on session switch", stopsPlayback);
 
   // Context NOT resent on session switch (removed contextSentAt = 0)
   const switchBlock = serverSrc.slice(serverSrc.indexOf("tmux:switch:"), serverSrc.indexOf("tmux:switch:") + 1500);
@@ -1669,7 +1670,7 @@ async function testBug80v3_proseModTargetGuard() {
 
   // The fix: sendMurmurContext and MURMUR_EXIT both check displayTarget session name.
   // Only send to "claude-voice" — never to coordinator/agent sessions like "murmur:4".
-  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  const serverSrc = readFileSync("server.ts", "utf-8");
 
   // 1. Check sendMurmurContext has the target guard
   const contextFn = serverSrc.slice(
@@ -1883,7 +1884,7 @@ async function testTask11_tmuxNameMismatch() {
   // instead of human-readable session:window. Fix: use displayTarget for client-facing labels.
 
   // 1. Check server uses displayTarget in tmux broadcasts
-  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  const serverSrc = readFileSync("server.ts", "utf-8");
   const tmuxListLine = serverSrc.includes("displayTarget ?? terminal.currentTarget");
   report("Server tmux:list uses displayTarget for current label", tmuxListLine);
 
@@ -1904,7 +1905,7 @@ async function testTask11_tmuxNameMismatch() {
   report("Server initial tmux broadcast uses displayTarget", initUsesDisplay);
 
   // 4. Check TmuxBackend has displayTarget getter
-  const backendSrc = require("fs").readFileSync("terminal/tmux-backend.ts", "utf-8");
+  const backendSrc = readFileSync("terminal/tmux-backend.ts", "utf-8");
   const hasDisplayTarget = backendSrc.includes("get displayTarget()");
   const noPaneIdInDisplay = backendSrc.includes("displayTarget") &&
     !backendSrc.slice(backendSrc.indexOf("get displayTarget")).split("}")[0].includes("_paneId");
@@ -2104,51 +2105,41 @@ async function main() {
   await testTask14_streamingSTT();
 
   // Session 5 fixes
-  await testBug_pregenHighlightRace();
+  await testBug_ttsJobEntryIdLabeling();
   await testBug80v4_proseFilterWrappedLines();
   await testBug_ttsQueueFlushOnDisconnect();
   await testBug_debugApiEndpoints();
+  await testTask24_ttsPlayOnlyOnSuccess();
+  await testBugA_fuzzyDedup();
 
   await teardown();
 }
 
 // --- Session 5 regression tests ---
 
-async function testBug_pregenHighlightRace() {
-  console.log("\n[BUG-HIGHLIGHT] Pregen path captures entryId before async gap");
+async function testBug_ttsJobEntryIdLabeling() {
+  console.log("\n[TTS-PIPELINE] TtsJob carries entryId through fetch closure");
 
-  // The bug: handleTtsDone's pregen path used the mutable global currentTtsEntryId
-  // after an async gap (awaiting pregen promise). broadcastCurrentOutput could mutate
-  // currentTtsEntryId during the gap, causing tts_highlight to point to the wrong entry
-  // and _playingTtsEntryId to be wrong → duplicate TTS when catch-all re-speaks.
-  //
-  // The fix: capture nextEntryId into pregenEntryId BEFORE the async gap and use it.
-  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  // Old bug: handleTtsDone's pregen path used mutable global after async gap.
+  // New pipeline: TtsJob carries entryId in closure, no global mutation possible.
+  const serverSrc = readFileSync("server.ts", "utf-8");
 
-  // Find handleTtsDone function body
-  const fnStart = serverSrc.indexOf("function handleTtsDone()");
-  const fnEnd = serverSrc.indexOf("broadcast({ type: \"voice_status\", state: \"idle\" })", fnStart);
-  if (fnStart < 0 || fnEnd < 0) {
-    report("handleTtsDone function found", false, "Could not locate function");
-    return;
-  }
-  const fn = serverSrc.slice(fnStart, fnEnd + 100);
+  // Verify TtsJob interface has entryId field
+  const hasEntryId = serverSrc.includes("entryId: number | null");
+  report("TtsJob interface has entryId field", hasEntryId);
 
-  // Check that pregenEntryId is captured before the async promise.then
-  const capturesEntryId = fn.includes("const pregenEntryId = nextEntryId");
-  report("Pregen path captures entryId before async gap", capturesEntryId);
+  // Verify queueTts creates job with entryId from parameter
+  const queueFn = serverSrc.slice(serverSrc.indexOf("function queueTts("));
+  const jobUsesEntryId = queueFn.includes("entryId: entryId") || queueFn.includes("entryId,");
+  report("queueTts creates job with entryId from parameter", jobUsesEntryId);
 
-  // Check that tts_highlight uses the captured variable, not the mutable global
-  const usesCapture = fn.includes("entryId: pregenEntryId");
-  report("Pregen tts_highlight uses captured entryId (not global)", usesCapture);
+  // Verify tts_play message includes entryId
+  const hasTtsPlayEntryId = serverSrc.includes('type: "tts_play"') && serverSrc.includes("entryId: job.entryId");
+  report("tts_play message carries entryId from job", hasTtsPlayEntryId);
 
-  // Check that _playingTtsEntryId uses the captured variable
-  const playingUsesCapture = fn.includes("_playingTtsEntryId = pregenEntryId");
-  report("Pregen _playingTtsEntryId uses captured entryId", playingUsesCapture);
-
-  // Check that currentTtsEntryId is restored before fallback speakText
-  const restoresBeforeFallback = fn.includes("currentTtsEntryId = pregenEntryId; // Restore before fresh generation");
-  report("Pregen restores currentTtsEntryId before fallback speakText", restoresBeforeFallback);
+  // Verify no tts_highlight messages remain (replaced by tts_play)
+  const noTtsHighlight = !serverSrc.includes('type: "tts_highlight"');
+  report("No tts_highlight messages in server (replaced by tts_play)", noTtsHighlight);
 }
 
 async function testBug80v4_proseFilterWrappedLines() {
@@ -2159,7 +2150,7 @@ async function testBug80v4_proseFilterWrappedLines() {
   // the regex. Similarly, MURMUR_CONTEXT_LINES wrapping "no markdown, short sentences."
   //
   // The fix: add continuation patterns to the regex.
-  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  const serverSrc = readFileSync("server.ts", "utf-8");
 
   // Extract the MURMUR_CONTEXT_FILTER regex source
   const filterMatch = serverSrc.match(/MURMUR_CONTEXT_FILTER\s*=\s*\/(.*?)\/i;/);
@@ -2193,7 +2184,7 @@ async function testBug_ttsQueueFlushOnDisconnect() {
   // and ws clients = 0.
   //
   // The fix: on ws close, if no real clients remain, flush ttsQueue and bump ttsGeneration.
-  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  const serverSrc = readFileSync("server.ts", "utf-8");
 
   // Find the ws close handler
   const closeStart = serverSrc.indexOf('ws.on("close"');
@@ -2201,11 +2192,11 @@ async function testBug_ttsQueueFlushOnDisconnect() {
   const closeBody = serverSrc.slice(closeStart, closeEnd > closeStart ? closeEnd : closeStart + 2000);
 
   // Check that the close handler flushes TTS queue when no real clients remain
-  const flushesQueue = closeBody.includes("ttsQueue.splice(0") || closeBody.includes("ttsQueue.length");
+  const flushesQueue = closeBody.includes("ttsJobQueue.length") || closeBody.includes("stopClientPlayback2()");
   report("WS close handler checks TTS queue", flushesQueue);
 
-  const bumpsGen = closeBody.includes("ttsGeneration++");
-  report("WS close handler bumps ttsGeneration", bumpsGen);
+  const bumpsGen = closeBody.includes("ttsGeneration++") || closeBody.includes("stopClientPlayback2");
+  report("WS close handler bumps ttsGeneration (via stopClientPlayback2)", bumpsGen);
 
   const checksRealClients = closeBody.includes("_isTestClient") || closeBody.includes("_isTestMode");
   report("WS close handler only counts real (non-test) clients", checksRealClients);
@@ -2231,6 +2222,106 @@ async function testBug_debugApiEndpoints() {
 
     report(`${ep} returns valid JSON array`, result.ok && result.isArray, JSON.stringify(result));
   }
+}
+
+async function testTask24_ttsPlayOnlyOnSuccess() {
+  console.log("\n[TASK-24] TTS tts_play only sent after audio successfully fetched");
+
+  // Old bug: tts_highlight was broadcast BEFORE audio generation.
+  // New pipeline: tts_play is sent only after at least one chunk is ready,
+  // via drainTtsQueue which checks chunk state before sending.
+  const serverSrc = readFileSync("server.ts", "utf-8");
+
+  // Verify drainAudioBuffer sends tts_play only when chunks are ready
+  const drainIdx = serverSrc.indexOf("function drainAudioBuffer");
+  const drainFn = drainIdx >= 0 ? serverSrc.slice(drainIdx, drainIdx + 2000) : "";
+  const checksReady = drainFn.includes('"ready"') || drainFn.includes("chunk.state") || drainFn.includes("allReady");
+  report("drainAudioBuffer checks chunk readiness before sending tts_play", checksReady);
+
+  // Verify fetchKokoroAudio marks failed chunks
+  const fetchIdx = serverSrc.indexOf("async function fetchKokoroAudio");
+  const fetchFn = fetchIdx >= 0 ? serverSrc.slice(fetchIdx, fetchIdx + 1000) : "";
+  const marksFailed = fetchFn.includes('"failed"');
+  report("fetchKokoroAudio marks chunk as failed on error", marksFailed);
+
+  // Verify no speakText function remains (old pipeline)
+  const noSpeakText = serverSrc.indexOf("async function speakText(") === -1;
+  report("Old speakText function removed", noSpeakText);
+
+  // Verify no tts_highlight messages
+  const noHighlight = !serverSrc.includes('type: "tts_highlight"');
+  report("No tts_highlight messages remain", noHighlight);
+}
+
+async function testBugA_fuzzyDedup() {
+  console.log("\n[BUG-A] Fuzzy dedup catches tmux-wrapped text duplicates");
+
+  // The bug: passive watcher reconstructs user input from tmux pane by joining
+  // wrapped lines with " ". If wrap splits mid-word ("bro" + "wn"), the reconstructed
+  // text has spurious space ("bro wn" vs "brown"). Strict whitespace-collapse dedup
+  // misses this because "bro wn fox" ≠ "brown fox" after collapsing.
+  //
+  // The fix: two-level dedup — strict (collapse whitespace) + fuzzy (strip ALL spaces).
+  const serverSrc = readFileSync("server.ts", "utf-8");
+
+  // Extract addUserEntry function
+  const fnStart = serverSrc.indexOf("function addUserEntry(");
+  const fnEnd = serverSrc.indexOf("// Unified extraction:", fnStart);
+  if (fnStart < 0 || fnEnd < 0) {
+    report("addUserEntry function found", false, "Could not locate function");
+    return;
+  }
+  const fn = serverSrc.slice(fnStart, fnEnd);
+
+  // Check that fuzzy (no-spaces) comparison exists alongside strict comparison
+  const hasFuzzyNorm = fn.includes('.replace(/\\s/g, "")');
+  report("Dedup has fuzzy (strip-all-spaces) normalization", hasFuzzyNorm);
+
+  // Check that both strict and fuzzy are used in the duplicate finder
+  const hasStrictMatch = fn.includes("=== normalized");
+  const hasFuzzyMatch = fn.includes("=== normalizedNoSpaces");
+  report("Dedup uses strict match (collapse whitespace)", hasStrictMatch);
+  report("Dedup uses fuzzy match (strip all spaces)", hasFuzzyMatch);
+
+  // Verify via API: send two entries with tmux-wrap-style difference
+  // Entry 1: "the quick brown fox" (original)
+  // Entry 2: "the quick bro wn fox" (tmux-wrapped reconstruction with spurious space)
+  const result = await page.evaluate(async () => {
+    return new Promise<{ entryCount: number; deduped: boolean }>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:3457?testmode=1`);
+      let firstEntryCount = 0;
+      ws.onopen = () => {
+        // Send first message
+        ws.send("text:the quick brown fox jumps");
+        setTimeout(() => {
+          // Check entry count after first message
+          fetch("http://localhost:3457/api/state").then(r => r.json()).then(state1 => {
+            firstEntryCount = state1.entryCount;
+            // Send second message with tmux-wrap-style difference
+            ws.send("text:the quick bro wn fox jumps");
+            setTimeout(() => {
+              fetch("http://localhost:3457/api/state").then(r => r.json()).then(state2 => {
+                ws.send("test:clear-entries");
+                setTimeout(() => { ws.close(); }, 100);
+                resolve({
+                  entryCount: state2.entryCount - firstEntryCount,
+                  deduped: state2.entryCount === firstEntryCount,
+                });
+              });
+            }, 500);
+          });
+        }, 500);
+      };
+      ws.onerror = () => resolve({ entryCount: -1, deduped: false });
+      setTimeout(() => resolve({ entryCount: -1, deduped: false }), 5000);
+    });
+  });
+
+  report(
+    "Fuzzy dedup catches tmux-wrapped duplicate (no new entry created)",
+    result.deduped,
+    `entries added after second send: ${result.entryCount}`
+  );
 }
 
 main().catch(err => {

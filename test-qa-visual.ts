@@ -658,7 +658,7 @@ async function runWebUITests() {
     }
     await page.waitForTimeout(1000);
 
-    // 34. tts_highlight — bubble gets .bubble-active during TTS
+    // 34. tts_play — bubble gets .bubble-active during TTS
     let wsC: WebSocket | null = null;
     try {
       wsC = await connectTestWs();
@@ -672,12 +672,12 @@ async function runWebUITests() {
         const cls = await page.locator("#talkBtn").getAttribute("class").catch(() => "");
         if (cls?.includes("speaking")) { wsC.send("tts_done"); await page.waitForTimeout(500); }
       }
-      if (sawActive) ok("tts_highlight: .bubble-active applied during TTS");
-      else fail("tts_highlight", "no .bubble-active seen within timeout");
+      if (sawActive) ok("tts_play: .bubble-active applied during TTS");
+      else fail("tts_play", "no .bubble-active seen within timeout");
       // Drain remaining
       wsC.send("tts_done");
     } catch (e: any) {
-      fail("tts_highlight (WS)", e.message?.slice(0, 60));
+      fail("tts_play (WS)", e.message?.slice(0, 60));
     } finally {
       await page.waitForTimeout(1000);
       wsC?.close();

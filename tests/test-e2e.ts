@@ -1260,7 +1260,7 @@ async function testReadModeEntriesRender() {
 
   const entryCount = await page.locator(".entry-bubble.msg.assistant").count();
   const currentMode = await page.locator("#modeBtn").textContent();
-  // In Read mode TTS is off, so entry bubbles should NOT have bubble-active (server-driven tts_highlight)
+  // In Read mode TTS is off, so entry bubbles should NOT have bubble-active (driven by tts_play)
   // The voice_status=responding from test:entries: may trigger client-side legacy highlight — wait for idle
   await page.waitForTimeout(1000);
   const activeCount = await page.locator(".entry-bubble.bubble-active").count();

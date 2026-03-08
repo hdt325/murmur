@@ -1,11 +1,9 @@
 /**
  * Speech-to-text module — Whisper integration.
  * Handles audio format detection, transcription with retry, and hallucination filtering.
+ * Uses async fetch() instead of execFileSync to avoid blocking the event loop.
  */
 
-import { writeFileSync, unlinkSync } from "fs";
-import { execFileSync } from "child_process";
-import { join } from "path";
 import { plog, slog } from "./logging.js";
 import type { ServiceStatus, BroadcastFn } from "./types.js";
 
@@ -20,6 +18,64 @@ export function detectAudioExt(data: Buffer): string {
     if (data.slice(0, 4).toString("ascii") === "OggS") return "ogg";
   }
   return "webm";
+}
+
+const EXT_TO_MIME: Record<string, string> = {
+  wav: "audio/wav",
+  webm: "audio/webm",
+  mp4: "audio/mp4",
+  ogg: "audio/ogg",
+};
+
+/** Send audio to Whisper via async fetch (non-blocking). */
+async function whisperFetch(audioData: Buffer, audioExt: string, whisperUrl: string): Promise<any> {
+  const mime = EXT_TO_MIME[audioExt] || "application/octet-stream";
+  const boundary = "----MurmurBoundary" + Date.now();
+  const fileName = `audio.${audioExt}`;
+
+  // Build multipart/form-data body manually (Node fetch FormData doesn't support Buffer as File easily)
+  const fields: Array<{ name: string; value: string }> = [
+    { name: "model", value: "whisper-1" },
+    { name: "language", value: "en" },
+    { name: "response_format", value: "verbose_json" },
+    { name: "prompt", value: STT_PROMPT },
+  ];
+
+  const parts: Buffer[] = [];
+  for (const f of fields) {
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${f.name}"\r\n\r\n${f.value}\r\n`));
+  }
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: ${mime}\r\n\r\n`));
+  parts.push(audioData);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  const body = Buffer.concat(parts);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const resp = await fetch(`${whisperUrl}/v1/audio/transcriptions`, {
+      method: "POST",
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body,
+      signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error(`Whisper HTTP ${resp.status}: ${await resp.text()}`);
+    return await resp.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Parse Whisper response, apply hallucination filter. Returns text or empty string. */
+function parseWhisperResult(json: any): string {
+  const noSpeechProb = json.segments?.[0]?.no_speech_prob ?? 0;
+  if (noSpeechProb >= 0.6) {
+    console.log(`[stt] Discarded -- no_speech_prob=${noSpeechProb.toFixed(2)} (likely hallucination)`);
+    return "";
+  }
+  return json.text?.trim() || "";
 }
 
 export async function transcribeAudio(
@@ -39,42 +95,24 @@ export async function transcribeAudio(
     }
   }
 
-  const uid = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
   const audioExt = detectAudioExt(audioData);
-  const tmpFile = join(tempDir, `murmur-audio-${uid}.${audioExt}`);
-  writeFileSync(tmpFile, audioData);
 
   try {
     plog("transcribe_start");
     const sttStart = Date.now();
     slog("stt", "start", { bytes: audioData.length, ext: audioExt });
 
-    const result = execFileSync("curl", [
-      "-s", "-X", "POST", `${whisperUrl}/v1/audio/transcriptions`,
-      "-F", `file=@${tmpFile}`, "-F", "model=whisper-1", "-F", "language=en",
-      "-F", "response_format=verbose_json", "-F", `prompt=${STT_PROMPT}`,
-    ], { encoding: "utf-8", timeout: 10000 });
+    const json = await whisperFetch(audioData, audioExt, whisperUrl);
+    const text = parseWhisperResult(json);
 
-    const json = JSON.parse(result);
-    const noSpeechProb = json.segments?.[0]?.no_speech_prob ?? 0;
-    if (noSpeechProb >= 0.6) {
-      console.log(`[stt] Discarded -- no_speech_prob=${noSpeechProb.toFixed(2)} (likely hallucination)`);
-      return "";
-    }
-    const text = json.text?.trim() || "";
     plog("transcribe_done", text ? `"${text.slice(0, 100)}"` : "(empty)");
     slog("stt", "done", { text: text.slice(0, 100), durationMs: Date.now() - sttStart });
     return text;
   } catch (err) {
     console.warn("[stt] First attempt failed, retrying:", (err as Error).message);
     try {
-      const retryResult = execFileSync("curl", [
-        "-s", "-X", "POST", `${whisperUrl}/v1/audio/transcriptions`,
-        "-F", `file=@${tmpFile}`, "-F", "model=whisper-1", "-F", "language=en",
-        "-F", "response_format=verbose_json", "-F", `prompt=${STT_PROMPT}`,
-      ], { encoding: "utf-8", timeout: 10000 });
-      const retryJson = JSON.parse(retryResult);
-      const text = retryJson.text?.trim() || "";
+      const retryJson = await whisperFetch(audioData, audioExt, whisperUrl);
+      const text = parseWhisperResult(retryJson);
       console.log(`[stt] Retry succeeded: "${text.slice(0, 60)}"`);
       return text;
     } catch (retryErr) {
@@ -85,7 +123,5 @@ export async function transcribeAudio(
       broadcast({ type: "voice_status", state: "error", message: "Whisper STT failed" });
       return "";
     }
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
   }
 }
