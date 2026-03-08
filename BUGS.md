@@ -609,12 +609,12 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-052: Flow mode barge-in sensitivity not adjustable
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Users can't adjust how loud they need to speak to interrupt TTS in flow mode.
 **Root cause**: Barge-in threshold is hardcoded.
-**Proposed fix**: Add sensitivity slider in flow mode settings sheet.
+**Fix**: Echo gate (2x threshold during TTS) + VAD presets provide adjustable sensitivity.
 
 ---
 
@@ -857,5 +857,207 @@ A log of bugs found, root cause, fix, and test coverage.
 **Root cause**: `broadcastCurrentOutput()` matches extracted paragraphs to existing entries by array index. During long responses, early content scrolls off the tmux pane, reducing the paragraph count. The positional match then shifts — paragraph 3 overwrites entry 1, paragraph 4 overwrites entry 2, etc. — while the original entries 3+ retain their old text. Result: same text in multiple entries.
 **Fix** (`server.ts`): (1) During RESPONDING, skip positional update if the first 20 chars don't match (detects shifted content). (2) Dedup new assistant entries against existing same-turn entries by exact text match. Applied in both `broadcastCurrentOutput` and `handleStreamDone`.
 **Test**: Smoke + E2E pass — no regressions.
+
+---
+
+## BUG-075: Duplicate user bubble from whitespace-variant text
+
+**Status**: Fix v2 submitted — time-based 30s dedup window, still failing in tests (needs debug logging)
+**Severity**: High
+**Found**: 2026-03-07
+**Symptom**: `addUserEntry()` dedup fails to catch duplicates where text differs only in whitespace.
+**Root cause**: Original turn-based dedup had race with concurrent turn increments. Fix v2 uses 30s time-based window but test still shows 2 entries.
+**Fix**: Time-based 30s dedup window in `addUserEntry`. DEDUP-TRACE logging added across all 10 call sites.
+
+---
+
+## BUG-076: Double TTS drain from duplicate tts_done callbacks
+
+**Status**: Fixed
+**Severity**: High
+**Found**: 2026-03-07
+**Symptom**: TTS queue drained twice from duplicate `tts_done` callbacks arriving within milliseconds.
+**Fix**: 50ms dedup window in `handleTtsDone` guards against fast-queue-drain race.
+
+---
+
+## BUG-077: Red text highlight flicker on unspoken entries (bubble-dropped race)
+
+**Status**: Fixed
+**Severity**: High
+**Found**: 2026-03-07
+**Symptom**: Entries briefly flash red (bubble-dropped) then return to normal.
+**Fix**: ttsPendingIds prevents red flash during TTS fetch. Replaces previous approach of hoisted `_ttsStillActive` check.
+
+---
+
+## BUG-078: Entry count drops during THINKING state
+
+**Status**: Fixed
+**Severity**: Critical
+**Found**: 2026-03-07 (Monitor alert)
+**Symptom**: Entry count drops to 0 repeatedly during test runs.
+**Root cause**: `test:reset-entries` nuked global `conversationEntries[]` array.
+**Fix**: Replaced with scoped `test:clear-entries` using per-connection `_testEntryIds` tracking.
+
+---
+
+## BUG-079: TTS queue stalls with items remaining when ttsInProgress is false
+
+**Status**: Open
+**Severity**: Critical
+**Found**: 2026-03-07 (Monitor alert)
+**Symptom**: TTS queue has items but `ttsInProgress` is false — audio stops. Severe instance: 42 items queued, nothing playing (07:46 UTC). Also causes highlight mismatches (tts counter vs highlight counter out of sync).
+**Proposed fix**: Add queue drain check when `ttsInProgress` transitions to false. May be related to Kokoro becoming unresponsive (watchdog killed/restarted Kokoro at 07:50).
+
+---
+
+## BUG-080: MURMUR_EXIT (Prose mode off) leaks to CLI when last WS client disconnects
+
+**Status**: Fixed (v3)
+**Severity**: High
+**Found**: 2026-03-08 (UX-Expert investigation)
+**Symptom**: Test browser disconnecting triggers `MURMUR_EXIT` to live CLI.
+**Fix**: (v1) Debounce timer checks for real clients. (v3) Session target guard — only fire for `claude-voice` session. Also added prose mode filter for tmux-wrapped continuation lines.
+
+---
+
+## BUG-081: TTS audio briefly duplicated during playback
+
+**Status**: Fixed
+**Severity**: High
+**Found**: 2026-03-08 (user report)
+**Symptom**: TTS audio briefly plays duplicate/overlapping audio. Monitor evidence: same text spoken twice with 3041ms gap.
+**Fix**: Chunk-level ack protocol in TTS Pipeline v2 eliminates overlap. Previous partial fixes (pregen race, queue flush on disconnect) were insufficient.
+
+---
+
+## BUG-082: TTS highlight on wrong chat bubble during playback
+
+**Status**: Fixed
+**Severity**: High
+**Found**: 2026-03-08 (user report)
+**Symptom**: TTS highlight appears on wrong bubble during playback.
+**Fix**: Fixed pregen race condition. Added debug API ring buffers for tts-history, highlight-log, entry-log.
+
+---
+
+## BUG-084: Temporal dead zone crashes page on load
+
+**Status**: Fixed
+**Severity**: Critical
+**Found**: 2026-03-08
+**Symptom**: Page crashes entirely on load due to `let` temporal dead zone errors.
+**Root cause**: Three variables (`ttsPlaying`, `autoListenEnabled`, `_vadPresetKey`) declared with `let` after their first usage sites in index.html.
+**Fix**: Hoisted declarations to global state section (line ~3668) above first usage sites. Original declaration sites changed to reassignments.
+
+---
+
+## BUG-083: Server RSS memory escalating across sessions (potential leak)
+
+**Status**: Open
+**Severity**: Medium
+**Found**: 2026-03-08 (Profiler alert)
+**Symptom**: RSS memory escalating: 109→113→116→123→134 MB across sessions.
+**Proposed fix**: Profile heap snapshots to identify growing objects.
+
+---
+
+## BUG-085: preInputSnapshot timing gap (precision issue S14)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: Passive watcher could capture stale pre-input snapshot, causing diff to include user's own text as Claude output.
+**Root cause**: Snapshot captured too early — gap between snapshot and sendText allowed terminal content to change.
+**Fix**: Snapshot captured immediately before sendText; passive watcher saves only when idle.
+
+---
+
+## BUG-086: Passive watcher text matching for CLI input (precision issue S15)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: Passive watcher continuation detection didn't stop at separator lines, matching across boundaries.
+**Root cause**: Missing separator line detection (─━═) in continuation loop.
+**Fix**: Added `^[─━═]{3,}` check to passive watcher continuation line loop.
+
+---
+
+## BUG-087: _flowWordPos vs text mutation during streaming (precision issue S16)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: Flow mode karaoke word position drifted when entry text mutated during streaming updates.
+**Root cause**: `_flowWordPos` tracked absolute index but DOM word spans could be re-created on text update.
+**Fix**: Word position derives from DOM (spoken span count); re-wraps on mismatch.
+
+---
+
+## BUG-088: ttsPlaying boolean race (precision issue T3)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: `ttsPlaying` flag could get stuck true if client disconnected mid-playback.
+**Root cause**: Flag set/cleared at wrong lifecycle points; no disconnect cleanup.
+**Fix**: Flag set at audio start/end; disconnect handler prevents stale state.
+
+---
+
+## BUG-089: clearFlowWordHighlight save/restore fragility (precision issue T6)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: clearFlowWordHighlight saved/restored DOM state, but restore could apply stale snapshot after text mutation.
+**Root cause**: Fragile save/restore pattern for DOM state.
+**Fix**: Marks unspoken text red (dropped indicator); no fragile save/restore needed.
+
+---
+
+## BUG-090: renderEntries removes actively-highlighted DOM (precision issue T7)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: renderEntries innerHTML update destroyed active word highlight spans mid-karaoke.
+**Root cause**: renderEntries overwrote entry bubble innerHTML unconditionally.
+**Fix**: renderEntries skips innerHTML update if entry has active word spans.
+
+---
+
+## BUG-091: pipe-pane vs capture-pane content divergence (precision issue T8)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: pipe-pane and capture-pane saw different terminal content, causing inconsistent output detection.
+**Root cause**: pipe-pane streams continuously while capture-pane snapshots — timing creates divergence.
+**Fix**: pipe-pane used as activity signal only; capture-pane is the content source of truth.
+
+---
+
+## BUG-092: entryTextToHtml vs word-span innerHTML churn (precision issue T11)
+
+**Status**: Fixed
+**Severity**: Medium
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: entryTextToHtml and karaoke word-span wrapping both set innerHTML, causing churn and flicker.
+**Root cause**: Two competing innerHTML writers for the same entry bubble.
+**Fix**: entryTextToHtml handles plain text only; word spans added separately by karaoke system.
+
+---
+
+## BUG-093: PtyBackend sendText has no retry logic (precision issue T9)
+
+**Status**: Open
+**Severity**: Low
+**Found**: 2026-03-08 (TTS redesign audit)
+**Symptom**: Windows pty backend has no retry logic for sendText, unlike tmux backend which has 3 retries with stuck detection.
+**Root cause**: PtyBackend.sendText implemented without retry mechanism.
+**Proposed fix**: Add retry logic matching tmux backend pattern. Low priority — macOS only right now.
 
 ---

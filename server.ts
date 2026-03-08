@@ -585,7 +585,7 @@ let ttsGeneration = 0; // Bumped ONLY via bumpGeneration() on user interruption
 
 interface GenerationEvent {
   gen: number;
-  reason: "user_stop" | "voice_change" | "new_input" | "session_switch" | "client_disconnect";
+  reason: "user_stop" | "voice_change" | "new_input" | "session_switch" | "client_disconnect" | "barge_in";
   ts: number;
   entryId?: number;
 }
@@ -3696,6 +3696,31 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     if (msg === "key:enter") { terminal.sendKey("Enter"); return; }
     if (msg === "key:escape") { terminal.sendKey("Escape"); return; }
     if (msg === "key:tab") { terminal.sendKey("Tab"); return; }
+
+    // Barge-in: user started speaking over TTS. During playback-only (DONE),
+    // pause TTS without bumping generation (client may resume if no real speech).
+    // During active streaming (THINKING/RESPONDING), treat as full interrupt.
+    if (msg === "barge_in") {
+      console.log(`[barge-in] Received, streamState=${streamState}`);
+      if (streamState === "THINKING" || streamState === "RESPONDING" || streamState === "WAITING") {
+        // Full interrupt — same as stop
+        terminal.sendKey("Escape");
+        stopTts();
+        stopTmuxStreaming();
+        broadcast({ type: "voice_status", state: "idle" });
+      } else {
+        // Playback-only (DONE/IDLE) — soft pause, don't bump generation
+        // Just stop client playback without invalidating pending chunks
+        broadcast({ type: "tts_stop" });
+        ttsCurrentlyPlaying = null;
+        if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+        // Log for Monitor visibility
+        ttsGenerationLog.push({ gen: ttsGeneration, reason: "barge_in", ts: Date.now() });
+        if (ttsGenerationLog.length > 20) ttsGenerationLog.shift();
+        console.log(`[barge-in] Soft pause (playback only, gen=${ttsGeneration} NOT bumped)`);
+      }
+      return;
+    }
 
     if (msg === "stop") {
       // Remove queued entries from transcript and clear queue

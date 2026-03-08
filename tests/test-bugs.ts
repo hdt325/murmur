@@ -2112,6 +2112,13 @@ async function main() {
   await testTask24_ttsPlayOnlyOnSuccess();
   await testBugA_fuzzyDedup();
 
+  // Barge-in improvements
+  await testBargeIn_serverHandler();
+
+  // Flow button positioning
+  await testFlowButton_visibleBothModes();
+  await testFlowButton_gearOverlayNotBlocked();
+
   await teardown();
 }
 
@@ -2322,6 +2329,229 @@ async function testBugA_fuzzyDedup() {
     result.deduped,
     `entries added after second send: ${result.entryCount}`
   );
+}
+
+// ──────────────────────────────────────────────────────────────
+// Barge-in: server handles "barge_in" WS message correctly
+// ──────────────────────────────────────────────────────────────
+async function testBargeIn_serverHandler() {
+  console.log("\n[BARGE-IN] Server barge_in message handler");
+
+  // Test 1: barge_in is in the testmode safe-prefixes list (not blocked)
+  const src = readFileSync("server.ts", "utf-8");
+  const hasSafePrefix = /safeTestPrefixes[\s\S]*?"barge_in"/.test(src);
+  report(
+    "barge_in in testmode safe-prefixes",
+    hasSafePrefix,
+    `found=${hasSafePrefix}`
+  );
+
+  // Test 2: barge_in handler exists and distinguishes from user_stop
+  const hasHandler = /msg === ["']barge_in["']/.test(src);
+  report(
+    "Server has barge_in WS handler",
+    hasHandler,
+    `found=${hasHandler}`
+  );
+
+  // Test 3: barge_in reason added to GenerationEvent type
+  const hasReason = /reason:.*"barge_in"/.test(src);
+  report(
+    "GenerationEvent includes barge_in reason",
+    hasReason,
+    `found=${hasReason}`
+  );
+
+  // Test 4: Send barge_in over WS — connection stays open (no crash)
+  const result = await page.evaluate(async () => {
+    return new Promise<{ connOpen: boolean }>((resolve) => {
+      const ws = new WebSocket(`ws://localhost:3457?testmode=1`);
+      ws.onopen = () => {
+        setTimeout(() => {
+          ws.send("barge_in");
+          setTimeout(() => {
+            resolve({ connOpen: ws.readyState === WebSocket.OPEN });
+            ws.close();
+          }, 300);
+        }, 200);
+      };
+      ws.onerror = () => resolve({ connOpen: false });
+      setTimeout(() => resolve({ connOpen: false }), 3000);
+    });
+  });
+
+  report(
+    "barge_in accepted — connection stays open",
+    result.connOpen,
+    `connOpen=${result.connOpen}`
+  );
+
+  // Test 5: barge_in soft-pause path doesn't bump generation (code check)
+  // In DONE/IDLE path: no bumpGeneration call, just broadcast tts_stop + log
+  const bargeInBlock = src.match(/if \(msg === ["']barge_in["']\)[\s\S]*?return;\s*\}/);
+  const hasBumpInBargeIn = bargeInBlock ? /bumpGeneration/.test(bargeInBlock[0]) : false;
+  const hasTtsStopBroadcast = bargeInBlock ? /tts_stop/.test(bargeInBlock[0]) : false;
+  report(
+    "barge_in soft-pause does NOT bump generation",
+    bargeInBlock != null && !hasBumpInBargeIn,
+    `hasBlock=${!!bargeInBlock} hasBump=${hasBumpInBargeIn}`
+  );
+  report(
+    "barge_in broadcasts tts_stop",
+    hasTtsStopBroadcast,
+    `found=${hasTtsStopBroadcast}`
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
+// Flow button: visible and clickable in both regular and flow mode
+// ──────────────────────────────────────────────────────────────
+async function testFlowButton_visibleBothModes() {
+  console.log("\n[FLOW-BTN] Flow button visible in both modes");
+
+  // Start in regular mode
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+
+  // Regular mode: button should be visible in toolbar
+  const regularResult = await page.evaluate(() => {
+    const btn = document.getElementById("flowModeBtn");
+    if (!btn) return { visible: false, inViewport: false, x: -1, y: -1, clickable: false };
+    const rect = btn.getBoundingClientRect();
+    const visible = rect.width > 0 && rect.height > 0;
+    const inViewport = rect.top >= 0 && rect.left >= 0
+      && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth;
+    return { visible, inViewport, x: Math.round(rect.left), y: Math.round(rect.top), clickable: !btn.disabled };
+  });
+
+  report(
+    "Flow button visible in regular mode",
+    regularResult.visible && regularResult.inViewport,
+    `visible=${regularResult.visible} inViewport=${regularResult.inViewport} pos=(${regularResult.x},${regularResult.y})`
+  );
+
+  // Click to enter flow mode
+  await page.click("#flowModeBtn");
+  await page.waitForTimeout(300);
+
+  // Flow mode: button should be visible with .flow-fixed class
+  const flowResult = await page.evaluate(() => {
+    const btn = document.getElementById("flowModeBtn");
+    if (!btn) return { visible: false, inViewport: false, x: -1, y: -1, hasFlowFixed: false };
+    const rect = btn.getBoundingClientRect();
+    const visible = rect.width > 0 && rect.height > 0;
+    const inViewport = rect.top >= 0 && rect.left >= 0
+      && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth;
+    const hasFlowFixed = btn.classList.contains("flow-fixed");
+    return { visible, inViewport, x: Math.round(rect.left), y: Math.round(rect.top), hasFlowFixed };
+  });
+
+  report(
+    "Flow button visible in flow mode",
+    flowResult.visible && flowResult.inViewport,
+    `visible=${flowResult.visible} inViewport=${flowResult.inViewport} pos=(${flowResult.x},${flowResult.y}) flowFixed=${flowResult.hasFlowFixed}`
+  );
+
+  report(
+    "Flow button has .flow-fixed class in flow mode",
+    flowResult.hasFlowFixed,
+    `hasFlowFixed=${flowResult.hasFlowFixed}`
+  );
+
+  // Click to exit flow mode — button should still be clickable
+  await page.click("#flowModeBtn");
+  await page.waitForTimeout(300);
+
+  const exitResult = await page.evaluate(() => {
+    const btn = document.getElementById("flowModeBtn");
+    if (!btn) return { visible: false, flowFixed: true };
+    const rect = btn.getBoundingClientRect();
+    return {
+      visible: rect.width > 0 && rect.height > 0 && rect.top >= 0,
+      flowFixed: btn.classList.contains("flow-fixed"),
+    };
+  });
+
+  report(
+    "Flow button visible after exiting flow mode",
+    exitResult.visible && !exitResult.flowFixed,
+    `visible=${exitResult.visible} flowFixed=${exitResult.flowFixed}`
+  );
+
+  // Restore flow mode off for subsequent tests
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(300);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Flow button z-index: must not block gear overlay dismiss
+// Regression: flow button z-index 300 sat on top of overlay (299),
+// intercepting clicks and preventing sheet dismiss.
+// ──────────────────────────────────────────────────────────────
+async function testFlowButton_gearOverlayNotBlocked() {
+  console.log("\n[FLOW-BTN] Flow button does not block gear overlay");
+
+  // Enter flow mode
+  await page.evaluate(() => {
+    localStorage.setItem("murmur-flow-mode", "1");
+    localStorage.setItem("murmur-tour-done", "1");
+    localStorage.setItem("murmur-flow-tour-done", "1");
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(500);
+
+  // Verify flow button z-index is below overlay (299)
+  const zResult = await page.evaluate(() => {
+    const btn = document.getElementById("flowModeBtn");
+    const overlay = document.getElementById("flowSettingsOverlay");
+    if (!btn || !overlay) return { btnZ: -1, overlayZ: -1 };
+    const btnZ = parseInt(btn.style.zIndex || getComputedStyle(btn).zIndex || "0");
+    const overlayZ = parseInt(getComputedStyle(overlay).zIndex || "0");
+    return { btnZ, overlayZ };
+  });
+
+  report(
+    "Flow button z-index below overlay z-index",
+    zResult.btnZ > 0 && zResult.overlayZ > 0 && zResult.btnZ < zResult.overlayZ,
+    `btnZ=${zResult.btnZ} overlayZ=${zResult.overlayZ}`
+  );
+
+  // Open gear sheet, click overlay to dismiss, verify it closes
+  const gearVisible = await page.locator("#flowGearBtn").isVisible().catch(() => false);
+  if (gearVisible) {
+    await page.click("#flowGearBtn");
+    await page.waitForTimeout(400);
+
+    const sheetOpen = await page.evaluate(() =>
+      document.getElementById("flowSettingsSheet")?.classList.contains("open") ?? false);
+
+    // Click overlay at top-left (near where flow button sits)
+    await page.locator("#flowSettingsOverlay").click({ position: { x: 10, y: 10 }, force: true });
+    await page.waitForTimeout(400);
+
+    const sheetClosed = await page.evaluate(() =>
+      !document.getElementById("flowSettingsSheet")?.classList.contains("open"));
+
+    report(
+      "Gear sheet opens on click",
+      sheetOpen,
+      `sheetOpen=${sheetOpen}`
+    );
+    report(
+      "Gear sheet dismisses via overlay click (not blocked by flow button)",
+      sheetClosed,
+      `sheetClosed=${sheetClosed}`
+    );
+  } else {
+    report("Gear button visible in flow mode (prereq)", false);
+  }
+
+  // Restore
+  await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(300);
 }
 
 main().catch(err => {
