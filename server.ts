@@ -271,6 +271,13 @@ function sendMurmurContext(delayMs = 2000) {
     contextTimer = null;
     if (contextSent) return;
     if (terminal.isSessionAlive()) {
+      // Guard: only send prose mode context to the voice session (claude-voice).
+      // Other sessions (coordinator, agents) should never receive prose mode instructions.
+      const targetSession = (terminal.displayTarget ?? terminal.currentTarget ?? "").split(":")[0];
+      if (targetSession !== "claude-voice") {
+        console.log(`[context] Skipping Murmur context — target "${targetSession}" is not claude-voice`);
+        return;
+      }
       _isSystemContext = true;
       terminal.sendText(MURMUR_CONTEXT_LINES.join(" "));
       contextSent = true;
@@ -1273,7 +1280,8 @@ let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 let entryTtsCursor: Map<number, number> = new Map();
 
 // Add a user entry and broadcast the updated entry list
-function addUserEntry(text: string, queued = false) {
+function addUserEntry(text: string, queued = false, _source = "unknown") {
+  console.log(`[DEDUP-TRACE] addUserEntry called from="${_source}" text="${text.slice(0, 80)}" queued=${queued} ts=${Date.now()} turn=${currentTurn} streamState=${streamState}`);
   // Suppress voice panel instruction messages from appearing in the conversation view
   if (MURMUR_CONTEXT_FILTER.test(text.trim())) {
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
@@ -1292,12 +1300,18 @@ function addUserEntry(text: string, queued = false) {
   const dedupeWindowMs = 30000;
   const cutoff = Date.now() - dedupeWindowMs;
   const recent = conversationEntries.filter(e => e.role === "user" && e.ts >= cutoff);
-  console.log(`[entry] addUserEntry dedup check: normalized="${normalized.slice(0, 60)}" recent=${recent.length} total=${conversationEntries.length}`);
+  console.log(`[DEDUP-TRACE] dedup check: normalized="${normalized.slice(0, 60)}" recent=${recent.length} total=${conversationEntries.length} cutoff=${cutoff}`);
+  for (const e of recent) {
+    const eNorm = e.text.trim().toLowerCase().replace(/[\s]+/g, " ");
+    console.log(`[DEDUP-TRACE]   compare id=${e.id} ts=${e.ts} eNorm="${eNorm.slice(0, 60)}" match=${eNorm === normalized}`);
+  }
   const dup = recent.find(e => e.text.trim().toLowerCase().replace(/[\s]+/g, " ") === normalized);
   if (dup) {
-    console.log(`[entry] Skipping duplicate user entry: "${text.slice(0, 60)}" (matches id=${dup.id})`);
+    console.log(`[DEDUP-TRACE] DEDUP HIT: Skipping duplicate from="${_source}" text="${text.slice(0, 60)}" (matches id=${dup.id})`);
     return dup;
   }
+  console.log(`[DEDUP-TRACE] CREATING NEW entry from="${_source}" text="${text.slice(0, 60)}"`);
+
   const entry: ConversationEntry = {
     id: ++entryIdCounter,
     role: "user",
@@ -2264,7 +2278,7 @@ function stopTmuxStreaming() {
         }
       }
       startTmuxStreaming(next.text);
-      if (!queuedEntry) addUserEntry(next.text); // Fallback if entry was lost
+      if (!queuedEntry) addUserEntry(next.text, false, "queue-drain-fallback"); // Fallback if entry was lost
       terminal.sendText(next.text);
       broadcast({ type: "voice_queue", count: remaining });
       } finally { _voiceQueueDraining = false; }
@@ -2370,7 +2384,7 @@ function startPassiveWatcher() {
         lastBroadcastText = "";
 
         if (userInput && !_isSystemContext) {
-          addUserEntry(userInput);
+          addUserEntry(userInput, false, "passive-watcher");
         }
 
         preInputSnapshot = snapshot;
@@ -2724,7 +2738,7 @@ function handleVoiceModeExchange(exchange: {
   if (role === "user") {
     // New turn for each voice exchange cycle
     currentTurn++;
-    addUserEntry(exchange.text);
+    addUserEntry(exchange.text, false, "voicemode-exchange");
   } else {
     const entry: ConversationEntry = {
       id: ++entryIdCounter,
@@ -2862,9 +2876,9 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   ws.send(
     JSON.stringify({
       type: "tmux",
-      session: terminal.currentTarget ?? "claude-voice",
+      session: terminal.displayTarget ?? terminal.currentTarget ?? "claude-voice",
       alive: terminal.isSessionAlive(),
-      current: terminal.currentTarget ?? "claude-voice",
+      current: terminal.displayTarget ?? terminal.currentTarget ?? "claude-voice",
     })
   );
 
@@ -2974,6 +2988,21 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     if (isBinary) {
       const audioData = raw as Buffer;
 
+      // Streaming STT: partial transcription during recording (preview only)
+      if ((ws as any)._expectPartial) {
+        (ws as any)._expectPartial = false;
+        // Don't block the main pipeline — transcribe async and send result to this client only
+        transcribeAudio(audioData).then(text => {
+          if (text && text.length > 1) {
+            console.log(`[streaming-stt] Partial: "${text.slice(0, 80)}"`);
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "partial_transcription", text }));
+          }
+        }).catch(err => {
+          console.warn("[streaming-stt] Partial transcription failed:", (err as Error).message);
+        });
+        return;
+      }
+
       // If we're expecting a pre-buffer WAV, store it and wait for the main audio
       if (pendingPreBuffer === null && pendingWakeCheck === false && (ws as any)._expectPreBuffer) {
         pendingPreBuffer = audioData;
@@ -3038,7 +3067,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         (ws as any)._testTranscribeOnly = false;
         console.log(`[test] Transcribe-only mode — not sending to terminal`);
         plog("test_transcribe_only", `"${text.slice(0, 80)}"`);
-        addUserEntry(text);
+        addUserEntry(text, false, "stt-test-transcribe");
         broadcast({ type: "voice_status", state: "idle" });
         broadcastPipelineTrace();
         return;
@@ -3052,7 +3081,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           console.log("Wake word detected!");
           // Snapshot BEFORE sending, then send, then start polling
           startTmuxStreaming(text);
-          addUserEntry(text); // After startTmuxStreaming which resets entries
+          addUserEntry(text, false, "stt-wake-word"); // After startTmuxStreaming which resets entries
           terminal.sendText(text);
         } else {
           console.log(`No wake word in: "${text}"`);
@@ -3063,11 +3092,11 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if (streamState === "IDLE" || streamState === "DONE") {
           // Normal: send immediately
           startTmuxStreaming(text);
-          addUserEntry(text);
+          addUserEntry(text, false, "stt-direct");
           terminal.sendText(text);
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
-          const queuedEntry = addUserEntry(text, true);
+          const queuedEntry = addUserEntry(text, true, "stt-queue");
           pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
@@ -3101,6 +3130,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     if (msg === "voice:prebuffer") {
       (ws as any)._expectPreBuffer = true;
       console.log("Pre-buffer signal received — next binary is WAV pre-buffer");
+      return;
+    }
+
+    // Partial streaming STT — next binary is partial audio for preview transcription
+    if (msg === "voice:partial") {
+      (ws as any)._expectPartial = true;
       return;
     }
 
@@ -3385,7 +3420,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     // List tmux sessions and windows
     if (msg === "tmux:list") {
       const sessions = terminal.listTmuxSessions?.() ?? [];
-      ws.send(JSON.stringify({ type: "tmux_sessions", sessions, current: terminal.currentTarget ?? "" }));
+      ws.send(JSON.stringify({ type: "tmux_sessions", sessions, current: terminal.displayTarget ?? terminal.currentTarget ?? "" }));
       return;
     }
 
@@ -3416,7 +3451,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         stopClientPlayback();
         broadcast({ type: "voice_status", state: "idle" });
         broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
-        broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.currentTarget });
+        broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
       }
       return;
     }
@@ -3428,7 +3463,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if ((ws as any)._isTestMode) {
           // Test mode: render user bubble in UI but do NOT forward to terminal
           console.log(`[terminal] Test mode text (not sent to Claude): "${text.slice(0, 60)}"`);
-          const testEntry = addUserEntry(text);
+          const testEntry = addUserEntry(text, false, "text-testmode");
           // Track test-created entries so test:clear-entries can remove them
           if (testEntry.id > 0) (ws as any)._testEntryIds?.add(testEntry.id);
         } else if (interactivePromptActive) {
@@ -3439,11 +3474,11 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           // Normal: send immediately
           console.log(`[terminal] Text input: "${text}"`);
           startTmuxStreaming(text);
-          addUserEntry(text);
+          addUserEntry(text, false, "text-direct");
           terminal.sendText(text);
         } else {
           // Claude is active — queue typed text same as voice
-          const queuedEntry = addUserEntry(text, true);
+          const queuedEntry = addUserEntry(text, true, "text-queue");
           pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[terminal] Text queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
@@ -3761,10 +3796,18 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           c => c.readyState === WebSocket.OPEN && !(c as any)._isTestMode && !(c as any)._isTestClient
         );
         if (realClients.length === 0 && Date.now() - exitSentAt > 30000) {
-          terminal.sendText(MURMUR_EXIT);
-          contextSent = false; // Allow context resend if server restarts fresh
-          exitSentAt = Date.now();
-          console.log("[context] Sent Murmur exit message to Claude");
+          // Guard: only send exit message to the voice session (claude-voice).
+          // If the user switched to a coordinator/agent session (e.g. murmur:4),
+          // sending MURMUR_EXIT would leak prose instructions into that session.
+          const targetSession = (terminal.displayTarget ?? terminal.currentTarget ?? "").split(":")[0];
+          if (targetSession !== "claude-voice") {
+            console.log(`[context] Skipping Murmur exit — target "${targetSession}" is not claude-voice`);
+          } else {
+            terminal.sendText(MURMUR_EXIT);
+            contextSent = false; // Allow context resend if server restarts fresh
+            exitSentAt = Date.now();
+            console.log("[context] Sent Murmur exit message to Claude");
+          }
         }
       }, 15000);
     }

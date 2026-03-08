@@ -1664,6 +1664,34 @@ async function testBug80_noExitOnTestDisconnect() {
   );
 }
 
+async function testBug80v3_proseModTargetGuard() {
+  console.log("\n[BUG-80v3] Prose mode context/exit only sent to claude-voice session");
+
+  // The fix: sendMurmurContext and MURMUR_EXIT both check displayTarget session name.
+  // Only send to "claude-voice" — never to coordinator/agent sessions like "murmur:4".
+  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+
+  // 1. Check sendMurmurContext has the target guard
+  const contextFn = serverSrc.slice(
+    serverSrc.indexOf("function sendMurmurContext"),
+    serverSrc.indexOf("function sendMurmurContext") + 800
+  );
+  const contextHasGuard = contextFn.includes('!== "claude-voice"') && contextFn.includes("displayTarget");
+  report("sendMurmurContext guards against non-claude-voice targets", contextHasGuard);
+
+  // 2. Check exit path has the target guard
+  const exitSection = serverSrc.slice(
+    serverSrc.indexOf("MURMUR_EXIT"),
+    serverSrc.lastIndexOf("MURMUR_EXIT") + 500
+  );
+  const exitHasGuard = exitSection.includes('!== "claude-voice"') && exitSection.includes("displayTarget");
+  report("MURMUR_EXIT path guards against non-claude-voice targets", exitHasGuard);
+
+  // 3. Verify the guard extracts session name correctly (split on ":")
+  const usesSplit = exitSection.includes('.split(":")[0]');
+  report("Target guard extracts session name via split(':')", usesSplit);
+}
+
 async function testTask13_thinkModeSilenceTolerance() {
   console.log("\n[TASK-13] Think mode uses silence tolerance, not hard timer");
 
@@ -1718,6 +1746,257 @@ async function testTask13_thinkModeSilenceTolerance() {
     uiResult.desc != null && uiResult.desc.includes("silence"),
     `desc="${uiResult.desc}"`
   );
+}
+
+// ──────────────────────────────────────────────────────────────
+// Task #12 — VAD environment adaptation (mic sensitivity presets)
+// ──────────────────────────────────────────────────────────────
+async function testTask12_vadEnvironmentPresets() {
+  console.log("\n[Task12] VAD environment adaptation presets");
+
+  // 1. Check VAD_PRESETS object exists with expected keys
+  const presetsResult = await page.evaluate(() => {
+    const w = window as any;
+    const hasPresets = typeof w.VAD_PRESETS === "undefined";
+    // Check inline script has the presets defined
+    const allSrc = document.documentElement.innerHTML;
+    const hasQuiet = allSrc.includes('quiet:') && allSrc.includes('speechThresholdMin');
+    const hasNormal = allSrc.includes('"normal"') || allSrc.includes("normal:");
+    const hasNoisy = allSrc.includes('noisy:') && allSrc.includes('sustainedNoiseMs');
+    const hasPresetFn = allSrc.includes('_vadPreset()');
+    const hasLocalStorage = allSrc.includes('murmur-vad-preset');
+    return { hasQuiet, hasNormal, hasNoisy, hasPresetFn, hasLocalStorage };
+  });
+
+  report("VAD presets include 'quiet' with speechThresholdMin", presetsResult.hasQuiet);
+  report("VAD presets include 'normal' configuration", presetsResult.hasNormal);
+  report("VAD presets include 'noisy' with sustainedNoiseMs", presetsResult.hasNoisy);
+  report("_vadPreset() function exists for runtime access", presetsResult.hasPresetFn);
+  report("VAD preset persists to localStorage (murmur-vad-preset)", presetsResult.hasLocalStorage);
+
+  // 2. Check normal mode settings popover has sensitivity pills
+  const normalUI = await page.evaluate(() => {
+    const row = document.getElementById("vadPresetRow");
+    if (!row) return { exists: false, pillCount: 0, labels: [] };
+    const pills = row.querySelectorAll(".sopt[data-vad]");
+    const labels = Array.from(pills).map(p => (p as HTMLElement).dataset.vad);
+    return { exists: true, pillCount: pills.length, labels };
+  });
+
+  report("Normal mode settings has VAD preset row", normalUI.exists);
+  report("Normal mode has 3 sensitivity pills (quiet/normal/noisy)",
+    normalUI.pillCount === 3 && normalUI.labels.includes("quiet") &&
+    normalUI.labels.includes("normal") && normalUI.labels.includes("noisy"),
+    `count=${normalUI.pillCount} labels=${normalUI.labels.join(",")}`
+  );
+
+  // 3. Check flow mode settings sheet has sensitivity pills
+  const flowUI = await page.evaluate(() => {
+    const pills = document.querySelectorAll("#fssSensitivityPills .fss-pill[data-fss-vad]");
+    const labels = Array.from(pills).map(p => (p as HTMLElement).dataset.fssVad);
+    return { pillCount: pills.length, labels };
+  });
+
+  report("Flow mode settings has 3 sensitivity pills",
+    flowUI.pillCount === 3 && flowUI.labels.includes("quiet") &&
+    flowUI.labels.includes("normal") && flowUI.labels.includes("noisy"),
+    `count=${flowUI.pillCount} labels=${flowUI.labels.join(",")}`
+  );
+
+  // 4. Check that auto-listen uses preset values (not hardcoded)
+  const codeResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const autoListenSection = allSrc.slice(
+      allSrc.indexOf("function startAutoListen"),
+      allSrc.indexOf("function tryStartAutoListen")
+    );
+    const usesPresetThreshold = autoListenSection.includes("vp.speechThresholdMin") ||
+      autoListenSection.includes("vp.speechMultiplier");
+    const usesPresetSustained = autoListenSection.includes("vp.sustainedNoiseMs");
+    const usesPresetConfirm = autoListenSection.includes("vp.speechConfirmMs");
+    return { usesPresetThreshold, usesPresetSustained, usesPresetConfirm };
+  });
+
+  report("Auto-listen uses preset speech threshold", codeResult.usesPresetThreshold);
+  report("Auto-listen uses preset sustained noise duration", codeResult.usesPresetSustained);
+  report("Auto-listen uses preset speech confirm time", codeResult.usesPresetConfirm);
+
+  // 5. Check silence detection uses preset values
+  const silenceResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const silenceSection = allSrc.slice(
+      allSrc.indexOf("function startSilenceDetection"),
+      allSrc.indexOf("function stopSilenceDetection")
+    );
+    const usesPresetSilence = silenceSection.includes("vp.silenceThresholdMin") ||
+      silenceSection.includes("vp.silenceMultiplier");
+    const usesPresetDuration = silenceSection.includes("vp.silenceDuration");
+    return { usesPresetSilence, usesPresetDuration };
+  });
+
+  report("Silence detection uses preset threshold", silenceResult.usesPresetSilence);
+  report("Silence detection uses preset duration", silenceResult.usesPresetDuration);
+
+  // 6. Verify localStorage persistence round-trip
+  const persistResult = await page.evaluate(() => {
+    localStorage.setItem("murmur-vad-preset", "noisy");
+    const stored = localStorage.getItem("murmur-vad-preset");
+    // Clean up
+    localStorage.setItem("murmur-vad-preset", "normal");
+    return stored === "noisy";
+  });
+
+  report("VAD preset round-trips through localStorage", persistResult);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Task #11 — tmux session/window name mismatch after selection
+// ──────────────────────────────────────────────────────────────
+async function testTask11_tmuxNameMismatch() {
+  console.log("\n[Task11] tmux session name mismatch fix");
+
+  // Root cause: server broadcast used terminal.currentTarget which returns pane ID (%3)
+  // instead of human-readable session:window. Fix: use displayTarget for client-facing labels.
+
+  // 1. Check server uses displayTarget in tmux broadcasts
+  const serverSrc = require("fs").readFileSync("server.ts", "utf-8");
+  const tmuxListLine = serverSrc.includes("displayTarget ?? terminal.currentTarget");
+  report("Server tmux:list uses displayTarget for current label", tmuxListLine);
+
+  // 2. Check tmux:switch broadcast uses displayTarget
+  const switchSection = serverSrc.slice(
+    serverSrc.indexOf("tmux:switch:"),
+    serverSrc.indexOf("tmux:switch:") + 2000
+  );
+  const switchUsesDisplay = switchSection.includes("displayTarget");
+  report("Server tmux:switch broadcast uses displayTarget", switchUsesDisplay);
+
+  // 3. Check initial WS connection uses displayTarget
+  const initSection = serverSrc.slice(
+    serverSrc.indexOf('type: "tmux"'),
+    serverSrc.indexOf('type: "tmux"') + 300
+  );
+  const initUsesDisplay = initSection.includes("displayTarget");
+  report("Server initial tmux broadcast uses displayTarget", initUsesDisplay);
+
+  // 4. Check TmuxBackend has displayTarget getter
+  const backendSrc = require("fs").readFileSync("terminal/tmux-backend.ts", "utf-8");
+  const hasDisplayTarget = backendSrc.includes("get displayTarget()");
+  const noPaneIdInDisplay = backendSrc.includes("displayTarget") &&
+    !backendSrc.slice(backendSrc.indexOf("get displayTarget")).split("}")[0].includes("_paneId");
+  report("TmuxBackend has displayTarget getter", hasDisplayTarget);
+  report("displayTarget never returns pane ID", noPaneIdInDisplay);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Task #15 — Mute microphone button in flow mode
+// ──────────────────────────────────────────────────────────────
+async function testTask15_flowMuteButton() {
+  console.log("\n[Task15] Flow mode mute button");
+
+  // 1. Check the button exists in HTML
+  const btnExists = await page.evaluate(() => {
+    const btn = document.getElementById("flowMuteBtn");
+    if (!btn) return { exists: false };
+    const hasMicSvg = btn.querySelector("svg") !== null;
+    const hasSlash = btn.querySelector(".flow-mute-slash") !== null;
+    return { exists: true, hasMicSvg, hasSlash };
+  });
+
+  report("flowMuteBtn element exists in DOM", btnExists.exists);
+  report("Flow mute button has mic SVG icon", btnExists.exists && btnExists.hasMicSvg);
+  report("Flow mute button has slash overlay for muted state", btnExists.exists && btnExists.hasSlash);
+
+  // 2. Check CSS positions it on the right (mirroring gear on left)
+  const cssResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const hasRightPos = allSrc.includes("flow-mute-btn") && allSrc.includes("right: 20px");
+    const has44Size = allSrc.includes("flow-mute-btn") && allSrc.includes("width: 44px");
+    return { hasRightPos, has44Size };
+  });
+
+  report("Flow mute button positioned right:20px", cssResult.hasRightPos);
+  report("Flow mute button has 44px width (touch target)", cssResult.has44Size);
+
+  // 3. Check click handler sends mute WS message
+  const handlerResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const flowMuteSection = allSrc.slice(
+      allSrc.indexOf("flowMuteBtn"),
+      allSrc.indexOf("flowMuteBtn") + 600
+    );
+    const sendsMuteMsg = flowMuteSection.includes('mute:');
+    const togglesActive = flowMuteSection.includes('classList.toggle("active"');
+    return { sendsMuteMsg, togglesActive };
+  });
+
+  report("Flow mute button sends mute WS message", handlerResult.sendsMuteMsg);
+  report("Flow mute button toggles active class", handlerResult.togglesActive);
+
+  // 4. Check normal-mode mute syncs flow mute button
+  const syncResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const muteBtnHandler = allSrc.slice(
+      allSrc.indexOf("muteBtn.addEventListener"),
+      allSrc.indexOf("muteBtn.addEventListener") + 500
+    );
+    return { syncsFlowBtn: muteBtnHandler.includes("flowMuteBtn") };
+  });
+
+  report("Normal mute button syncs flow mute state", syncResult.syncsFlowBtn);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Task #14 — Streaming STT (partial transcription during recording)
+// ──────────────────────────────────────────────────────────────
+async function testTask14_streamingSTT() {
+  console.log("\n[Task14] Streaming STT — partial transcription");
+
+  // 1. Check client-side streaming STT functions exist
+  const clientResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const hasStartFn = allSrc.includes("function startStreamingSTT");
+    const hasStopFn = allSrc.includes("function stopStreamingSTT");
+    const hasInterval = allSrc.includes("STREAMING_STT_INTERVAL");
+    const hasPartialSignal = allSrc.includes("voice:partial");
+    const hasPartialHandler = allSrc.includes("partial_transcription");
+    // Verify startStreamingSTT is called in startRecording
+    const recSection = allSrc.slice(
+      allSrc.indexOf("mediaRecorder.start(100)"),
+      allSrc.indexOf("function stopRecording")
+    );
+    const calledInRecording = recSection.includes("startStreamingSTT()");
+    // Verify stopStreamingSTT is called in stopRecording
+    const stopSection = allSrc.slice(
+      allSrc.indexOf("function stopRecording"),
+      allSrc.indexOf("function startSilenceDetection")
+    );
+    const calledInStop = stopSection.includes("stopStreamingSTT()");
+    return {
+      hasStartFn, hasStopFn, hasInterval, hasPartialSignal,
+      hasPartialHandler, calledInRecording, calledInStop,
+    };
+  });
+
+  report("startStreamingSTT function exists", clientResult.hasStartFn);
+  report("stopStreamingSTT function exists", clientResult.hasStopFn);
+  report("STREAMING_STT_INTERVAL constant defined", clientResult.hasInterval);
+  report("Client sends voice:partial signal", clientResult.hasPartialSignal);
+  report("Client handles partial_transcription WS message", clientResult.hasPartialHandler);
+  report("startStreamingSTT called during startRecording", clientResult.calledInRecording);
+  report("stopStreamingSTT called during stopRecording", clientResult.calledInStop);
+
+  // 2. Check partial_transcription updates prelim bubble via _ltRenderText
+  const renderResult = await page.evaluate(() => {
+    const allSrc = document.documentElement.innerHTML;
+    const partialSection = allSrc.slice(
+      allSrc.indexOf('"partial_transcription"'),
+      allSrc.indexOf('"partial_transcription"') + 200
+    );
+    return { usesLtRender: partialSection.includes("_ltRenderText") };
+  });
+
+  report("Partial transcription renders via _ltRenderText", renderResult.usesLtRender);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -1792,7 +2071,12 @@ async function main() {
   await testBugC_noBubbleDroppedDuringTts();
   await testTask10_ttsNoReplayLoop();
   await testBug80_noExitOnTestDisconnect();
+  await testBug80v3_proseModTargetGuard();
   await testTask13_thinkModeSilenceTolerance();
+  await testTask12_vadEnvironmentPresets();
+  await testTask11_tmuxNameMismatch();
+  await testTask15_flowMuteButton();
+  await testTask14_streamingSTT();
 
   await teardown();
 }

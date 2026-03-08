@@ -22,6 +22,11 @@ export class TmuxBackend implements TerminalManager {
     return this._window >= 0 ? `${this._session}:${this._window}` : this._session;
   }
 
+  /** Human-readable session:window label (never a pane ID) */
+  get displayTarget(): string {
+    return this._window >= 0 ? `${this._session}:${this._window}` : this._session;
+  }
+
   constructor(session = DEFAULT_SESSION) {
     this._session = session;
     this._window = -1;

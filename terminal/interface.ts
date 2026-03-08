@@ -54,8 +54,11 @@ export interface TerminalManager {
   /** List all tmux sessions and their windows (tmux only — returns [] on pty) */
   listTmuxSessions?(): TmuxSessionInfo[];
 
-  /** The current tmux target string (e.g. "claude-voice" or "main:1") */
+  /** The current tmux target string (e.g. "claude-voice" or "main:1") — may be a pane ID */
   readonly currentTarget?: string;
+
+  /** Human-readable session:window label (never a pane ID like %3) */
+  readonly displayTarget?: string;
 }
 
 /**
