@@ -3663,6 +3663,11 @@
     let ttsMuted = false;
     let currentVoice = "_local:default";
     let thinkingBubble = null;
+    // Hoisted from later in the file — referenced before their original declaration sites.
+    // Without hoisting, let TDZ errors crash the page (no WS, all indicators gray).
+    let ttsPlaying = false;
+    let autoListenEnabled = false; // Re-initialized from _pushToTalkMode at declaration site
+    let _vadPresetKey = localStorage.getItem("murmur-vad-preset") || "normal";
 
     // Apply saved interaction mode
     let _modeReady = false;
@@ -5695,7 +5700,7 @@
         sustainedNoiseMs: 3000,
       },
     };
-    let _vadPresetKey = localStorage.getItem("murmur-vad-preset") || "normal";
+    _vadPresetKey = localStorage.getItem("murmur-vad-preset") || "normal"; // Hoisted to global state
     if (!VAD_PRESETS[_vadPresetKey]) _vadPresetKey = "normal";
     function _vadPreset() { return VAD_PRESETS[_vadPresetKey]; }
 
@@ -5835,7 +5840,7 @@
     }
 
     let _pushToTalkMode = localStorage.getItem("murmur-ptt-mode") === "1";
-    let autoListenEnabled = !_pushToTalkMode;
+    autoListenEnabled = !_pushToTalkMode; // Hoisted to global state
     let autoListenActive = false;
     let speechConfirmStart = 0;
     const SPEECH_THRESHOLD_MIN = 0.012;  // Legacy reference — actual value from _vadPreset()
@@ -6258,7 +6263,7 @@
     // Falls back to HTML Audio element if Web Audio fails.
     let ttsCurrentSource = null; // Web Audio BufferSourceNode
     let ttsPlaybackTimer = null;
-    let ttsPlaying = false;
+    ttsPlaying = false; // Hoisted to global state
     let ttsAnalyser = null;
     let ttsDataArray = null;
     let ttsGainNode = null;
