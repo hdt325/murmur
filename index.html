@@ -4724,6 +4724,7 @@
           if (msg.current || msg.session) {
             const target = msg.current || msg.session;
             _currentTmuxTarget = target;
+            localStorage.setItem("murmur-tmux-target", target);
             if (sessionBtn) {
               // Collapsed button: show window name only
               sessionBtn.textContent = getWindowDisplayName(target);
@@ -7831,7 +7832,7 @@
     });
 
     // Session selector
-    let _currentTmuxTarget = "claude-voice";
+    let _currentTmuxTarget = localStorage.getItem("murmur-tmux-target") || "claude-voice";
     const _tmuxWindowNames = new Map(); // "session:index" → window name
     const sessionBtn = document.getElementById("sessionBtn");
     const sessionPopover = document.getElementById("sessionPopover");
@@ -7939,6 +7940,7 @@
     // WS handler for tmux_sessions — rendered inline in ws.onmessage below
     window._onTmuxSessions = (data) => {
       _currentTmuxTarget = data.current || _currentTmuxTarget;
+      if (data.current) localStorage.setItem("murmur-tmux-target", data.current);
       renderSessPopover(data.sessions || []);
       // Collapsed button: show window name only (session color indicates which session)
       sessionBtn.textContent = getWindowDisplayName(_currentTmuxTarget);

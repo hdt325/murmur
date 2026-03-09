@@ -306,6 +306,30 @@ Push to main
 
 ## Testing
 
+> **MANDATORY: Real Claude Sessions for Testing — NO Fake Injection**
+>
+> ALL interaction tests MUST use real Claude Code sessions in isolated tmux windows.
+> Do NOT use `test:entries-full` injection for tests that verify entry creation, scrollback,
+> window switching, TTS pipeline, dedup, role detection, or clean/verbose filtering.
+>
+> **Why**: Injected entries bypass the entire server-side pipeline (`capturePaneScrollback` →
+> `extractStructuredOutput` → `loadScrollbackEntries` → `broadcastCurrentOutput`). Bugs in
+> this pipeline (bubbles disappearing on switch, zero assistant entries on fresh load) are
+> INVISIBLE to injection-based tests.
+>
+> **How**:
+> 1. Create isolated tmux session: `tmux new-session -d -s murmur-test-agents`
+> 2. Spawn Claude: `tmux send-keys -t murmur-test-agents:0 "claude --dangerously-skip-permissions" Enter`
+> 3. Send real prompts: `tmux send-keys -t murmur-test-agents:0 "Say hello" Enter`
+> 4. Wait for response, verify entries appear through full pipeline
+> 5. Kill agents + destroy session in teardown (`try/finally`)
+>
+> **NEVER use the `murmur` session or any agent windows the user is working in.**
+> Test agents go in `murmur-test-agents` only.
+>
+> **Injection acceptable ONLY for**: pure CSS/layout checks, DOM structure, button sizes/colors,
+> WebSocket message format validation — i.e., tests that don't touch the entry pipeline.
+
 > **CRITICAL — SELF-INTERRUPTION PREVENTION**
 > Tests MUST be run in the **`test-runner`** tmux session ONLY.
 >

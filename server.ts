@@ -869,9 +869,11 @@ function logInput(inputId: string, source: InputLog["source"], userEntryId: numb
 // Clean raw text for TTS — strips code, URLs, markdown, etc.
 function cleanTtsText(text: string): string {
   return text
-    // M12: Strip ANSI escape sequences
+    // M12: Strip ANSI escape sequences (CSI, OSC, charset, and other escapes)
     // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")   // CSI sequences (colors, cursor)
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")  // OSC sequences (title, hyperlinks)
+    .replace(/\x1b[()][A-Z0-9]/g, "")         // Charset selection (e.g. \x1b(B)
     // M4: Strip HTML tags, then decode common HTML entities
     .replace(/<[^>]+>/g, "")
     .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
@@ -2031,6 +2033,19 @@ function stopClientPlayback2(reason: GenerationEvent["reason"] = "user_stop", en
   } else {
     // new_input: let existing queue drain naturally. Don't abort fetches or clear queue.
     // The gen bump prevents NEW stale callbacks from old async paths, but existing jobs play through.
+    // HOWEVER: if the currently playing job is stuck (playing for >10s on a new_input bump),
+    // force-clear it so the queue can advance. This prevents stale playing jobs from blocking
+    // new content indefinitely.
+    if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.playingSince > 0) {
+      const elapsed = Date.now() - ttsCurrentlyPlaying.playingSince;
+      if (elapsed > 10000) {
+        console.warn(`[tts2] new_input bump: currently playing job=${ttsCurrentlyPlaying.jobId} stuck for ${(elapsed / 1000).toFixed(0)}s — force-clearing`);
+        ttsCurrentlyPlaying.state = "failed";
+        ttsCurrentlyPlaying = null;
+        if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+        broadcast({ type: "tts_stop", reason: "stall_recovery" });
+      }
+    }
     console.log(`[tts2] Soft gen bump (reason=${reason}) — preserving ${ttsJobQueue.length} queued jobs`);
   }
 }
@@ -2394,9 +2409,12 @@ try {
   // Not running inside tmux — no exclusion needed
 }
 
-/** Get the window key for the currently active tmux pane */
+/** Get the window key for the currently active tmux window.
+ *  Uses displayTarget (session:windowIdx) rather than currentTarget (pane ID)
+ *  because pane IDs change when agents spawn/close panes in the same window,
+ *  causing cache misses and lost conversation entries on switch-back. */
 function getWindowKey(): string {
-  return terminal?.currentTarget ?? currentWindowKey ?? "_default";
+  return terminal?.displayTarget ?? currentWindowKey ?? "_default";
 }
 
 /** Check if the current target is a voice session (claude-voice).
@@ -2616,6 +2634,9 @@ function pushEntry(entry: ConversationEntry): void {
     }
   }
   conversationEntries.push(entry);
+  // Enforce cap on every push — prevents overflow during rapid gen bumps
+  // where dedicated trimEntriesToCap call sites may be skipped.
+  trimEntriesToCap();
 }
 
 // Add a user entry and broadcast the updated entry list
@@ -2650,11 +2671,11 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   //     has a spurious space ("bro wn" vs original "brown"). Stripping all spaces
   //     makes both "bro wn fox" and "brown fox" → "brownfox" → match.
   //
-  // Use time-based window (30s) instead of turn-based — turn counter can jump during
+  // Use time-based window (60s) instead of turn-based — turn counter can jump during
   // concurrent activity, causing the dedup to miss duplicates across turn boundaries.
   const normalized = text.trim().toLowerCase().replace(/[\s]+/g, " ");
   const normalizedNoSpaces = normalized.replace(/\s/g, "");
-  const dedupeWindowMs = 30000;
+  const dedupeWindowMs = 60000;
   const cutoff = Date.now() - dedupeWindowMs;
   const recent = conversationEntries.filter(e => e.role === "user" && e.ts >= cutoff);
   console.log(`[DEDUP-TRACE] dedup check: normalized="${normalized.slice(0, 60)}" noSpaces="${normalizedNoSpaces.slice(0, 40)}" recent=${recent.length} total=${conversationEntries.length}`);
@@ -2761,7 +2782,8 @@ function isChromeSkip(trimmed: string): string {
     return "murmur_context";
   }
   if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) return "json_notification";
-  if (/^Background command .+ completed/i.test(trimmed)) return "bg_task_notification";
+  if (/^Background command/i.test(trimmed)) return "bg_task_notification";
+  if (/^\d+\s+background\s+task/i.test(trimmed)) return "bg_task_count";
   // NOTE: Tool markers (⏺ Bash, ⎿, Read(...), ctrl+o expand, etc.) are NOT filtered here.
   // They are handled by the state machine's TOOL_BLOCK transitions so that continuation
   // lines are properly captured. Filtering them here would prevent state transitions
@@ -3085,6 +3107,9 @@ function loadScrollbackEntries(): ConversationEntry[] {
       if (/context left until/i.test(trimmed)) continue;
       if (/auto-compact/i.test(trimmed)) continue;
       if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(trimmed)) continue;
+      if (/^Background command/i.test(trimmed)) continue;
+      if (/^\d+\s+background\s+task/i.test(trimmed)) continue;
+      if (/^[✻✶✢✽]/.test(trimmed)) continue;
       responseLines.push(lines[i]);
     }
 
@@ -3100,9 +3125,15 @@ function loadScrollbackEntries(): ConversationEntry[] {
         turn: turnNum,
         window: getWindowKey(),
       });
+      console.log(`[scrollback] Turn ${t}: user="${start.input.slice(0, 60)}" → assistant text ${text.length} chars`);
+    } else {
+      console.log(`[scrollback] Turn ${t}: user="${start.input.slice(0, 60)}" → NO assistant text (${responseLines.length} response lines, all empty after filter)`);
     }
   }
 
+  const userCount = entries.filter(e => e.role === "user").length;
+  const assistantCount = entries.filter(e => e.role === "assistant").length;
+  console.log(`[scrollback] Result: ${entries.length} entries (${userCount} user, ${assistantCount} assistant) for window=${getWindowKey()}`);
   return entries;
 }
 
@@ -3225,9 +3256,17 @@ function broadcastCurrentOutput() {
       // New paragraph — create entry (skip if identical text exists in recent entries that
       // were NOT already matched to a different paragraph this cycle). This allows entries
       // with identical text (e.g., repeated list items) to each get their own entry.
-      const recentEntries = conversationEntries.slice(-20);
-      const isDup = recentEntries.some(e => e.role === "assistant" && e.text === para.text &&
-        (e.turn === currentTurn || currentTurn - e.turn <= 2) && !matchedEntryIds.has(e.id));
+      // Use normalized comparison to catch duplicates across gen bumps (BUG-A pattern).
+      const recentEntries = conversationEntries.slice(-30);
+      const paraNorm = para.text.trim().toLowerCase().replace(/\s+/g, " ");
+      const isDup = recentEntries.some(e => {
+        if (e.role !== "assistant" || matchedEntryIds.has(e.id)) return false;
+        // Exact text match within recent turns
+        if (e.text === para.text && (e.turn === currentTurn || currentTurn - e.turn <= 2)) return true;
+        // Normalized match across gen bumps — catches re-created entries with identical content
+        const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
+        return eNorm === paraNorm && (e.turn === currentTurn || currentTurn - e.turn <= 3);
+      });
       if (!isDup) {
         // First new assistant content in this turn — cancel old-turn TTS so new response plays
         cancelOldTurnJobs();
@@ -5165,8 +5204,21 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     // This is the PRIMARY activation trigger: no scraping/broadcasting happens until
     // a client sends this. Uses shared activateWindow() for all resets.
     if (msg.startsWith("window_preference:")) {
-      const preferred = msg.slice(18).trim();
+      let preferred = msg.slice(18).trim();
       if (!preferred) return;
+      // Handle bare session names without window index (e.g. "claude-voice" → "claude-voice:0")
+      // Client may send bare session name on first load before it knows the window index.
+      if (!preferred.includes(":")) {
+        // Try to use the saved target if it matches this session
+        const saved = loadSettings().tmuxTarget;
+        if (saved && saved.startsWith(preferred + ":")) {
+          preferred = saved;
+          console.log(`[ws] Bare session "${msg.slice(18)}" → using saved target "${preferred}"`);
+        } else {
+          preferred = preferred + ":0";
+          console.log(`[ws] Bare session "${msg.slice(18)}" → defaulting to "${preferred}"`);
+        }
+      }
       const currentTarget = terminal?.displayTarget ?? terminal?.currentTarget ?? "";
       // If already on this window and window is active, nothing to do
       if (isWindowActive() && (currentTarget === preferred || getWindowKey() === preferred)) {
@@ -5897,6 +5949,97 @@ app.get("/debug/kokoro-log", (_req, res) => {
   res.json(_kokoroLog);
 });
 
+// Diagnostic: test loadScrollbackEntries against a specific target without modifying state
+// Usage: /debug/scrollback-parse?target=murmur:3
+app.get("/debug/scrollback-parse", (req, res) => {
+  const target = req.query.target as string | undefined;
+  if (!target) {
+    res.json({ error: "Missing ?target=session:window" });
+    return;
+  }
+  try {
+    const lastColon = target.lastIndexOf(":");
+    if (lastColon === -1) { res.json({ error: "Target must be session:window" }); return; }
+    const session = target.slice(0, lastColon);
+    const windowIdx = parseInt(target.slice(lastColon + 1));
+    if (isNaN(windowIdx)) { res.json({ error: "Invalid window index" }); return; }
+
+    // Capture scrollback from the target without modifying terminal state
+    const scrollback = execFileSync("tmux", [
+      "capture-pane", "-t", `${session}:${windowIdx}`, "-p", "-S", "-2000"
+    ], { encoding: "utf-8", timeout: 3000 });
+
+    const lines = scrollback.split("\n");
+    const turnStarts: { lineIdx: number; input: string }[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trimEnd();
+      const m = trimmed.match(/^❯\s+(.+)$/);
+      if (m && m[1].trim()) {
+        turnStarts.push({ lineIdx: i, input: m[1].trim() });
+      }
+    }
+
+    const recentTurns = turnStarts.slice(-10);
+    const turnResults: Array<{
+      input: string;
+      responseLineCount: number;
+      filteredLineCount: number;
+      assistantTextLength: number;
+      assistantTextPreview: string;
+      skippedAsContext: boolean;
+    }> = [];
+
+    for (let t = 0; t < recentTurns.length; t++) {
+      const start = recentTurns[t];
+      const endLineIdx = t + 1 < recentTurns.length ? recentTurns[t + 1].lineIdx : lines.length;
+      const skippedAsContext = MURMUR_CONTEXT_FILTER.test(start.input);
+
+      const responseLines: string[] = [];
+      let filteredCount = 0;
+      for (let i = start.lineIdx + 1; i < endLineIdx; i++) {
+        const trimmed = lines[i].trim();
+        if (!trimmed) { responseLines.push(""); continue; }
+        if (/^[─━═]{3,}/.test(trimmed)) { filteredCount++; continue; }
+        if (/^❯/.test(trimmed)) { filteredCount++; continue; }
+        if (isSpinnerLine(trimmed)) { filteredCount++; continue; }
+        if (MURMUR_CONTEXT_FILTER.test(trimmed)) { filteredCount++; continue; }
+        if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { filteredCount++; continue; }
+        if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { filteredCount++; continue; }
+        if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) { filteredCount++; continue; }
+        if (/bypass\s+permissions/i.test(trimmed)) { filteredCount++; continue; }
+        if (/context left until/i.test(trimmed)) { filteredCount++; continue; }
+        if (/auto-compact/i.test(trimmed)) { filteredCount++; continue; }
+        if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(trimmed)) { filteredCount++; continue; }
+        if (/^Background command/i.test(trimmed)) { filteredCount++; continue; }
+        if (/^\d+\s+background\s+task/i.test(trimmed)) { filteredCount++; continue; }
+        if (/^[✻✶✢✽]/.test(trimmed)) { filteredCount++; continue; }
+        responseLines.push(lines[i]);
+      }
+
+      const text = reflowText(responseLines.join("\n")).trim();
+      turnResults.push({
+        input: start.input.slice(0, 120),
+        responseLineCount: endLineIdx - start.lineIdx - 1,
+        filteredLineCount: filteredCount,
+        assistantTextLength: text.length,
+        assistantTextPreview: text.slice(0, 200),
+        skippedAsContext: skippedAsContext,
+      });
+    }
+
+    res.json({
+      target,
+      totalLines: lines.length,
+      turnsFound: turnStarts.length,
+      recentTurnsAnalyzed: recentTurns.length,
+      turnResults,
+      sampleLines: lines.slice(0, 10).map((l, i) => `[${i}] ${l.slice(0, 120)}`),
+    });
+  } catch (err) {
+    res.json({ error: (err as Error).message });
+  }
+});
+
 app.get("/debug/chunk-flow", (_req, res) => {
   res.json(_chunkFlowLog);
 });
@@ -6083,7 +6226,7 @@ server.listen(PORT, "0.0.0.0", () => {
   // Actual scraping/broadcasting begins only after a client sends window_preference.
   startPassiveWatcher();
   console.log(`  Passive pane watcher: started (gated on window_preference)`);
-  setInterval(sweepStaleTtsJobs, 15000); // Periodic sweep for stuck TTS jobs
+  setInterval(sweepStaleTtsJobs, 10000); // Periodic sweep for stuck TTS jobs (10s)
 });
 
 // HTTPS server for remote access (Tailscale) — needed for mic permission on non-localhost
