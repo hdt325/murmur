@@ -2431,11 +2431,12 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   if (!isFirst) saveCurrentWindowEntries();
   terminal.switchTarget(session, windowIdx);
 
-  // CRITICAL: Reject activation if the resolved pane is the server's own pane.
-  // This prevents coordinator/agent output from leaking into conversation view.
-  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) {
-    console.log(`[window] BLOCKED: ${target} resolves to server's own pane ${_serverOwnPaneId} — refusing to scrape ourselves`);
-    return;
+  // Check if the resolved pane is the server's own pane.
+  // If so, skip scraping but still load cached entries — refusing to scrape ourselves
+  // prevents coordinator/agent output from leaking into conversation view.
+  const isOwnPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
+  if (isOwnPane) {
+    console.log(`[window] Own pane detected: ${target} resolves to ${_serverOwnPaneId} — refusing to scrape ourselves, serving cached entries`);
   }
 
   saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
@@ -2452,6 +2453,7 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   _pendingPromptInput = "";
   _pendingPromptInputTs = 0;
   _scrollbackCache = { text: "", ts: 0 };
+  lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
   if (streamState !== "IDLE") streamState = "IDLE";
   entryTtsCursor.clear();
 
@@ -2459,9 +2461,14 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   const cached = loadWindowEntries(currentWindowKey);
   if (cached) {
     setConversationEntries(cached.filter(e => !e.window || e.window === currentWindowKey));
-  } else {
+  } else if (!isOwnPane) {
+    // Only scrape scrollback for non-own panes — own pane scraping blocked to prevent
+    // coordinator/agent output from leaking into conversation view
     const scrollback = loadScrollbackEntries();
     setConversationEntries(scrollback);
+  } else {
+    // Own pane with no cached entries — start with empty (passive watcher won't scrape either)
+    setConversationEntries([]);
   }
   for (const e of conversationEntries) e.spoken = true;
   if (conversationEntries.length > 0) {
@@ -2486,6 +2493,14 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
     lastPassiveSnapshot = captureTmuxPane();
     preInputSnapshot = lastPassiveSnapshot;
   } catch {}
+  // Immediately broadcast terminal panel content from the new window
+  try {
+    const text = captureTerminalPane();
+    if (text) {
+      lastTerminalText = text;
+      broadcast({ type: "terminal", text });
+    }
+  } catch {}
 
   // On first activation, send Murmur context to voice session
   if (isFirst) sendMurmurContext(3000);
@@ -2509,6 +2524,79 @@ function saveCurrentWindowEntries(): void {
 /** Load entries for a window key from the map, or empty array if not cached */
 function loadWindowEntries(windowKey: string): ConversationEntry[] | null {
   return windowEntries.get(windowKey) ?? null;
+}
+
+/** Debounce timer for rapid window switches — only the last one executes */
+let _switchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Execute the actual window switch (called after debounce from tmux:switch: handler) */
+function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws").WebSocket): void {
+  if (!terminal.switchTarget) return;
+  console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
+  stopTmuxStreaming();
+  saveCurrentWindowEntries();
+  terminal.switchTarget(session, windowIdx);
+  saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
+  currentWindowKey = getWindowKey();
+  stopClientPlayback2("session_switch");
+  lastPassiveSnapshot = "";
+  _lastPassiveUserInput = "";
+  _lastPassiveUserInputTs = 0;
+  _cooldownThinking = false;
+  lastStreamEndTime = 0;
+  preInputSnapshot = "";
+  _scrollbackCache = { text: "", ts: 0 };
+  lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
+  if (streamState !== "IDLE") streamState = "IDLE";
+  entryTtsCursor.clear();
+
+  const isSelfPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
+  if (isSelfPane) {
+    console.log(`[tmux] Own pane detected (${_serverOwnPaneId}) — will skip scraping, serve cached entries only`);
+  }
+
+  const cached = loadWindowEntries(currentWindowKey);
+  if (cached) {
+    const cleaned = cached.filter(e => !e.window || e.window === currentWindowKey);
+    if (cleaned.length < cached.length) {
+      console.log(`[tmux] Cleaned ${cached.length - cleaned.length} cross-window entries from cache`);
+    }
+    setConversationEntries(cleaned);
+    console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
+  } else if (!isSelfPane) {
+    const scrollback = loadScrollbackEntries();
+    setConversationEntries(scrollback);
+    if (conversationEntries.length > 0) {
+      console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
+    } else {
+      console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
+    }
+  } else {
+    setConversationEntries([]);
+    console.log(`[tmux] Own pane with no cached entries — starting empty`);
+  }
+  for (const e of conversationEntries) e.spoken = true;
+  if (conversationEntries.length > 0) {
+    entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
+  }
+  broadcast({ type: "entry", entries: conversationEntries, partial: false });
+  broadcast({ type: "voice_status", state: "idle" });
+  broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
+  broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
+  try {
+    lastPassiveSnapshot = captureTmuxPane();
+    preInputSnapshot = lastPassiveSnapshot;
+    console.log(`[tmux] Initialized passive snapshot for ${currentWindowKey} (${lastPassiveSnapshot.length} chars)`);
+  } catch {}
+  // Immediately broadcast terminal panel content from the new window
+  // (don't wait for the 500ms poll — user sees stale content otherwise)
+  try {
+    const text = captureTerminalPane();
+    if (text) {
+      lastTerminalText = text;
+      broadcast({ type: "terminal", text });
+    }
+  } catch {}
 }
 
 /** Push an entry into conversationEntries with window tag automatically set */
@@ -3068,6 +3156,8 @@ const ENTRY_TTS_DELAY_MS = 200;
 // broadcasts { type: "entry" }, and triggers TTS for completed speakable entries.
 function broadcastCurrentOutput() {
   if (_isSystemContext) return; // Suppress UI during system context
+  // Never scrape/broadcast from the server's own pane — prevents coordinator output leaking
+  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return;
   const pane = captureTmuxPane();
   if (!pane) return;
 
@@ -3132,11 +3222,12 @@ function broadcastCurrentOutput() {
         continue;
       }
 
-      // New paragraph — create entry (skip if identical text exists in recent entries).
-      // Check last 20 entries regardless of turn to catch duplicates across generation bumps.
+      // New paragraph — create entry (skip if identical text exists in recent entries that
+      // were NOT already matched to a different paragraph this cycle). This allows entries
+      // with identical text (e.g., repeated list items) to each get their own entry.
       const recentEntries = conversationEntries.slice(-20);
       const isDup = recentEntries.some(e => e.role === "assistant" && e.text === para.text &&
-        (e.turn === currentTurn || currentTurn - e.turn <= 2));
+        (e.turn === currentTurn || currentTurn - e.turn <= 2) && !matchedEntryIds.has(e.id));
       if (!isDup) {
         // First new assistant content in this turn — cancel old-turn TTS so new response plays
         cancelOldTurnJobs();
@@ -3798,7 +3889,7 @@ function startPassiveWatcher() {
       // Also end the stream if still active
       if (streamState !== "IDLE" && streamState !== "DONE") {
         console.log("[passive] Interrupted prompt detected — ending stream");
-        streamState = "DONE";
+        streamState = "IDLE";
         lastStreamEndTime = Date.now();
         stopClientPlayback2("new_input");
         broadcast({ type: "voice_status", state: "idle" });
@@ -4804,7 +4895,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const safeTestPrefixes = [
         "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
         "mute:", "replay", "replay:", "text:",  // text: is handled separately with its own testmode check
-        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:", "window_preference:",  // TTS control messages safe for testing
+        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:", "window_preference:",
+        "tmux:switch:", "tmux:list",  // Window management — safe for testing (don't touch Claude session)
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
       if (!isSafe) {
@@ -4927,6 +5019,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       terminal.sendKey("Escape");
       stopTts();
       stopTmuxStreaming();
+      if (streamState !== "IDLE") streamState = "IDLE";
       // Also kill VoiceMode's sounddevice playback and any recording (Unix only)
       if (process.platform !== "win32") {
         try { execSync("pkill -f 'sounddevice\\|rec\\|sox\\|arecord' 2>/dev/null", { stdio: "ignore", timeout: 3000 }); } catch {}
@@ -5254,6 +5347,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
 
     // Switch to a different tmux session/window
     // Format: tmux:switch:ENCODED_SESSION:WINDOW_INDEX
+    // Debounced: rapid A→B→C switches only execute the final one
+    // Uses displayTarget for client-facing labels (not pane IDs)
     if (msg.startsWith("tmux:switch:")) {
       const rest = msg.slice("tmux:switch:".length);
       const lastColon = rest.lastIndexOf(":");
@@ -5261,70 +5356,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         const encodedSession = rest.slice(0, lastColon);
         const windowIdx = parseInt(rest.slice(lastColon + 1));
         const session = decodeURIComponent(encodedSession);
-        console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
-        stopTmuxStreaming();
-        // Save current window's entries before switching
-        saveCurrentWindowEntries();
-        terminal.switchTarget(session, windowIdx);
-        saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
-        currentWindowKey = getWindowKey();
-        // Stop TTS BEFORE loading new entries — prevents old audio continuing
-        stopClientPlayback2("session_switch");
-        // Reset passive watcher state for the new pane — stale snapshots from
-        // the old pane cause diff comparisons against wrong baseline, which is
-        // the root cause of all entries being keyed to one window.
-        lastPassiveSnapshot = "";
-        _lastPassiveUserInput = "";
-        _lastPassiveUserInputTs = 0;
-        _cooldownThinking = false;
-        lastStreamEndTime = 0;
-        preInputSnapshot = "";
-        _scrollbackCache = { text: "", ts: 0 };
-        // Reset stream state — new window starts IDLE
-        if (streamState !== "IDLE") {
-          streamState = "IDLE";
-        }
-        // Clear TTS cursor — sentence progress is per-window
-        entryTtsCursor.clear();
-
-        // Load entries for the new window: from cache if available, else from scrollback
-        const cached = loadWindowEntries(currentWindowKey);
-        if (cached) {
-          // Safety: filter out any entries from other windows that may have leaked in
-          const cleaned = cached.filter(e => !e.window || e.window === currentWindowKey);
-          if (cleaned.length < cached.length) {
-            console.log(`[tmux] Cleaned ${cached.length - cleaned.length} cross-window entries from cache`);
-          }
-          setConversationEntries(cleaned);
-          console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
-        } else {
-          const scrollback = loadScrollbackEntries();
-          setConversationEntries(scrollback);
-          if (conversationEntries.length > 0) {
-            console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
-          } else {
-            console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
-          }
-        }
-        // Mark ALL loaded entries as spoken to prevent auto-TTS re-queueing on switch
-        for (const e of conversationEntries) {
-          e.spoken = true;
-        }
-        if (conversationEntries.length > 0) {
-          entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
-        }
-        broadcast({ type: "entry", entries: conversationEntries, partial: false });
-        // Reset status indicators for the new session
-        broadcast({ type: "voice_status", state: "idle" });
-        broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
-        broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
-        // Initialize passive watcher snapshot for the new pane so it has a correct baseline
-        // (without this, lastPassiveSnapshot="" causes diff to detect all existing content as new)
-        try {
-          lastPassiveSnapshot = captureTmuxPane();
-          preInputSnapshot = lastPassiveSnapshot;
-          console.log(`[tmux] Initialized passive snapshot for ${currentWindowKey} (${lastPassiveSnapshot.length} chars)`);
-        } catch {}
+        // Cancel any pending switch — only the latest wins
+        if (_switchDebounceTimer) clearTimeout(_switchDebounceTimer);
+        _switchDebounceTimer = setTimeout(() => {
+          _switchDebounceTimer = null;
+          _executeWindowSwitch(session, windowIdx, ws);
+        }, 150);
       }
       return;
     }
@@ -5473,6 +5510,32 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         addNext();
       }, 300);
 
+      return;
+    }
+
+    // test:entries-full:JSON — create entries with full per-entry control (role, spoken, speakable)
+    // Input: JSON array of { text, role?, spoken?, speakable? } objects
+    // Broadcasts: entry list immediately (no TTS, no state transitions)
+    if (msg.startsWith("test:entries-full:")) {
+      let items: Array<{ text: string; role?: string; spoken?: boolean; speakable?: boolean }>;
+      try { items = JSON.parse(msg.slice(18)); } catch { console.warn("[test] Invalid JSON in test:entries-full"); return; }
+      console.log(`[test] Creating ${items.length} full entries`);
+
+      for (const item of items) {
+        const role = (item.role === "user" ? "user" : "assistant") as "user" | "assistant";
+        const entry: ConversationEntry = {
+          id: ++entryIdCounter,
+          role,
+          text: item.text,
+          speakable: role === "user" ? false : item.speakable !== false,
+          spoken: item.spoken === true,
+          ts: Date.now(),
+          turn: currentTurn,
+        };
+        pushEntry(entry);
+        (ws as any)._testEntryIds?.add(entry.id);
+      }
+      broadcast({ type: "entry", entries: conversationEntries, partial: false });
       return;
     }
 

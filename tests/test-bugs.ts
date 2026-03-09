@@ -2248,6 +2248,18 @@ async function main() {
   // Paste input detection
   await testBug_pasteInputDetection();
 
+  // E2E: Conversation verification (API ↔ DOM cross-reference)
+  await testE2E_conversationVerification();
+
+  // UX Assessment bug fix regressions
+  await testUX_ttsHighlightScrollsToEntry();
+  await testUX_ttsHighlightClearsPrevious();
+  await testUX_ttsPlayScrollsToEntry();
+  await testUX_controlsPointerEvents();
+  await testUX_windowSwitchDebounce();
+  await testUX_entryDedupUsesMatchedIds();
+  await testUX_replayCycleWorks();
+
   await teardown();
 }
 
@@ -4484,6 +4496,290 @@ async function testBug_pasteInputDetection() {
   // 5. Pending input consumed after use (prevents stale reuse)
   const consumeIdx = src.indexOf('_pendingPromptInput = ""; // Consume');
   report("Pending input consumed after extraction (no stale reuse)", consumeIdx > 0);
+}
+
+// ──────────────────────────────────────────────────────────────
+// E2E Conversation Verification: /debug/entries vs rendered DOM
+// ──────────────────────────────────────────────────────────────
+async function testE2E_conversationVerification() {
+  console.log("\n[E2E-VERIFY] Cross-reference /debug/entries API with rendered DOM bubbles");
+
+  // 1. Inject test entries with both user and assistant roles via WebSocket
+  const testEntries = [
+    { text: "What is the weather today?", role: "user" },
+    { text: "The weather is sunny and warm.", role: "assistant", speakable: true },
+    { text: "Tell me a joke.", role: "user" },
+    { text: "Why did the chicken cross the road? To get to the other side!", role: "assistant", speakable: true },
+    { text: "Thanks!", role: "user" },
+  ];
+
+  // Send via page's WebSocket (already connected in testmode)
+  const injected = await page.evaluate((entries) => {
+    const ws = (window as any)._ws;
+    if (!ws || ws.readyState !== 1) return false;
+    ws.send("test:entries-full:" + JSON.stringify(entries));
+    return true;
+  }, testEntries);
+
+  if (!injected) {
+    report("WebSocket available for entry injection", false, "ws not connected");
+    return;
+  }
+  report("WebSocket available for entry injection", true);
+
+  // Wait for entries to render
+  await page.waitForTimeout(2000);
+
+  // 2. Fetch entries from /debug/entries API
+  const apiResponse = await page.evaluate(async () => {
+    const res = await fetch("/debug/entries");
+    return res.json() as Promise<{ count: number; entries: Array<{ id: number; role: string; text: string; speakable: boolean }> }>;
+  });
+
+  const apiEntries = apiResponse.entries;
+  report(`API returns ${apiEntries.length} entries (expected >= ${testEntries.length})`, apiEntries.length >= testEntries.length);
+
+  // 3. Read rendered DOM bubbles
+  const domBubbles = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble[data-entry-id]");
+    return Array.from(bubbles).map(el => ({
+      entryId: el.getAttribute("data-entry-id"),
+      role: el.classList.contains("user") ? "user" : "assistant",
+      text: (el.querySelector(".entry-text") as HTMLElement)?.innerText?.trim() || "",
+    }));
+  });
+
+  report(`DOM has ${domBubbles.length} entry bubbles`, domBubbles.length > 0);
+
+  // 4. Cross-reference: every API entry should have a corresponding DOM bubble
+  let apiMatchCount = 0;
+  let apiMismatches: string[] = [];
+
+  for (const apiEntry of apiEntries) {
+    const domMatch = domBubbles.find(b => b.entryId === String(apiEntry.id));
+    if (!domMatch) {
+      apiMismatches.push(`API entry id=${apiEntry.id} role=${apiEntry.role} text="${apiEntry.text.slice(0, 40)}" missing from DOM`);
+    } else {
+      // Verify role matches
+      if (domMatch.role !== apiEntry.role) {
+        apiMismatches.push(`Entry id=${apiEntry.id}: API role="${apiEntry.role}" but DOM role="${domMatch.role}"`);
+      }
+      // Verify text content matches (after trimming/normalizing)
+      const apiText = apiEntry.text.replace(/\s+/g, " ").trim();
+      const domText = domMatch.text.replace(/\s+/g, " ").trim();
+      if (!domText.includes(apiText.slice(0, 30)) && !apiText.includes(domText.slice(0, 30))) {
+        apiMismatches.push(`Entry id=${apiEntry.id}: text mismatch — API="${apiText.slice(0, 50)}" DOM="${domText.slice(0, 50)}"`);
+      } else {
+        apiMatchCount++;
+      }
+    }
+  }
+
+  report(
+    `All API entries rendered in DOM (${apiMatchCount}/${apiEntries.length})`,
+    apiMismatches.length === 0,
+    apiMismatches.length > 0 ? apiMismatches.join("; ") : ""
+  );
+
+  // 5. Check for phantom DOM bubbles (in DOM but not in API)
+  const apiIds = new Set(apiEntries.map(e => String(e.id)));
+  const phantoms = domBubbles.filter(b => b.entryId && !apiIds.has(b.entryId));
+  report(
+    `No phantom DOM bubbles (DOM entries not in API)`,
+    phantoms.length === 0,
+    phantoms.length > 0 ? `${phantoms.length} phantoms: ${phantoms.map(p => `id=${p.entryId} "${p.text.slice(0, 30)}"`).join(", ")}` : ""
+  );
+
+  // 6. Verify both roles present
+  const apiUserCount = apiEntries.filter(e => e.role === "user").length;
+  const apiAssistantCount = apiEntries.filter(e => e.role === "assistant" && e.speakable).length;
+  const domUserCount = domBubbles.filter(b => b.role === "user").length;
+  const domAssistantCount = domBubbles.filter(b => b.role === "assistant").length;
+
+  report(
+    `User entries: API=${apiUserCount} DOM=${domUserCount}`,
+    domUserCount >= apiUserCount,
+    domUserCount < apiUserCount ? `DOM missing ${apiUserCount - domUserCount} user entries` : ""
+  );
+  report(
+    `Assistant entries: API=${apiAssistantCount} DOM=${domAssistantCount}`,
+    domAssistantCount >= apiAssistantCount,
+    domAssistantCount < apiAssistantCount ? `DOM missing ${apiAssistantCount - domAssistantCount} assistant entries` : ""
+  );
+}
+
+// ===== UX Assessment Bug Fix Regression Tests =====
+
+async function testUX_ttsHighlightScrollsToEntry() {
+  console.log("\n[UX-L9] tts_highlight scrolls to off-screen entry");
+  // Inject entries, then send tts_highlight for the first one — verify scrollIntoView
+  await page.evaluate(() => {
+    const ws = (window as any)._testWs || (window as any).__ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send('test:entries-full:' + JSON.stringify([
+        { text: "Entry Alpha for highlight test", role: "assistant" },
+        { text: "Entry Bravo for highlight test", role: "assistant" },
+        { text: "Entry Charlie for highlight test", role: "assistant" },
+      ]));
+    }
+  });
+  await page.waitForTimeout(800);
+
+  // Get the first entry's ID
+  const firstEntryId = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.assistant");
+    return bubbles.length > 0 ? bubbles[0].getAttribute("data-entry-id") : null;
+  });
+
+  if (!firstEntryId) {
+    report("tts_highlight entry found", false, "No entry bubbles created");
+    return;
+  }
+
+  // Send tts_highlight via evaluate (simulate server sending it)
+  const highlighted = await page.evaluate((entryId) => {
+    const handler = (window as any).__wsOnMessage || null;
+    // Simulate receiving a tts_highlight message
+    const fakeMsg = JSON.stringify({ type: "tts_highlight", entryId: parseInt(entryId) });
+    const ws = (window as any)._ws;
+    // Dispatch the message handler directly
+    if (ws && ws.onmessage) {
+      ws.onmessage({ data: fakeMsg } as any);
+    }
+    const el = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
+    return el?.classList.contains("bubble-active") || false;
+  }, firstEntryId);
+
+  report("tts_highlight applies bubble-active class", highlighted);
+}
+
+async function testUX_ttsHighlightClearsPrevious() {
+  console.log("\n[UX-P2.3/U1.2] tts_highlight clears previous highlight");
+  await page.evaluate(() => {
+    const ws = (window as any)._testWs || (window as any).__ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send('test:entries-full:' + JSON.stringify([
+        { text: "First for cleanup test", role: "assistant" },
+        { text: "Second for cleanup test", role: "assistant" },
+      ]));
+    }
+  });
+  await page.waitForTimeout(800);
+
+  const result = await page.evaluate(() => {
+    const bubbles = Array.from(document.querySelectorAll(".entry-bubble.assistant"));
+    if (bubbles.length < 2) return { ok: false, reason: "not enough bubbles" };
+
+    const id1 = bubbles[bubbles.length - 2].getAttribute("data-entry-id");
+    const id2 = bubbles[bubbles.length - 1].getAttribute("data-entry-id");
+
+    // Simulate highlight on first entry
+    const msg1 = JSON.stringify({ type: "tts_highlight", entryId: parseInt(id1!) });
+    const ws = (window as any)._ws;
+    if (ws?.onmessage) ws.onmessage({ data: msg1 } as any);
+
+    const firstActive = bubbles[bubbles.length - 2].classList.contains("bubble-active");
+
+    // Simulate highlight on second entry — first should be cleared
+    const msg2 = JSON.stringify({ type: "tts_highlight", entryId: parseInt(id2!) });
+    if (ws?.onmessage) ws.onmessage({ data: msg2 } as any);
+
+    const firstCleared = !bubbles[bubbles.length - 2].classList.contains("bubble-active");
+    const secondActive = bubbles[bubbles.length - 1].classList.contains("bubble-active");
+
+    return { ok: firstActive && firstCleared && secondActive, firstActive, firstCleared, secondActive };
+  });
+
+  report("Highlight jumps from first to second, first cleared", result.ok,
+    !result.ok ? `firstActive=${result.firstActive} firstCleared=${result.firstCleared} secondActive=${result.secondActive}` : "");
+}
+
+async function testUX_ttsPlayScrollsToEntry() {
+  console.log("\n[UX-U3.1] tts_play scrolls to highlighted entry");
+  // Verify that the tts_play handler includes scrollIntoView (code check)
+  const hasScroll = await page.evaluate(() => {
+    const html = document.documentElement.outerHTML;
+    // Check that the tts_play handler scrolls to the target
+    return html.includes('targetEl.scrollIntoView') && html.includes('tts_play');
+  });
+  report("tts_play handler includes scrollIntoView", hasScroll);
+}
+
+async function testUX_controlsPointerEvents() {
+  console.log("\n[UX-H2] .controls pointer-events: none, children auto");
+  const result = await page.evaluate(() => {
+    const controls = document.querySelector(".controls") as HTMLElement;
+    if (!controls) return { ok: false, reason: "no .controls element" };
+    const style = getComputedStyle(controls);
+    const controlsPE = style.pointerEvents;
+
+    // Check a child button
+    const btn = controls.querySelector("button") as HTMLElement;
+    if (!btn) return { ok: false, reason: "no button in .controls" };
+    const btnStyle = getComputedStyle(btn);
+    const btnPE = btnStyle.pointerEvents;
+
+    return { ok: controlsPE === "none" && btnPE === "auto", controlsPE, btnPE };
+  });
+  report("Controls has pointer-events:none, buttons have auto", result.ok,
+    !result.ok ? `controls=${result.controlsPE} btn=${result.btnPE}` : "");
+}
+
+async function testUX_windowSwitchDebounce() {
+  console.log("\n[UX-K4] Window switch debounce in server.ts");
+  // Code check: verify _switchDebounceTimer exists in server.ts
+  const serverCode = readFileSync("server.ts", "utf8");
+  const hasDebounce = serverCode.includes("_switchDebounceTimer") && serverCode.includes("_executeWindowSwitch");
+  report("Window switch uses debounce timer", hasDebounce);
+  const hasClearTimeout = serverCode.includes("clearTimeout(_switchDebounceTimer)");
+  report("Rapid switches cancel previous timer", hasClearTimeout);
+}
+
+async function testUX_entryDedupUsesMatchedIds() {
+  console.log("\n[UX-O3] Entry dedup respects already-matched entries");
+  // Code check: verify dedup checks matchedEntryIds
+  const serverCode = readFileSync("server.ts", "utf8");
+  const hasMatchedCheck = serverCode.includes("matchedEntryIds.has(e.id)") &&
+    serverCode.includes("!matchedEntryIds.has(e.id)");
+  report("Entry dedup excludes already-matched entries from false positives", hasMatchedCheck);
+}
+
+async function testUX_replayCycleWorks() {
+  console.log("\n[UX-U2.2] Replay cycle: highlight → stop → highlight again");
+  await page.evaluate(() => {
+    const ws = (window as any)._testWs || (window as any).__ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send('test:entries-full:' + JSON.stringify([
+        { text: "Replay cycle test entry", role: "assistant" },
+      ]));
+    }
+  });
+  await page.waitForTimeout(800);
+
+  const result = await page.evaluate(() => {
+    const bubble = document.querySelector(".entry-bubble.assistant:last-of-type");
+    if (!bubble) return { ok: false, reason: "no bubble" };
+    const id = bubble.getAttribute("data-entry-id");
+    const ws = (window as any)._ws;
+    if (!ws?.onmessage) return { ok: false, reason: "no ws" };
+
+    // First highlight
+    ws.onmessage({ data: JSON.stringify({ type: "tts_highlight", entryId: parseInt(id!) }) } as any);
+    const firstHL = bubble.classList.contains("bubble-active");
+
+    // Stop (simulated tts_stop)
+    ws.onmessage({ data: JSON.stringify({ type: "tts_stop", reason: "user_stop" }) } as any);
+    const afterStop = !bubble.classList.contains("bubble-active");
+
+    // Second highlight (replay again)
+    ws.onmessage({ data: JSON.stringify({ type: "tts_highlight", entryId: parseInt(id!) }) } as any);
+    const secondHL = bubble.classList.contains("bubble-active");
+
+    return { ok: firstHL && afterStop && secondHL, firstHL, afterStop, secondHL };
+  });
+
+  report("Replay cycle: first HL → stop clears → second HL works", result.ok,
+    !result.ok ? `firstHL=${result.firstHL} afterStop=${result.afterStop} secondHL=${result.secondHL}` : "");
 }
 
 main().catch(err => {

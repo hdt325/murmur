@@ -73,7 +73,7 @@ Then brief with current task context. See memory file `agent-charters.md` for fu
 ### Telegram Notifications
 When user attention is needed:
 ```bash
-curl -s -X POST "https://api.telegram.org/bot8019114653:AAH5roaFSWgm_p2JhSke4dW3_PW2GJoVJYs/sendMessage" -H "Content-Type: application/json" -d '{"chat_id":"1063408704","text":"🔔 [summary]"}'
+curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -H "Content-Type: application/json" -d '{"chat_id":"1063408704","text":"🔔 [summary]"}'
 ```
 
 ## MANDATORY: Voice Conversation Parameters

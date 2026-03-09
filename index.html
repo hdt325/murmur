@@ -1815,9 +1815,13 @@
       flex-wrap: nowrap;
       justify-content: center;
       align-items: center;
+      pointer-events: none;
+      position: relative;
+      z-index: 5;
     }
 
     .controls button {
+      pointer-events: auto;
       padding: 0;
       border: 1px solid #333338;
       border-radius: 5px;
@@ -4770,6 +4774,10 @@
             if (targetEl) {
               targetEl.classList.remove("bubble-dropped");
               targetEl.classList.add("bubble-active");
+              // Scroll to the highlighted entry if it's off-screen (defer to next frame for layout)
+              requestAnimationFrame(() => {
+                targetEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+              });
 
               // Flow mode: replace displayed text with speakableText as grey word spans
               // speakableText is the clean text that matches audio 1:1
@@ -4790,6 +4798,29 @@
             el.classList.remove("bubble-active");
             el.classList.add("bubble-spoken");
           });
+          return;
+        }
+
+        // tts_highlight: highlight a specific entry by ID (used by tests and future server features)
+        if (msg.type === "tts_highlight") {
+          const entryId = msg.entryId != null ? String(msg.entryId) : null;
+          // Clear previous highlights
+          document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
+            if (entryId && el.dataset.entryId === entryId) return;
+            el.classList.remove("bubble-active");
+            el.classList.add("bubble-spoken");
+          });
+          if (entryId) {
+            const targetEl = document.querySelector(`.entry-bubble[data-entry-id="${entryId}"]`);
+            if (targetEl) {
+              targetEl.classList.remove("bubble-dropped", "bubble-spoken");
+              targetEl.classList.add("bubble-active");
+              // Defer scroll to next frame so layout reflow completes first
+              requestAnimationFrame(() => {
+                targetEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+              });
+            }
+          }
           return;
         }
 
@@ -5218,12 +5249,16 @@
         }
       });
 
-      // Remove stale bubbles (not in current entries list)
-      existing.forEach(el => {
-        const wrap = el.closest(".msg-wrap");
-        if (wrap) wrap.remove();
-        else el.remove();
-      });
+      // Remove stale bubbles (not in current entries list) — only on final (non-partial) broadcasts.
+      // During partial streaming, the server sends incremental snapshots; removing "missing" entries
+      // would cause flicker when rapid broadcasts each contain growing subsets.
+      if (!partial) {
+        existing.forEach(el => {
+          const wrap = el.closest(".msg-wrap");
+          if (wrap) wrap.remove();
+          else el.remove();
+        });
+      }
       // Remove stale turn separators
       existingSeps.forEach(key => {
         const el = document.querySelector(`.turn-separator[data-turn-sep="${key}"]`);
