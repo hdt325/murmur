@@ -479,7 +479,7 @@ function createWindow() {
     alwaysOnTop: true,
     resizable: true,
     hasShadow: true,
-    minWidth: 240,
+    minWidth: 360,
     minHeight: 300,
     backgroundColor: "#1a1a1e",
     webPreferences: {

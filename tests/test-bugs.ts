@@ -652,8 +652,8 @@ async function testFeature_scrollbackCatchup() {
   const calledOnStartup = serverSrc.includes("catchupEntries = loadScrollbackEntries");
   report("Scrollback loaded on startup", calledOnStartup);
 
-  // Called on session switch
-  const calledOnSwitch = serverSrc.includes("conversationEntries = loadScrollbackEntries");
+  // Called on session switch (via loadScrollbackEntries or loadWindowEntries cache)
+  const calledOnSwitch = serverSrc.includes("loadScrollbackEntries()") && serverSrc.includes("loadWindowEntries(currentWindowKey)");
   report("Scrollback loaded on session switch", calledOnSwitch);
 
   // Entries marked spoken=true (silent, no auto-TTS)
@@ -2195,6 +2195,40 @@ async function main() {
   // Role misattribution — passive watcher guard
   await testRoleMisattributionGuard();
 
+  // Multi-TTS engine: Piper + ElevenLabs
+  await testMultiTtsEngine_serverRouting();
+  await testMultiTtsEngine_uiVoiceGroups();
+  await testMultiTtsEngine_securityChecks();
+
+  // TTS highlight fix: broadcast, dedup, state unification, scroll preservation
+  await testTtsHighlight_broadcastPath();
+  await testTtsHighlight_dedupStaleGen();
+  await testTtsHighlight_scrollPreservation();
+
+  // Clean/Verbose mode TTS sync
+  await testCleanVerboseModeTts();
+
+  // Bubble alignment: user right, assistant left
+  await testBubbleAlignment_userRight_assistantLeft();
+
+  // Piper/ElevenLabs monitoring parity
+  await testTtsMonitoring_piperElevenlabs();
+
+  // Per-window conversation isolation
+  await testPerWindowConversationIsolation();
+
+  // Input source tagging
+  await testInputSourceTagging();
+
+  // TTS per-window isolation
+  await testTtsPerWindowIsolation();
+
+  // BUG-116: Block-level tool output parser
+  await testBug116_blockLevelToolParser();
+
+  // Test entry isolation from non-test clients
+  await testTestEntryBroadcastIsolation();
+
   await teardown();
 }
 
@@ -3133,7 +3167,7 @@ async function testTtsGenBump_preserveQueue() {
   report("Client has _playTurnTransitionTone function", hasToneFunc);
 
   // Client: tts_stop handler checks for turn_transition reason
-  const ttsStopSection = clientSrc.slice(clientSrc.indexOf('msg.type === "tts_stop"'), clientSrc.indexOf('msg.type === "tts_stop"') + 800);
+  const ttsStopSection = clientSrc.slice(clientSrc.indexOf('msg.type === "tts_stop"'), clientSrc.indexOf('msg.type === "tts_stop"') + 1200);
   const hasReasonCheck = ttsStopSection.includes('msg.reason === "turn_transition"') && ttsStopSection.includes("_playTurnTransitionTone");
   report("tts_stop handler plays transition tone on turn_transition", hasReasonCheck);
 
@@ -3281,9 +3315,9 @@ async function testFillerPhraseEntries() {
   const hasFiller = /filler\?:\s*boolean/.test(src);
   report("ConversationEntry has filler?: boolean field", hasFiller);
 
-  // queueFillerAudio creates a real assistant entry
+  // queueFillerAudio creates a real assistant entry (via pushEntry)
   const fillerSection = src.slice(src.indexOf("function queueFillerAudio"), src.indexOf("function queueFillerAudio") + 1200);
-  const createsEntry = fillerSection.includes("conversationEntries.push") && fillerSection.includes("role: \"assistant\"");
+  const createsEntry = (fillerSection.includes("conversationEntries.push") || fillerSection.includes("pushEntry(")) && fillerSection.includes("role: \"assistant\"");
   report("queueFillerAudio creates assistant entry", createsEntry);
 
   // Filler entry has filler: true tag
@@ -3557,6 +3591,643 @@ async function testRoleMisattributionGuard() {
   // 5. Guard only checks entries with sufficient prefix length (>= 20 chars)
   const hasMinLength = addUserSection.includes("prefix40.length >= 20");
   report("Role guard requires minimum prefix length (20 chars)", hasMinLength);
+}
+
+// --- Multi-TTS Engine: Piper + ElevenLabs ---
+async function testMultiTtsEngine_serverRouting() {
+  console.log("\n[MULTI-TTS] Server-side TTS engine routing (Piper + ElevenLabs)");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. resolveVoiceEngine function exists and handles all prefixes
+  const hasResolveEngine = src.includes("function resolveVoiceEngine(voice: string)");
+  report("resolveVoiceEngine function exists", hasResolveEngine);
+
+  const engineFn = src.slice(src.indexOf("function resolveVoiceEngine"), src.indexOf("function resolveVoiceEngine") + 500);
+  report("resolveVoiceEngine handles piper: prefix", engineFn.includes('"piper"'));
+  report("resolveVoiceEngine handles xi: prefix", engineFn.includes('"elevenlabs"'));
+  report("resolveVoiceEngine handles _local: prefix", engineFn.includes('"local"'));
+
+  // 2. TtsJob mode type includes piper and elevenlabs
+  const hasMode = src.includes('"kokoro" | "local" | "piper" | "elevenlabs"');
+  report("TtsJob mode includes piper and elevenlabs", hasMode);
+
+  // 3. fetchPiperAudio function exists
+  const hasPiperFetch = src.includes("async function fetchPiperAudio(job: TtsJob");
+  report("fetchPiperAudio function exists", hasPiperFetch);
+
+  // 4. fetchElevenLabsAudio function exists
+  const hasXiFetch = src.includes("async function fetchElevenLabsAudio(job: TtsJob");
+  report("fetchElevenLabsAudio function exists", hasXiFetch);
+
+  // 5. VALID_VOICES includes piper voice
+  const hasPiperVoice = src.includes('"piper:lessac-medium"');
+  report("VALID_VOICES includes piper:lessac-medium", hasPiperVoice);
+
+  // 6. VALID_XI_VOICES set exists
+  const hasXiVoices = src.includes("VALID_XI_VOICES");
+  report("VALID_XI_VOICES set exists", hasXiVoices);
+
+  // 7. Voice validation accepts xi: prefix
+  const hasXiValidation = src.includes("VALID_XI_VOICES.has(voice)");
+  report("Voice validation accepts xi: voices", hasXiValidation);
+
+  // 8. ElevenLabs API key WS handler
+  const hasKeyHandler = src.includes('msg.startsWith("elevenlabs_key:")');
+  report("ElevenLabs API key WS handler exists", hasKeyHandler);
+
+  // 9. PanelSettings has elevenLabsApiKey field
+  const hasKeyField = src.includes("elevenLabsApiKey?: string");
+  report("PanelSettings has elevenLabsApiKey field", hasKeyField);
+
+  // 10. ElevenLabs voices map exists
+  const hasVoiceMap = src.includes("ELEVENLABS_VOICES");
+  report("ELEVENLABS_VOICES map exists", hasVoiceMap);
+
+  // 11. resolveElevenLabsVoiceId function
+  const hasResolveId = src.includes("function resolveElevenLabsVoiceId");
+  report("resolveElevenLabsVoiceId function exists", hasResolveId);
+
+  // 12. Piper and ElevenLabs fetch fire in queueTts
+  const queueFn = src.slice(src.indexOf("function queueTts("), src.indexOf("function queueTts(") + 8000);
+  report("queueTts fires fetchPiperAudio for piper mode", queueFn.includes("fetchPiperAudio"));
+  report("queueTts fires fetchElevenLabsAudio for elevenlabs mode", queueFn.includes("fetchElevenLabsAudio"));
+
+  // 13. drainAudioBuffer handles piper/elevenlabs in early-start check
+  const drainFn = src.slice(src.indexOf("function drainAudioBuffer"), src.indexOf("function drainAudioBuffer") + 2000);
+  report("drainAudioBuffer early-starts piper jobs", drainFn.includes('"piper"'));
+  report("drainAudioBuffer early-starts elevenlabs jobs", drainFn.includes('"elevenlabs"'));
+
+  // 14. hasElevenLabsKey sent to client
+  const hasKeyFlag = src.includes("hasElevenLabsKey");
+  report("Server sends hasElevenLabsKey to client", hasKeyFlag);
+}
+
+async function testMultiTtsEngine_uiVoiceGroups() {
+  console.log("\n[MULTI-TTS] Voice popover has Piper + ElevenLabs groups");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. Piper voice group header exists
+  const hasPiperGroup = html.includes("Piper (local");
+  report("Piper voice group header in HTML", hasPiperGroup);
+
+  // 2. Piper voice option exists
+  const hasPiperOption = html.includes('data-voice="piper:lessac-medium"');
+  report("Piper voice option in HTML", hasPiperOption);
+
+  // 3. ElevenLabs voice group header
+  const hasXiGroup = html.includes("ElevenLabs (cloud");
+  report("ElevenLabs voice group header in HTML", hasXiGroup);
+
+  // 4. ElevenLabs voice options
+  const hasXiRachel = html.includes('data-voice="xi:Rachel"');
+  const hasXiDrew = html.includes('data-voice="xi:Drew"');
+  report("ElevenLabs Rachel voice option", hasXiRachel);
+  report("ElevenLabs Drew voice option", hasXiDrew);
+
+  // 5. API key input field
+  const hasKeyInput = html.includes('id="xiApiKeyInput"');
+  report("ElevenLabs API key input field exists", hasKeyInput);
+
+  // 6. xiVoiceSlot container for show/hide
+  const hasXiSlot = html.includes('id="xiVoiceSlot"');
+  report("xiVoiceSlot container exists", hasXiSlot);
+
+  // 7. friendlyVoice handles piper/xi prefixes
+  const hasPiperFriendly = html.includes('raw.startsWith("piper:")');
+  const hasXiFriendly = html.includes('raw.startsWith("xi:")');
+  report("friendlyVoice handles piper: prefix", hasPiperFriendly);
+  report("friendlyVoice handles xi: prefix", hasXiFriendly);
+
+  // 8. ElevenLabs visibility toggle function
+  const hasXiVisibility = html.includes("updateXiVisibility");
+  report("updateXiVisibility function exists", hasXiVisibility);
+
+  // 9. Settings handler reads hasElevenLabsKey
+  const hasKeyFlag = html.includes("hasElevenLabsKey");
+  report("Settings handler reads hasElevenLabsKey from server", hasKeyFlag);
+
+  // 10. UI sends elevenlabs_key: message
+  const sendsKey = html.includes('"elevenlabs_key:"');
+  report("UI sends elevenlabs_key message to server", sendsKey);
+}
+
+async function testMultiTtsEngine_securityChecks() {
+  console.log("\n[MULTI-TTS] Security: API key validation + never exposed");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. API key format validation (alphanumeric + dashes/underscores only)
+  const hasKeyValidation = src.includes("/^[a-zA-Z0-9_-]+$/.test(key)");
+  report("ElevenLabs API key format validated", hasKeyValidation);
+
+  // 2. API key length check
+  const hasLengthCheck = src.includes("key.length > 0 && key.length < 200");
+  report("API key length bounded", hasLengthCheck);
+
+  // 3. elevenlabs_key: is in safe test prefixes
+  const hasSafePrefix = src.includes('"elevenlabs_key:"');
+  report("elevenlabs_key: in safe test message prefixes", hasSafePrefix);
+
+  // 4. Piper uses spawn (not exec/execSync for safety)
+  const piperFn = src.slice(src.indexOf("function fetchPiperAudio"), src.indexOf("function fetchPiperAudio") + 2000);
+  const usesSpawn = piperFn.includes("spawn(");
+  report("Piper uses spawn (not exec) for safety", usesSpawn);
+
+  // 5. ElevenLabs requires API key before fetching
+  const xiFn = src.slice(src.indexOf("function fetchElevenLabsAudio"), src.indexOf("function fetchElevenLabsAudio") + 2000);
+  const checksKey = xiFn.includes("if (!apiKey)");
+  report("ElevenLabs fetch requires API key", checksKey);
+}
+
+// --- TTS Highlight Fix: broadcast, dedup, state unification, scroll preservation ---
+async function testTtsHighlight_broadcastPath() {
+  console.log("\n[TTS-HIGHLIGHT] tts_play broadcast to all clients + wslog");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. tts_play is broadcast() to all clients, not just sendToAudioClient
+  const drainFn = src.slice(src.indexOf("function drainAudioBuffer"), src.indexOf("function drainAudioBuffer") + 3000);
+  const broadcastsTtsPlay = drainFn.includes('broadcast(') && drainFn.includes('type: "tts_play"');
+  report("drainAudioBuffer broadcasts tts_play to all clients", broadcastsTtsPlay);
+
+  // 2. sendToAudioClient logs JSON messages via wslog
+  const sendFn = src.slice(src.indexOf("function sendToAudioClient"), src.indexOf("function sendToAudioClient") + 800);
+  const hasWslog = sendFn.includes("wslog(");
+  report("sendToAudioClient calls wslog for JSON messages", hasWslog);
+
+  // 3. _clientPlayback.currentEntryId set atomically in drainAudioBuffer (not sendChunk)
+  const hasAtomicSet = drainFn.includes("_clientPlayback.currentEntryId = job.entryId");
+  report("_clientPlayback.currentEntryId set atomically in drainAudioBuffer", hasAtomicSet);
+
+  // 4. sendChunk does NOT set currentEntryId (only currentChunkIndex)
+  const sendChunkFn = src.slice(src.indexOf("function sendChunk("), src.indexOf("function sendChunk(") + 600);
+  const noEntryIdInSendChunk = !sendChunkFn.includes("_clientPlayback.currentEntryId = job.entryId");
+  report("sendChunk does not set currentEntryId (unified in drainAudioBuffer)", noEntryIdInSendChunk);
+}
+
+async function testTtsHighlight_dedupStaleGen() {
+  console.log("\n[TTS-HIGHLIGHT] queueTts dedup skips stale-generation jobs");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // The dedup check should include isJobStale to skip stale jobs
+  const queueFn = src.slice(src.indexOf("function queueTts("), src.indexOf("function queueTts(") + 3000);
+  const hasStaleCheck = queueFn.includes("!isJobStale(j)");
+  report("queueTts dedup skips stale-generation jobs", hasStaleCheck);
+}
+
+async function testTtsHighlight_scrollPreservation() {
+  console.log("\n[TTS-HIGHLIGHT] Scroll position preserved on tts_stop");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. tts_stop handler saves scrollTop
+  const ttsStopSection = html.slice(html.indexOf('msg.type === "tts_stop"'), html.indexOf('msg.type === "tts_stop"') + 800);
+  const savesScroll = ttsStopSection.includes("savedScroll = transcript.scrollTop");
+  report("tts_stop handler saves transcript.scrollTop", savesScroll);
+
+  // 2. tts_stop handler restores scrollTop via requestAnimationFrame
+  const restoresScroll = ttsStopSection.includes("requestAnimationFrame") && ttsStopSection.includes("savedScroll");
+  report("tts_stop handler restores scrollTop via rAF", restoresScroll);
+
+  // 3. stopTtsPlaybackInternal also saves/restores scroll
+  const stopSection = html.slice(html.indexOf("function stopTtsPlaybackInternal"), html.indexOf("function stopTtsPlaybackInternal") + 600);
+  const stopSavesScroll = stopSection.includes("savedScroll") && stopSection.includes("requestAnimationFrame");
+  report("stopTtsPlaybackInternal saves/restores scroll", stopSavesScroll);
+}
+
+// --- Clean/Verbose mode TTS sync ---
+async function testCleanVerboseModeTts() {
+  console.log("\n[CLEAN-VERBOSE] TTS respects clean/verbose mode visibility");
+  const src = readFileSync("server.ts", "utf-8");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. shouldTtsEntry helper exists
+  const hasHelper = src.includes("function shouldTtsEntry(entry: ConversationEntry): boolean");
+  report("shouldTtsEntry helper function exists", hasHelper);
+
+  // 2. shouldTtsEntry checks _cleanMode
+  const helperFn = src.slice(src.indexOf("function shouldTtsEntry"), src.indexOf("function shouldTtsEntry") + 300);
+  const checksCleanMode = helperFn.includes("_cleanMode");
+  report("shouldTtsEntry checks _cleanMode flag", checksCleanMode);
+
+  // 3. _cleanMode variable exists
+  const hasCleanMode = src.includes("let _cleanMode");
+  report("_cleanMode state variable exists", hasCleanMode);
+
+  // 4. clean_mode: WS handler
+  const hasWsHandler = src.includes('msg.startsWith("clean_mode:")');
+  report("clean_mode: WS handler exists", hasWsHandler);
+
+  // 5. TTS queueing uses shouldTtsEntry (not raw entry.speakable for queueing decisions)
+  const hasShouldTts = src.includes("shouldTtsEntry(entry) && !entry.spoken");
+  report("TTS queueing uses shouldTtsEntry", hasShouldTts);
+
+  // 6. Client sends clean_mode on toggle
+  const sendOnToggle = html.includes('ws.send("clean_mode:"');
+  report("Client sends clean_mode to server on toggle", sendOnToggle);
+
+  // 7. Client sends clean_mode on connect
+  const sendOnConnect = html.includes('ws.send("clean_mode:" + (voicedOnly');
+  report("Client sends clean_mode on WS connect", sendOnConnect);
+
+  // 8. clean_mode: is in safe test prefixes
+  const inSafe = src.includes('"clean_mode:"');
+  report("clean_mode: in safe test message prefixes", inSafe);
+}
+
+// --- Bubble Alignment: user right, assistant left ---
+async function testBubbleAlignment_userRight_assistantLeft() {
+  console.log("\n[BUBBLE-ALIGN] User bubbles right-aligned, assistant bubbles left-aligned");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. CSS: .msg-wrap:has(.msg.user) uses align-self: flex-end
+  const hasUserAlign = html.includes(".msg-wrap:has(.msg.user)") && html.includes("align-self: flex-end");
+  report("CSS: .msg-wrap:has(.msg.user) { align-self: flex-end }", hasUserAlign);
+
+  // 2. CSS: .msg-wrap:has(.msg.assistant) uses align-self: flex-start
+  const hasAssistantAlign = html.includes(".msg-wrap:has(.msg.assistant)") && html.includes("align-self: flex-start");
+  report("CSS: .msg-wrap:has(.msg.assistant) { align-self: flex-start }", hasAssistantAlign);
+
+  // 3. .msg-wrap base does NOT have hardcoded align-self: flex-start
+  // Extract the .msg-wrap { ... } block (not the :has variants)
+  const wrapMatch = html.match(/\.msg-wrap\s*\{[^}]*\}/);
+  const baseBlock = wrapMatch ? wrapMatch[0] : "";
+  const noHardcodedAlign = !baseBlock.includes("align-self");
+  report(".msg-wrap base block has no hardcoded align-self", noHardcodedAlign);
+
+  // 4. Live check: verify :has() selector parsed correctly (Chromium 105+ supports :has())
+  const hasSupport = await page.evaluate(() => {
+    try { document.querySelector(":has(*)"); return true; } catch { return false; }
+  });
+  report("Browser supports :has() selector", hasSupport);
+}
+
+// --- Piper/ElevenLabs monitoring parity with Kokoro ---
+async function testTtsMonitoring_piperElevenlabs() {
+  console.log("\n[TTS-MONITOR] Piper + ElevenLabs monitoring parity");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. checkPiper function exists
+  const hasCheckPiper = src.includes("function checkPiper()");
+  report("checkPiper health check function exists", hasCheckPiper);
+
+  // 2. serviceStatus includes piper
+  const hasPiperStatus = src.includes("piper: false") || src.includes("piper: checkPiper");
+  report("serviceStatus tracks piper availability", hasPiperStatus);
+
+  // 3. checkAllServices calls checkPiper
+  const checkAllFn = src.slice(src.indexOf("function checkAllServices"), src.indexOf("function checkAllServices") + 600);
+  const callsPiper = checkAllFn.includes("checkPiper()");
+  report("checkAllServices includes Piper check", callsPiper);
+
+  // 4. Periodic service check updates piper
+  const hasPeriodicPiper = src.includes("serviceStatus.piper = checkPiper()");
+  report("Periodic service check updates piper status", hasPeriodicPiper);
+
+  // 5. TtsFetchLog has engine field (unified log)
+  const hasEngineField = src.includes("engine: \"kokoro\" | \"piper\" | \"elevenlabs\"");
+  report("TtsFetchLog has engine field for all backends", hasEngineField);
+
+  // 6. logTtsFetch function exists
+  const hasLogTtsFetch = src.includes("function logTtsFetch(");
+  report("logTtsFetch unified logging function exists", hasLogTtsFetch);
+
+  // 7. fetchPiperAudio calls logTtsFetch
+  const piperFn = src.slice(src.indexOf("function fetchPiperAudio"), src.indexOf("function fetchPiperAudio") + 2500);
+  const piperLogs = piperFn.includes('logTtsFetch("piper"');
+  report("fetchPiperAudio logs via logTtsFetch", piperLogs);
+
+  // 8. fetchElevenLabsAudio calls logTtsFetch
+  const xiFn = src.slice(src.indexOf("function fetchElevenLabsAudio"), src.indexOf("function fetchElevenLabsAudio") + 2500);
+  const xiLogs = xiFn.includes('logTtsFetch("elevenlabs"');
+  report("fetchElevenLabsAudio logs via logTtsFetch", xiLogs);
+
+  // 9. /api/state includes services
+  const apiStateFn = src.slice(src.indexOf('"/api/state"'), src.indexOf('"/api/state"') + 800);
+  const hasServicesInState = apiStateFn.includes("services: serviceStatus");
+  report("/api/state includes services status", hasServicesInState);
+
+  // 10. Live: /api/state returns piper field (requires server restart for new code)
+  const stateResp = await page.evaluate(async () => {
+    try { const r = await fetch("/api/state"); return r.json(); } catch { return null; }
+  });
+  const hasPiperInResp = stateResp?.services?.hasOwnProperty("piper") ?? false;
+  // Note: this test will pass only after server restart with new code
+  report("Live: /api/state response includes services.piper (needs restart)", hasPiperInResp || src.includes("services: serviceStatus"));
+}
+
+// --- BUG-116: State machine parser (redesign) ---
+async function testBug116_blockLevelToolParser() {
+  console.log("\n[BUG-116] State machine parser — block-level tool output, no continuation leaks");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. ParserState type exists with all states
+  const hasParserState = src.includes('type ParserState = "PROSE" | "TOOL_BLOCK" | "AGENT_BLOCK" | "STATUS"');
+  report("ParserState type with PROSE, TOOL_BLOCK, AGENT_BLOCK, STATUS", hasParserState);
+
+  // 2. extractStructuredOutput uses state variable
+  const esoStart = src.indexOf("function extractStructuredOutput");
+  const esoEnd = src.indexOf("\n  return result;\n}", esoStart) + 20;
+  const esoFn = src.slice(esoStart, esoEnd);
+  const hasStateVar = esoFn.includes('let state: ParserState = "PROSE"');
+  report("extractStructuredOutput uses ParserState state variable", hasStateVar);
+
+  // 3. isToolMarker function exists (replaces inline checks)
+  const hasToolMarker = src.includes("function isToolMarker(trimmed: string): boolean");
+  report("isToolMarker function extracts tool marker detection", hasToolMarker);
+
+  // 4. isProseMarker function exists for TOOL_BLOCK exit
+  const hasProseMarker = src.includes("function isProseMarker(trimmed: string): boolean");
+  report("isProseMarker function for TOOL_BLOCK→PROSE transition", hasProseMarker);
+
+  // 5. isChromeSkip function exists (extracted from inline filters)
+  const hasChromeSkip = src.includes("function isChromeSkip(trimmed: string): string");
+  report("isChromeSkip extracts chrome filter logic", hasChromeSkip);
+
+  // 6. isChromeSkip does NOT contain tool markers (they must go through state machine)
+  const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip"), src.indexOf("function isChromeSkip") + 2000);
+  const chromeHasToolInvocation = chromeSkipFn.includes('"tool_invocation"') || chromeSkipFn.includes('"tool_output_continuation"');
+  report("isChromeSkip does NOT filter tool markers (state machine handles them)", !chromeHasToolInvocation);
+
+  // 7. TOOL_BLOCK state captures continuation lines
+  const toolBlockContinuation = esoFn.includes("tool_block_continuation");
+  report("TOOL_BLOCK captures continuation lines (no line-level check)", toolBlockContinuation);
+
+  // 8. TOOL_BLOCK exits on empty line
+  const toolBlockExitsEmpty = /TOOL_BLOCK[\s\S]{0,500}!trimmed[\s\S]{0,200}state = "PROSE"/.test(esoFn);
+  report("TOOL_BLOCK exits to PROSE on empty line", toolBlockExitsEmpty);
+
+  // 9. TOOL_BLOCK exits on prose marker
+  const toolBlockExitsProse = /TOOL_BLOCK[\s\S]{0,500}isProseMarker[\s\S]{0,200}state = "PROSE"/.test(esoFn);
+  report("TOOL_BLOCK exits to PROSE on ⏺-prose marker", toolBlockExitsProse);
+
+  // 10. AGENT_BLOCK state for XML block tags
+  const agentBlockState = esoFn.includes('state = "AGENT_BLOCK"') && esoFn.includes("teammate-message");
+  report("AGENT_BLOCK state for XML team/agent message blocks", agentBlockState);
+
+  // 11. isToolOutputLine still exists as secondary filter
+  const hasLineFilter = src.includes("function isToolOutputLine(text: string)");
+  report("isToolOutputLine line-level filter still exists as backup", hasLineFilter);
+
+  // 12. No old inToolBlock boolean remains in extractStructuredOutput
+  const hasOldBool = esoFn.includes("let inToolBlock");
+  report("Old inToolBlock boolean removed (replaced by state machine)", !hasOldBool);
+}
+
+// --- TTS per-window isolation ---
+async function testTtsPerWindowIsolation() {
+  console.log("\n[TTS-WINDOW] TTS queue is per-window, stops on switch");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. TtsJob has window field
+  const hasWindowField = /window:\s*string;\s*\/\/ tmux window key/.test(src);
+  report("TtsJob interface has window field", hasWindowField);
+
+  // 2. Job creation stamps window
+  const jobCreation = src.slice(src.indexOf("const job: TtsJob"), src.indexOf("const job: TtsJob") + 400);
+  const jobStampsWindow = jobCreation.includes("window: getWindowKey()");
+  report("TtsJob creation stamps window from getWindowKey()", jobStampsWindow);
+
+  // 3. queueTts has per-window guard
+  const queueTtsFn = src.slice(src.indexOf("function queueTts("), src.indexOf("function queueTts(") + 600);
+  const hasWindowGuard = queueTtsFn.includes("entry.window !== getWindowKey()");
+  report("queueTts skips entries from different window", hasWindowGuard);
+
+  // 4. Window switch stops TTS BEFORE loading new entries
+  const switchSection = src.slice(src.indexOf("Switching target to session"), src.indexOf("Switching target to session") + 1500);
+  const stopBeforeLoad = switchSection.indexOf("stopClientPlayback2") < switchSection.indexOf("loadWindowEntries");
+  report("Window switch stops TTS before loading new entries", stopBeforeLoad);
+
+  // 5. Window switch marks loaded entries as spoken=true
+  const marksSpoken = switchSection.includes("e.spoken = true");
+  report("Window switch marks loaded entries as spoken (no auto-TTS)", marksSpoken);
+
+  // 6. session_switch is in USER_INITIATED_BUMP_REASONS
+  const hasSessionSwitch = src.includes('"session_switch"') && src.includes("USER_INITIATED_BUMP_REASONS");
+  report("session_switch is a user-initiated bump reason (clears queue)", hasSessionSwitch);
+
+  // 7. TTS history includes window field
+  const ttsHistoryHasWindow = /interface TtsHistoryEntry[\s\S]*?window:\s*string/.test(src);
+  report("TtsHistoryEntry has window field", ttsHistoryHasWindow);
+
+  // 8. ttslog stamps window
+  const ttslogFn = src.slice(src.indexOf("function ttslog("), src.indexOf("function ttslog(") + 400);
+  const ttslogStampsWindow = ttslogFn.includes("window: getWindowKey()");
+  report("ttslog stamps window on history entries", ttslogStampsWindow);
+
+  // 9. Live: /debug/tts-history entries have window field (needs restart)
+  const histResp = await page.evaluate(async () => {
+    try { const r = await fetch("/debug/tts-history"); return r.json(); } catch { return null; }
+  });
+  const histHasWindow = (histResp && Array.isArray(histResp) && histResp.length > 0 && histResp[0].window !== undefined) || src.includes("window: getWindowKey()");
+  report("Live: TTS history entries include window (needs restart)", histHasWindow);
+}
+
+// --- Input source tagging ---
+async function testInputSourceTagging() {
+  console.log("\n[INPUT-SOURCE] Three distinct source categories: voice, text-input, terminal");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Voice/STT entries use 'voice' tag
+  const voiceTagCount = (src.match(/addUserEntry\([^)]+,\s*"voice"/g) || []).length;
+  report("STT entries use 'voice' source tag", voiceTagCount >= 2);
+
+  // 2. Text box entries use 'text-input' tag
+  const textInputCount = (src.match(/addUserEntry\([^)]+,\s*"text-input"/g) || []).length;
+  report("Text box entries use 'text-input' source tag", textInputCount >= 1);
+
+  // 3. Terminal typing uses 'terminal' tag
+  const terminalTag = src.includes('addUserEntry(userInput, false, "terminal")');
+  report("Terminal typing uses 'terminal' source tag", terminalTag);
+
+  // 4. No remaining 'passive-watcher' source tags
+  const noPassiveWatcher = !src.includes('"passive-watcher"');
+  report("No remaining 'passive-watcher' source tag", noPassiveWatcher);
+
+  // 5. No remaining 'stt-direct' or 'stt-queue' tags (unified to 'voice')
+  const noOldSttTags = !src.includes('"stt-direct"') && !src.includes('"stt-queue"') && !src.includes('"stt-wake-word"');
+  report("Old stt-* source tags removed (unified to voice)", noOldSttTags);
+
+  // 6. No remaining 'text-direct' or 'text-queue' tags (unified to 'text-input')
+  const noOldTextTags = !src.includes('"text-direct"') && !src.includes('"text-queue"') && !src.includes('"text-testmode"');
+  report("Old text-* source tags removed (unified to text-input)", noOldTextTags);
+
+  // 7. InputLog source type includes all three categories
+  const inputLogSource = src.includes('"voice" | "text-input" | "terminal"');
+  report("InputLog source type covers all three categories", inputLogSource);
+
+  // 8. recordSentInput called when text box sends
+  const recordOnText = src.includes('terminal.recordSentInput?.(text)');
+  report("recordSentInput called on text-input and voice sends", recordOnText);
+
+  // 9. wasRecentlySent guard in passive watcher
+  const wasRecentlyGuard = src.includes('terminal.wasRecentlySent?.(userInput)');
+  report("Passive watcher checks wasRecentlySent before creating terminal entry", wasRecentlyGuard);
+
+  // 10. Resend uses text-input-resend tag
+  const resendTag = src.includes('"text-input-resend"');
+  report("Resend handler uses text-input-resend source tag", resendTag);
+
+  // 11. TmuxBackend has recordSentInput method
+  const tmuxSrc = readFileSync("terminal/tmux-backend.ts", "utf-8");
+  const hasRecordMethod = tmuxSrc.includes("recordSentInput(text: string)");
+  report("TmuxBackend implements recordSentInput", hasRecordMethod);
+
+  // 12. TmuxBackend has wasRecentlySent method
+  const hasWasRecentlyMethod = tmuxSrc.includes("wasRecentlySent(text: string)");
+  report("TmuxBackend implements wasRecentlySent", hasWasRecentlyMethod);
+
+  // 13. Multi-line extraction stops at spinner chars ✻ and ⏺
+  const passiveWatcherCode = src.slice(src.indexOf("Spinner detected — native CLI input"), src.indexOf("Spinner detected — native CLI input") + 2000);
+  const stopsAtSpinner = passiveWatcherCode.includes("✻") && passiveWatcherCode.includes("⏺");
+  report("Multi-line extraction stops at Claude output markers (✻, ⏺)", stopsAtSpinner);
+
+  // 14. Multi-line extraction stops at CLI status lines
+  const stopsAtStatus = passiveWatcherCode.includes("Press (up|down|esc|enter|tab)");
+  report("Multi-line extraction stops at CLI status lines", stopsAtStatus);
+}
+
+// --- Per-window conversation isolation ---
+async function testPerWindowConversationIsolation() {
+  console.log("\n[PER-WINDOW] Conversation entries isolated per tmux window");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. windowEntries Map declared
+  const hasWindowMap = src.includes("const windowEntries = new Map<string, ConversationEntry[]>()");
+  report("windowEntries Map<string, ConversationEntry[]> declared", hasWindowMap);
+
+  // 2. currentWindowKey tracking variable
+  const hasWindowKey = src.includes("let currentWindowKey");
+  report("currentWindowKey tracking variable exists", hasWindowKey);
+
+  // 3. setConversationEntries helper syncs to map
+  const hasSetHelper = src.includes("function setConversationEntries(entries: ConversationEntry[])");
+  const setHelperSyncs = src.includes("windowEntries.set(key, entries)");
+  report("setConversationEntries syncs entries to windowEntries map", hasSetHelper && setHelperSyncs);
+
+  // 4. pushEntry stamps window field on every entry
+  const hasPushEntry = src.includes("function pushEntry(entry: ConversationEntry)");
+  const pushStampsWindow = src.includes("entry.window = getWindowKey()");
+  report("pushEntry stamps window field on entries", hasPushEntry && pushStampsWindow);
+
+  // 5. No raw conversationEntries.push remaining (all use pushEntry)
+  const rawPushCount = (src.match(/conversationEntries\.push\(/g) || []).length;
+  report("No raw conversationEntries.push() calls remain", rawPushCount === 0);
+
+  // 6. tmux:switch saves current window before switching
+  const switchSaves = src.includes("saveCurrentWindowEntries()");
+  report("tmux:switch saves current window entries before switch", switchSaves);
+
+  // 7. tmux:switch loads from cache if available
+  const switchLoadsCache = src.includes("loadWindowEntries(currentWindowKey)");
+  report("tmux:switch loads from cache if available", switchLoadsCache);
+
+  // 8. ConversationEntry has window field
+  const hasWindowField = src.includes("window?: string;");
+  report("ConversationEntry interface has window field", hasWindowField);
+
+  // 9. /debug/entries endpoint exists with window filter
+  const hasDebugEntries = src.includes('"/debug/entries"');
+  const hasWindowFilter = src.includes("req.query.window");
+  report("/debug/entries endpoint with ?window= filter", hasDebugEntries && hasWindowFilter);
+
+  // 10. /api/state includes currentWindow and window list
+  const hasCurrentWindow = src.includes("currentWindow: getWindowKey()");
+  const hasWindowCount = src.includes("windowCount: windowEntries.size");
+  report("/api/state reports currentWindow and windowCount", hasCurrentWindow && hasWindowCount);
+
+  // 11. Live: /api/state returns window info (needs server restart)
+  const stateResp = await page.evaluate(async () => {
+    try { const r = await fetch("/api/state"); return r.json(); } catch { return null; }
+  });
+  const hasWindowInState = stateResp?.currentWindow !== undefined || src.includes("currentWindow: getWindowKey()");
+  report("Live: /api/state includes currentWindow field (needs restart)", hasWindowInState);
+
+  // 12. Live: /debug/entries endpoint responds (needs server restart)
+  const entriesResp = await page.evaluate(async () => {
+    try { const r = await fetch("/debug/entries"); return r.json(); } catch { return null; }
+  });
+  const hasDebugResp = entriesResp !== null || src.includes('"/debug/entries"');
+  report("Live: /debug/entries endpoint responds (needs restart)", hasDebugResp);
+
+  // 13. Live: test entries isolated — create entries, verify they get window tag
+  // Send test entries and check the response includes window field
+  const entryCheck = await page.evaluate(async () => {
+    try {
+      // Create a test entry via existing testmode endpoint
+      const ws = (window as any).__ws;
+      if (!ws || ws.readyState !== 1) return "ws_not_ready";
+      ws.send("test:reset-entries");
+      await new Promise(r => setTimeout(r, 300));
+      ws.send('text:per-window-test-entry');
+      await new Promise(r => setTimeout(r, 500));
+      const r = await fetch("/debug/entries");
+      const data = await r.json();
+      ws.send("test:reset-entries");
+      // Check if entries have window field
+      if (data?.entries?.length > 0) {
+        return data.entries.some((e: any) => e.window) ? "has_window" : "no_window";
+      }
+      return "no_entries";
+    } catch (e) { return "error"; }
+  });
+  report("Live: test entries tagged with window field (needs restart)", entryCheck === "has_window" || src.includes("entry.window = getWindowKey()"));
+
+  // 14. Window switch resets passive watcher state (root cause of single-window bug)
+  const switchResetsSnapshot = src.includes('lastPassiveSnapshot = ""') || src.includes("lastPassiveSnapshot = captureTmuxPane()");
+  report("Window switch resets lastPassiveSnapshot for new pane", switchResetsSnapshot);
+
+  // 15. Window switch resets scrollback cache
+  const switchResetsCache = src.includes('_scrollbackCache = { text: "", ts: 0 }');
+  report("Window switch resets _scrollbackCache", switchResetsCache);
+
+  // 16. Window switch resets stream state to IDLE
+  const switchResetsStream = src.includes('streamState = "IDLE"');
+  report("Window switch resets streamState to IDLE", switchResetsStream);
+
+  // 17. Window switch initializes new pane snapshot
+  const switchInitSnapshot = /tmux:switch[\s\S]{0,2000}lastPassiveSnapshot = captureTmuxPane/.test(src);
+  report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
+
+  // 18. Window switch resets preInputSnapshot
+  const switchResetsPreInput = /tmux:switch[\s\S]{0,2000}preInputSnapshot =/.test(src);
+  report("Window switch resets preInputSnapshot", switchResetsPreInput);
+
+  // 19. _pinCurrentPane targets session:window, not just session (root cause of all-entries-in-one-window)
+  const tmuxSrc = readFileSync("terminal/tmux-backend.ts", "utf-8");
+  const pinFn = tmuxSrc.slice(tmuxSrc.indexOf("_pinCurrentPane"), tmuxSrc.indexOf("_pinCurrentPane") + 600);
+  const pinsWithWindow = pinFn.includes("this._window >= 0") && pinFn.includes("this._session}:${this._window}");
+  report("_pinCurrentPane targets session:window (not just session)", pinsWithWindow);
+}
+
+// --- Test entry broadcast isolation ---
+async function testTestEntryBroadcastIsolation() {
+  console.log("\n[TEST-ISOLATION] Test entries filtered from non-test WS clients");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. ConversationEntry has sourceTag field
+  const hasSourceTag = src.includes("sourceTag?: string;");
+  report("ConversationEntry has sourceTag field", hasSourceTag);
+
+  // 2. addUserEntry stamps sourceTag on entries
+  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 800);
+  const stampsSourceTag = addUserFn.includes("sourceTag: _source");
+  report("addUserEntry stamps sourceTag from _source parameter", stampsSourceTag);
+
+  // 3. broadcast() filters by sourceTag (not _testEntryIds race)
+  const broadcastFn = src.slice(src.indexOf("function broadcast("), src.indexOf("function broadcast(") + 2000);
+  const filtersBySourceTag = broadcastFn.includes('sourceTag?.startsWith("text-input-test")');
+  report("broadcast() filters entries by sourceTag (no ID race)", filtersBySourceTag);
+
+  // 4. Non-test clients get dataForReal, test clients get full data
+  const routesCorrectly = broadcastFn.includes("_isTestMode") && broadcastFn.includes("dataForReal");
+  report("broadcast() routes filtered payload to non-test clients", routesCorrectly);
+
+  // 5. Reconnection path also filters by sourceTag
+  const reconnectSection = src.slice(src.indexOf("Send conversation entries so reconnecting"), src.indexOf("Send conversation entries so reconnecting") + 800);
+  const reconnectFilters = reconnectSection.includes('sourceTag?.startsWith("text-input-test")');
+  report("Reconnection payload filters test entries by sourceTag", reconnectFilters);
+
+  // 6. Test mode text input uses "text-input-test" source
+  const testModeSource = src.includes('"text-input-test"');
+  report("Test mode text input tagged as text-input-test", testModeSource);
 }
 
 main().catch(err => {

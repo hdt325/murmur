@@ -62,6 +62,9 @@
 ### #19 — Center Murmur logo in toolbar ✓
 - Absolute positioning with `left:50%` + `translateX(-50%)`, removed redundant spacer
 
+### #21 — iOS background audio keepalive ✓
+- Silent audio buffer during TTS playback keeps audio session alive when app is backgrounded
+
 ### #25 — TTS Pipeline v2 ✓
 - Full redesign: queueTts/fetchKokoroAudio/drainAudioBuffer replaces curl-based speakText()
 - Entry-ID labeling end-to-end, chunk-level ack protocol
@@ -69,6 +72,7 @@
 
 ### #26 — Pipeline Observability ✓
 - 8 debug endpoints: kokoro-log, chunk-flow, playback-state, tts-jobs, input-log, generation-log, highlight-log, tts-history
+- /debug/parse-log endpoint: 3-tier pipeline trace (raw → discards → paragraphs)
 
 ### #27 — TTS Speed Optimizations ✓
 - Smaller first chunk (100 chars) for faster time-to-audio
@@ -93,11 +97,55 @@
 - `crypto.randomUUID()` inputId from client through Whisper through entry creation
 - End-to-end traceability for voice input pipeline
 
+### #32 — Entry stability fixes ✓
+- Cross-turn dedup: checks last 20 entries regardless of turn (BUG-075)
+- Entry cap: splice instead of filter+reassign, safety guard prevents empty array (BUG-094)
+- TTS requeue: queueTts handles all logging via source param, skips duplicate entries (BUG-095)
+- Cap overflow: trimEntriesToCap called from 3 sites (BUG-096)
+- Triplicate entries: _lastPassiveUserInput with 30s window (BUG-097)
+- Positional shift v2: text-similarity matching replaces array index (BUG-098)
+- File path filter: word count guard, standalone paths only (BUG-099)
+- Status line filter: simplified spinner char detection (BUG-100)
+- All have regression tests in test-bugs.ts
+
+### #33 — Sentence-accumulation TTS chunking ✓
+- Min 50, max 250 chars per chunk
+- Sentence-first splitting for natural prosody
+
+### #34 — Contextual filler templates ✓
+- Pattern matching with 8+ categories for context-aware filler phrases
+
 ### Precision Issues — 8/9 resolved ✓
 - S14 (preInputSnapshot timing), S15 (separator detection), S16 (flowWordPos mutation): Fixed
 - T3 (ttsPlaying race), T6 (highlight save/restore), T7 (renderEntries vs spans): Fixed
 - T8 (pipe-pane vs capture-pane), T11 (innerHTML churn): Fixed
 - T9 (Windows pty retry): Still open (BUG-093) — low priority
+
+## In Progress
+
+### #35 — Stale TTS playback cancellation
+**Priority**: High
+**Bug**: BUG-101
+- Cancel old-turn TTS jobs when first new assistant entry arrives
+- Play transition tone between turns
+
+### #36 — Tool output filtering
+**Priority**: High
+**Bugs**: BUG-102, BUG-103, BUG-104
+- Filter Bash(), ⏺, ⎿ tool execution markers from conversation
+- Filter "Background command completed" notifications
+- Debounce entry creation during tool execution to prevent flash
+
+### #37 — Generation bump refinement
+**Priority**: Medium
+**Bug**: BUG-106
+- Split `new_input` into `user_input` (cancels TTS) and `passive_redetect` (preserves playback)
+
+### #38 — Resend button on user bubbles
+**Priority**: Medium
+- Tap user bubble to resend text as new message with fresh ID
+- Tagged `user-resend` source
+- Works in both normal and flow mode
 
 ## Pending
 
@@ -112,39 +160,32 @@
 
 ### #20 — Seamless conversational flow: pause vs submit in recording
 **Priority**: High
-
-### #21 — Persistent audio/mic when app is backgrounded or closed
-**Priority**: High
-
-### #23 — Flow mode amber glow for system tasks (compacting, memory update)
-**Priority**: Medium
-**Area**: server.ts (passive watcher), index.html (flow mode CSS)
-**Problem**:
-- When Claude runs system tasks ("Compacting conversation", "Updating memory") the talk button should show amber/thinking glow in flow mode
-- The `tool_status` text line is hidden in flow mode by CSS (`display: none`)
-- The cooldown thinking detection (10s window) may miss system tasks that start later
-- User reports no visual feedback during these operations in flow mode
-**Requirements**:
-- Amber glow on talk button during system tasks in flow mode (CSS already supports it)
-- Investigate why `voice_status: thinking` isn't reaching the frontend during these tasks
-- Consider showing tool status text in flow mode (currently hidden)
-- Ensure system tasks outside the 10s cooldown window are still detected
-
-### #24 — TTS highlight walks through bubbles even when TTS is down/not speaking
-**Priority**: High
-**Area**: server.ts (TTS highlight logic, handleTtsDone)
-**Problem**:
-- When Kokoro TTS is down (or TTS otherwise fails), the server still sequentially highlights each of Claude's conversation bubbles as if they were being spoken
-- The highlight walks through every bubble one by one despite no audio playing
-- User sees bubbles lighting up with no sound — confusing and broken UX
-**Root cause (investigate)**:
-- `speakText()` likely fails (curl to Kokoro times out or errors), but the highlight broadcast happens BEFORE the curl call
-- The `tts_done` timeout fallback may fire, draining the queue and highlighting the next entry even though nothing was spoken
-- The highlight chain continues because `handleTtsDone` processes unspoken entries regardless of whether audio was actually delivered
-**Requirements**:
-- Do NOT highlight a bubble unless TTS audio was successfully generated and sent to the client
-- If Kokoro is unreachable, skip TTS entirely (don't queue, don't highlight)
-- Consider a health check before attempting TTS — if Kokoro was down on last attempt, backoff before retrying
+**Notes**: 4 approaches discussed, not decided
 
 ### #22 — Test suite leaking into live CLI session (BUG-003 regression)
 **Priority**: Critical
+
+### #23 — Flow mode amber glow for system tasks (compacting, memory update)
+**Priority**: Medium
+
+### #24 — TTS highlight walks through bubbles even when TTS is down/not speaking
+**Priority**: High
+
+### #39 — AirPods mic persistence test
+**Priority**: Medium
+**Status**: Endpoint built, needs manual iPhone testing
+
+### #40 — PiP mode for background audio
+**Priority**: Low
+**Notes**: Feasible for audio output; mic uncertain on iOS Safari
+
+### #41 — Apple Watch as remote mic
+**Priority**: Low
+**Notes**: Requires native WatchOS app (Swift), not possible via web
+
+## Reviewer Audit — Open Findings
+
+- **BUG-107**: Recursive `_sendTtsDone` stack overflow in index.html (Critical)
+- **BUG-108**: Incomplete ANSI strip regex in validation.ts (High)
+- **BUG-109**: Missing `.catch()` on TTS promise chains in server.ts (High)
+- **BUG-110**: Settings save mutex swallows errors in settings.ts (Medium)

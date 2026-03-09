@@ -678,6 +678,13 @@
       line-height: 1.5;
     }
 
+    /* Flow mode: shrink-wrap user msg-wrap so align-self: flex-end actually right-justifies */
+    body.flow-mode .msg-wrap:has(.msg.user) {
+      width: fit-content;
+      max-width: 72%;
+      margin-left: auto;
+    }
+
     body.flow-mode .msg.assistant {
       font-family: "EB Garamond", Georgia, serif;
       color: rgba(26, 26, 30, 0.3);
@@ -1319,9 +1326,10 @@
 
     .msg-wrap {
       position: relative;
-      align-self: flex-start;
       max-width: 88%;
     }
+    .msg-wrap:has(.msg.user) { align-self: flex-end; }
+    .msg-wrap:has(.msg.assistant) { align-self: flex-start; }
 
     .msg-wrap .msg {
       max-width: 100%;
@@ -2146,6 +2154,20 @@
       }
     }
 
+    .talk-bar button.recording.rec-paused {
+      animation: pulse-border-pause 1.5s ease-in-out infinite !important;
+      border-color: #888 !important;
+    }
+
+    .talk-bar button.recording.rec-paused .talk-wave-label {
+      color: #aaa !important;
+    }
+
+    @keyframes pulse-border-pause {
+      0%, 100% { border-color: #888; opacity: 1; }
+      50% { border-color: #555; opacity: 0.6; }
+    }
+
     /* --- Terminal Panel --- */
     .terminal-panel {
       overflow: hidden;
@@ -2849,7 +2871,7 @@
       </svg>
     </button>
     <div id="flowLiveTranscript" class="flow-live-transcript"></div>
-    <button id="talkBtn" data-tip="Auto-listens when it detects your voice">
+    <button id="talkBtn" data-tip="Double-tap while recording to pause/resume">
       <canvas id="talkWaveCanvas"></canvas>
       <img src="/icon-256.png" class="murmur-icon" alt="" id="talkIcon">
       <span class="talk-label" id="talkLabel">Tap or press Right ⌘ to talk</span>
@@ -2898,7 +2920,7 @@
         <span class="fss-check" id="fssCheckPushToTalk"></span>
       </div>
     </div>
-    <div class="fss-section-label">Mic Sensitivity</div>
+    <div class="fss-section-label">Environment Noise</div>
     <div class="fss-pills" id="fssSensitivityPills">
       <button class="fss-pill" data-fss-vad="quiet">Quiet</button>
       <button class="fss-pill" data-fss-vad="normal">Normal</button>
@@ -2975,7 +2997,7 @@
     </div>
     <div class="settings-divider"></div>
     <div class="settings-row settings-timeout-row" id="vadPresetRow">
-      <span class="settings-label">Mic sensitivity</span>
+      <span class="settings-label">Environment noise</span>
       <div class="settings-opts">
         <button class="sopt" data-vad="quiet">Quiet</button>
         <button class="sopt" data-vad="normal">Normal</button>
@@ -3046,6 +3068,24 @@
     <div class="voice-option" data-voice="zm_yunxi">Yunxi</div>
     <div class="voice-option" data-voice="zm_yunxia">Yunxia</div>
     <div class="voice-option" data-voice="zm_yunyang">Yunyang</div>
+    <div class="voice-group">Piper (local · free · fast)</div>
+    <div class="voice-option" data-voice="piper:lessac-medium">Lessac Medium</div>
+    <div class="voice-group voice-group-xi">ElevenLabs (cloud · metered $)</div>
+    <div id="xiVoiceSlot">
+      <div class="voice-option" data-voice="xi:Rachel">Rachel</div>
+      <div class="voice-option" data-voice="xi:Drew">Drew</div>
+      <div class="voice-option" data-voice="xi:Clyde">Clyde</div>
+      <div class="voice-option" data-voice="xi:Dorothy">Dorothy</div>
+      <div class="voice-option" data-voice="xi:Elli">Elli</div>
+      <div class="voice-option" data-voice="xi:Josh">Josh</div>
+      <div class="voice-option" data-voice="xi:Arnold">Arnold</div>
+      <div class="voice-option" data-voice="xi:Adam">Adam</div>
+      <div class="voice-option" data-voice="xi:Sam">Sam</div>
+    </div>
+    <div id="xiKeySlot" style="padding:4px 8px 6px">
+      <input type="password" id="xiApiKeyInput" placeholder="ElevenLabs API Key" autocomplete="off"
+        style="width:100%;font-size:11px;padding:4px 6px;background:#1a1a1e;border:1px solid #333;border-radius:4px;color:#aaa;outline:none;box-sizing:border-box">
+    </div>
     <div id="localVoiceSlot"></div>
   </div>
 
@@ -3229,6 +3269,8 @@
     const isMac = (window.murmurElectron && window.murmurElectron.platform === "darwin")
       || /Mac/.test(navigator.platform);
     if (isMac) document.body.classList.add("platform-mac");
+    const _talkKey = isMac ? "Right ⌘" : "Right Ctrl";
+    const _talkHint = `Tap or press ${_talkKey} to talk`;
 
     // iOS detection — must be declared early; used in mic init and voice population
     const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
@@ -3252,6 +3294,8 @@
     };
     function friendlyVoice(raw) {
       if (raw.startsWith("_local:")) return raw.slice(7) + " ⚡";
+      if (raw.startsWith("piper:")) return raw.slice(6) + " 🔧";
+      if (raw.startsWith("xi:")) return raw.slice(3) + " $";
       return VOICE_NAMES[raw] || raw;
     }
 
@@ -3348,6 +3392,12 @@
     });
 
     const emptyState = document.getElementById("emptyState");
+    // Update static HTML to platform-aware text
+    if (!isMac) {
+      emptyState.textContent = `Press ${_talkKey} or tap to talk`;
+      const talkLabelInit = document.getElementById("talkLabel");
+      if (talkLabelInit) talkLabelInit.textContent = _talkHint;
+    }
     const statusText = document.getElementById("statusText");
     const statusDot = document.getElementById("statusDot");
     const stopBtn = document.getElementById("stopBtn");
@@ -4328,6 +4378,8 @@
         clearTimeout(reconnectTimer);
         reconnectDelay = 1000; // Reset backoff on successful connection
         _flowInitialRender = false; // Fresh connect: treat next renderEntries as initial history load
+        // Sync clean/verbose mode so server queues TTS correctly
+        ws.send("clean_mode:" + (voicedOnly ? "1" : "0"));
         // Report available local voices so server knows what this client supports
         if (window.speechSynthesis) {
           const sendVoices = () => {
@@ -4442,6 +4494,10 @@
             modeIdx = 1; // Switch to type mode
             applyMode();
           }
+          if (msg.hasElevenLabsKey === "1") {
+            _hasElevenLabsKey = true;
+            updateXiVisibility();
+          }
         }
 
         if (msg.type === "transcription") {
@@ -4546,7 +4602,8 @@
                     const isActive = target === current || sess.name === current;
                     const row = document.createElement("div");
                     row.className = "fss-row" + (isActive ? " fss-row-active" : "");
-                    row.innerHTML = `<div><div class="fss-row-title">${escHtml(sess.name)}</div><div class="fss-row-desc">${escHtml(win.name || "")}</div></div><span class="fss-check">${isActive ? "✓" : ""}</span>`;
+                    const fssLabel = win.name ? `${sess.name}:${win.index} ${win.name}` : `${sess.name}:${win.index}`;
+                    row.innerHTML = `<div><div class="fss-row-title">${escHtml(fssLabel)}</div></div><span class="fss-check">${isActive ? "✓" : ""}</span>`;
                     row.addEventListener("click", () => {
                       if (ws?.readyState === WebSocket.OPEN) {
                         ws.send("tmux:switch:" + encodeURIComponent(sess.name) + ":" + win.index);
@@ -4562,9 +4619,9 @@
           if (msg.current || msg.session) {
             const target = msg.current || msg.session;
             _currentTmuxTarget = target;
-            const parts = target.split(":");
             if (sessionBtn) {
-              sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
+              // Collapsed button: show window name only
+              sessionBtn.textContent = getWindowDisplayName(target);
               if (typeof applySessionBtnColor === "function") applySessionBtnColor();
             }
           }
@@ -4636,13 +4693,20 @@
         if (msg.type === "tts_stop") {
           _currentTtsEntry = null;
           _currentPlayingEntryId = null;
-          stopTtsPlayback();
-          resetFlowWordHighlight(); // clear per-entry word positions for next response
+          // turn_transition = natural TTS completion → mark remaining as spoken (black)
+          // other reasons (interrupt, voice change) → mark as dropped (red)
+          const ttsCompletedOk = msg.reason === "turn_transition";
+          stopTtsPlayback(ttsCompletedOk);
+          resetFlowWordHighlight(ttsCompletedOk);
+          // Save scroll position before DOM mutations to prevent jump
+          const savedScroll = transcript.scrollTop;
           // Clear entry-bubble highlights (clearBubbleHighlights skips these)
           document.querySelectorAll(".entry-bubble.bubble-active").forEach(el => {
             el.classList.remove("bubble-active");
             el.classList.add("bubble-spoken");
           });
+          // Restore scroll after DOM reflow settles
+          requestAnimationFrame(() => { transcript.scrollTop = savedScroll; });
           // Turn transition: play a brief descending tone to signal "moving on to new content"
           if (msg.reason === "turn_transition") {
             _playTurnTransitionTone();
@@ -5110,15 +5174,17 @@
     let _flowWordPos = {}; // entryId → word index of next word to animate
     let _flowActiveEl = null; // currently-animating entry element
 
-    function clearFlowWordHighlight() {
+    // completedOk: true = audio played successfully (mark remaining as spoken/black),
+    //              false = interrupted/failed (mark remaining as dropped/red)
+    function clearFlowWordHighlight(completedOk) {
       if (_flowWordTimer) {
         clearTimeout(_flowWordTimer);
         _flowWordTimer = null;
-        // Mark remaining grey (unspoken) words as dropped (red) — they were never spoken.
-        // Only words that were highlighted during playback should be black (tts-word-spoken).
+        // Mark remaining grey words based on whether audio actually played
         if (_flowActiveEl) {
+          const cls = completedOk ? "tts-word-spoken" : "tts-word-dropped";
           _flowActiveEl.querySelectorAll(".tts-word").forEach(function (s) {
-            s.classList.replace("tts-word", "tts-word-dropped");
+            s.classList.replace("tts-word", cls);
           });
         }
       }
@@ -5128,8 +5194,8 @@
       _pendingHighlightSpeakableText = null;
     }
 
-    function resetFlowWordHighlight() {
-      clearFlowWordHighlight();
+    function resetFlowWordHighlight(completedOk) {
+      clearFlowWordHighlight(completedOk);
       _flowWordPos = {};
       _pendingHighlightEntryId = null;
       _pendingHighlightSpeakableText = null;
@@ -5193,7 +5259,7 @@
     // Continues from where the previous chunk left off (tracked by _flowWordPos[entryId]).
     // chunkIndex is used to look up word count from _currentTtsEntry.chunkWordCounts.
     function startFlowWordHighlight(entryEl, speakableText, durationMs, entryId, chunkIndex) {
-      clearFlowWordHighlight();
+      clearFlowWordHighlight(true); // previous chunk completed OK if next is starting
       _flowActiveEl = entryEl;
       const textEl = entryEl.querySelector(".entry-text");
       if (!textEl) return;
@@ -5473,7 +5539,7 @@
           if (mode.id === "text") hint = "Text mode — no audio";
           else if (mode.id === "type") hint = "Type mode — mic off";
           else if (mode.id === "listen") hint = "Read mode — voice in, text out";
-          else hint = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
+          else hint = thinkMode ? "Think mode — tap to record" : _talkHint;
           talkLabel.textContent = hint;
           talkLabel.className = "talk-label talk-idle-hint";
           talkBtn.className = "idle-state";
@@ -5515,7 +5581,7 @@
           setHeaderState("transcribing", "Transcribing...");
           break;
         case "thinking":
-          talkLabel.textContent = "Thinking... (tap to queue)";
+          talkLabel.textContent = "Working... (tap to record next message)";
           talkLabel.className = "talk-label";
           talkBtn.className = "thinking";
           setWaveMode("thinking");
@@ -5525,7 +5591,7 @@
           updateInterruptBtn(pendingVoiceCount);
           break;
         case "responding":
-          talkLabel.textContent = "Responding... (tap to queue)";
+          talkLabel.textContent = "Working... (tap to record next message)";
           talkLabel.className = "talk-label";
           talkBtn.className = "responding";
           setWaveMode("responding");
@@ -5715,6 +5781,8 @@
       voicedOnly = !voicedOnly;
       localStorage.setItem("voiced-only", voicedOnly ? "1" : "0");
       applyCleanMode();
+      // Notify server so TTS respects clean/verbose mode
+      if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:" + (voicedOnly ? "1" : "0"));
     });
 
     // Voice selection
@@ -5776,7 +5844,7 @@
         if (hint && !talkBtn.classList.contains("mode-type") &&
           !talkBtn.classList.contains("mode-text") &&
           !talkBtn.classList.contains("mode-read")) {
-          hint.textContent = thinkMode ? "Think mode — tap to record" : "Tap or press Right ⌘ to talk";
+          hint.textContent = thinkMode ? "Think mode — tap to record" : _talkHint;
         }
       }
     }
@@ -5873,6 +5941,43 @@
       speechSynthesis.addEventListener("voiceschanged", populateLocalVoices);
     }
 
+    // ElevenLabs API key input + voice visibility
+    let _hasElevenLabsKey = false;
+    const xiApiKeyInput = document.getElementById("xiApiKeyInput");
+    const xiVoiceSlot = document.getElementById("xiVoiceSlot");
+    function updateXiVisibility() {
+      if (xiVoiceSlot) xiVoiceSlot.style.display = _hasElevenLabsKey ? "" : "none";
+      if (!_hasElevenLabsKey && xiVoiceSlot) {
+        // Show placeholder instead
+        const existing = xiVoiceSlot.parentElement?.querySelector(".xi-unlock-hint");
+        if (!existing) {
+          const hint = document.createElement("div");
+          hint.className = "xi-unlock-hint";
+          hint.style.cssText = "color:#555;font-style:italic;font-size:10px;padding:2px 8px 4px";
+          hint.textContent = "Set API key below to unlock voices";
+          xiVoiceSlot.parentElement?.insertBefore(hint, xiVoiceSlot);
+        }
+      } else {
+        const hint = xiVoiceSlot?.parentElement?.querySelector(".xi-unlock-hint");
+        if (hint) hint.remove();
+      }
+    }
+    updateXiVisibility();
+    if (xiApiKeyInput) {
+      xiApiKeyInput.addEventListener("change", () => {
+        const key = xiApiKeyInput.value.trim();
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send("elevenlabs_key:" + key);
+          _hasElevenLabsKey = key.length > 0;
+          updateXiVisibility();
+        }
+      });
+      // Also populate voice labels for xi voices
+      document.querySelectorAll("#xiVoiceSlot .voice-option").forEach(el => {
+        voiceLabels[el.dataset.voice] = el.textContent;
+      });
+    }
+
     function updateVoiceSelection() {
       voicePopover.querySelectorAll(".voice-option").forEach(el => {
         const v = el.dataset.voice;
@@ -5889,6 +5994,7 @@
     let audioChunks = [];
     let isRecording = false;
     let _discardRecording = false; // Set before stopRecording() to discard audio without sending
+    let _recordingPaused = false;  // True when recording is paused via double-tap
     let _currentInputId = null;    // Unique ID for current recording session (links input → response)
     let _lastTapTime = 0;          // For double-tap cancel detection
     // Haptic helper — silently no-ops on desktop or where not supported
@@ -6287,13 +6393,16 @@
       if (!isRecording || !mediaRecorder) return;
       console.log("[rec] Stopping recording");
       isRecording = false;
+      _recordingPaused = false;
+      talkBtn.classList.remove("rec-paused");
       stopSilenceDetection();
       stopThinkCountdown();
       stopLiveTranscription();
       stopStreamingSTT();
       talkBtn.classList.remove("think-recording");
 
-      if (mediaRecorder.state === "recording") {
+      if (mediaRecorder.state === "recording" || mediaRecorder.state === "paused") {
+        if (mediaRecorder.state === "paused") mediaRecorder.resume(); // resume before stop to flush data
         mediaRecorder.stop();
       }
 
@@ -6893,9 +7002,13 @@
       }, 50);
     }
 
-    function stopTtsPlaybackInternal(sendDone) {
+    function stopTtsPlaybackInternal(sendDone, completedOk) {
       stopBargeIn();
-      clearFlowWordHighlight();
+      // Save scroll before DOM mutations (clearFlowWordHighlight modifies spans)
+      const savedScroll = transcript ? transcript.scrollTop : 0;
+      clearFlowWordHighlight(!!completedOk); // mark remaining words based on completion state
+      // Restore scroll after reflow
+      if (transcript) requestAnimationFrame(() => { transcript.scrollTop = savedScroll; });
       ttsAudioQueue.splice(0, ttsAudioQueue.length); // Flush queued audio on stop/interrupt
       if (ttsPlaybackTimer) { clearTimeout(ttsPlaybackTimer); ttsPlaybackTimer = null; }
       const wasPlaying = ttsPlaying;
@@ -6919,8 +7032,8 @@
       if (sendDone && wasPlaying) _sendTtsDone();
     }
 
-    function stopTtsPlayback() {
-      stopTtsPlaybackInternal(true);
+    function stopTtsPlayback(completedOk) {
+      stopTtsPlaybackInternal(true, completedOk);
     }
 
     // =============================================
@@ -7057,12 +7170,33 @@
       if (_flowLongPressFired) { _flowLongPressFired = false; return; }
       _startBgAudioSession(); // Start iOS background audio session on first user gesture
 
-      // Double-tap while recording → cancel and discard (no message sent)
+      // Double-tap while recording → pause/resume recording
       const _tapNow = Date.now();
       if (isRecording && (_tapNow - _lastTapTime) < 400) {
-        haptic([20, 30, 20]);
-        _discardRecording = true;
-        stopRecording();
+        if (_recordingPaused) {
+          // Resume recording
+          if (mediaRecorder && mediaRecorder.state === "paused") {
+            mediaRecorder.resume();
+            startSilenceDetection();
+          }
+          _recordingPaused = false;
+          haptic(30);
+          talkBtn.classList.remove("rec-paused");
+          const label = talkBtn.querySelector(".talk-wave-label");
+          if (label) label.textContent = "";
+          setTalkState("recording");
+        } else {
+          // Pause recording
+          if (mediaRecorder && mediaRecorder.state === "recording") {
+            mediaRecorder.pause();
+            stopSilenceDetection();
+          }
+          _recordingPaused = true;
+          haptic([20, 30, 20]);
+          talkBtn.classList.add("rec-paused");
+          const label = talkBtn.querySelector(".talk-wave-label");
+          if (label) label.textContent = "Paused — tap to resume";
+        }
         _lastTapTime = 0;
         return;
       }
@@ -7564,8 +7698,14 @@
 
     // Session selector
     let _currentTmuxTarget = "claude-voice";
+    const _tmuxWindowNames = new Map(); // "session:index" → window name
     const sessionBtn = document.getElementById("sessionBtn");
     const sessionPopover = document.getElementById("sessionPopover");
+
+    /** Get display name for collapsed session button — window name only */
+    function getWindowDisplayName(target) {
+      return _tmuxWindowNames.get(target) || target;
+    }
 
     function closeSessPopover() { sessionPopover.classList.remove("open"); }
 
@@ -7618,6 +7758,14 @@
 
     function renderSessPopover(sessions) {
       sessionPopover.innerHTML = "";
+      // Build window name map from session data
+      _tmuxWindowNames.clear();
+      for (const sess of sessions) {
+        for (const win of (sess.windows || [])) {
+          const target = win.index >= 0 ? `${sess.name}:${win.index}` : sess.name;
+          if (win.name) _tmuxWindowNames.set(target, win.name);
+        }
+      }
       if (!sessions.length) {
         sessionPopover.innerHTML = '<div class="sess-group">No tmux sessions</div>';
         return;
@@ -7638,8 +7786,9 @@
           const item = document.createElement("div");
           item.className = "sess-item" + (isActive ? " active" : "");
           item.style.color = isActive ? color : dimColor;
-          item.innerHTML = `<span>${win.name || "window " + win.index}</span>` +
-            `<span class="sess-win" style="color:${color}88">#${win.index}</span>`;
+          // Dropdown: show "session:index windowName" for clarity
+          const label = win.name ? `${sess.name}:${win.index} ${win.name}` : `${sess.name}:${win.index}`;
+          item.innerHTML = `<span>${escHtml(label)}</span>`;
           item.addEventListener("click", (e) => {
             e.stopPropagation();
             closeSessPopover();
@@ -7656,10 +7805,9 @@
     // WS handler for tmux_sessions — rendered inline in ws.onmessage below
     window._onTmuxSessions = (data) => {
       _currentTmuxTarget = data.current || _currentTmuxTarget;
-      // Update button label
-      const parts = _currentTmuxTarget.split(":");
-      sessionBtn.textContent = parts[0].slice(0, 16) + (parts[1] !== undefined ? ":" + parts[1] : "");
       renderSessPopover(data.sessions || []);
+      // Collapsed button: show window name only (session color indicates which session)
+      sessionBtn.textContent = getWindowDisplayName(_currentTmuxTarget);
     };
 
     // Terminal nav buttons for interactive prompts

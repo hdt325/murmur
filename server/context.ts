@@ -113,7 +113,7 @@ export function createServerContext(opts: {
 }): ServerContext {
   return {
     terminal: opts.terminal,
-    serviceStatus: { whisper: false, kokoro: false },
+    serviceStatus: { whisper: false, kokoro: false, piper: false },
     lastServiceCheckAt: 0,
     activeAudioClient: null,
 

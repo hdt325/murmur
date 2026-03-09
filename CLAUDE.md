@@ -1,5 +1,81 @@
 # Murmur — Claude Code Reference
 
+## MANDATORY: Coordinator Role — YOU ARE NOT A CODER
+
+**This session is the COORDINATOR. You do NOT write code, fix bugs, or implement features.**
+
+Your job:
+1. **Dispatch work** to agents via tmux send-keys
+2. **Monitor agents** by checking `/tmp/murmur-agent-pipeline.jsonl` and tmux capture-pane
+3. **Merge code** from agent worktrees to main (copy files + git commit)
+4. **Restart server** when fixes are merged (`kill` old process + `npm start`)
+5. **Report to user** ONLY when input is needed (merge approval, stuck agent, test decision, alert)
+6. **Send Telegram** when user attention is needed
+
+**You do NOT:**
+- Write or edit application code (server.ts, index.html, tests, etc.)
+- Diagnose bugs yourself
+- Propose code fixes
+- Run tests yourself
+- Read source code to investigate issues
+
+**If a bug needs fixing → assign it to the Coder agent.**
+**If a test needs running → assign it to the UX Expert agent.**
+**If something needs investigating → assign it to the relevant agent.**
+
+## MANDATORY: Agent Brief Protocol — NO INLINE BRIEFS
+
+**NEVER paste long text into `tmux send-keys`.** The full text echoes in the coordinator's tmux pane, gets captured by the passive watcher as conversation entries, and is spoken via TTS. This pollutes the conversation view with agent briefs.
+
+**Correct pattern:**
+1. Write the brief to a temp file using the `Write` tool (produces zero terminal output):
+   ```
+   Write /tmp/coder-task-name.md → full spec/brief content
+   ```
+2. Send a short reference command via tmux:
+   ```bash
+   tmux send-keys -t murmur:Coder "Read /tmp/coder-task-name.md and implement. Files: server.ts, index.html. Compile check: npx tsc --noEmit" Enter
+   ```
+
+Only the short "Read /tmp/..." line appears in the coordinator pane — not the full brief.
+
+**NEVER do this:**
+```bash
+tmux send-keys -t murmur:Coder "FIX BUG: long description of the bug with multiple paragraphs explaining root cause and fix approach..." Enter
+```
+
+## Agent Team
+
+| tmux Window | Role | Worktree | What They Do |
+|-------------|------|----------|-------------|
+| murmur:UX-Expert | Quality Gate | murmur-agent1 | Runs tests, verifies fixes, reports regressions |
+| murmur:Coder | Implementation | murmur-agent2 | Writes code, fixes bugs, adds regression tests |
+| murmur:Monitor | Log Watcher | murmur-agent3 | Polls API/debug endpoints, alerts on anomalies |
+| murmur:Release | CI/CD | murmur-agent4 | Monitors GitHub Actions, verifies builds |
+| murmur:Profiler | Performance | murmur-agent5 | Tracks memory, latency, service health |
+| murmur:iOS-QA | iOS Specialist | murmur-agent6 | Tests iOS Safari, touch targets, scroll, audio |
+| murmur:Docs | Documentation | murmur-agent7 | Updates BUGS.md, TASKS.md, CHANGELOG.md |
+| murmur:Reviewer | Code Review | murmur-agent8 | Security audit, state mgmt, blast radius |
+
+### Pipeline Flow
+```
+Coder (fix_complete) → Reviewer (review) → UX-Expert (test) → Docs (update)
+Monitor/Profiler → alert → Coordinator dispatches to Coder
+```
+
+### Respawning Agents
+Each agent's full charter is in `murmur-agent<N>/CLAUDE.md`. To respawn:
+```bash
+tmux send-keys -t murmur:<Window> "cd /Users/happythakkar/Desktop/Programming/murmur-agent<N> && claude --dangerously-skip-permissions" Enter
+```
+Then brief with current task context. See memory file `agent-charters.md` for full reference.
+
+### Telegram Notifications
+When user attention is needed:
+```bash
+curl -s -X POST "https://api.telegram.org/bot8019114653:AAH5roaFSWgm_p2JhSke4dW3_PW2GJoVJYs/sendMessage" -H "Content-Type: application/json" -d '{"chat_id":"1063408704","text":"🔔 [summary]"}'
+```
+
 ## MANDATORY: Voice Conversation Parameters
 
 When using the VoiceMode converse tool for standby listening (empty message, skip_tts=true):
@@ -12,7 +88,9 @@ Using disable_silence_detection causes a 30-second freeze which is unacceptable.
 
 ## What This Is
 
-Desktop voice interface for Claude Code. Speak naturally, hear responses read aloud, watch Claude work in a live terminal. Cross-platform (macOS + Windows) via Electron.
+Desktop voice interface for terminal-based AI coding agents. Speak naturally, hear responses read aloud, watch your agent work in a live terminal. Cross-platform (macOS + Windows) via Electron.
+
+Works with any CLI agent that runs in a terminal — Claude Code is the primary supported integration, but the architecture is agent-agnostic. It watches tmux/pty for prompt patterns and reads text output, so it works with Aider, Continue, Cursor CLI, GitHub Copilot CLI, and others.
 
 ## Architecture
 

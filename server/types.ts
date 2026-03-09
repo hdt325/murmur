@@ -56,6 +56,7 @@ export interface PanelSettings {
   speed?: number;
   tmuxTarget?: string;
   fillerAudio?: boolean; // Enable predictive filler audio while Claude thinks (default: true)
+  elevenLabsApiKey?: string; // ElevenLabs API key for cloud TTS
 }
 
 // --- Stream State Machine ---
@@ -114,4 +115,5 @@ export type SendToAudioClientFn = (data: Buffer | object) => void;
 export interface ServiceStatus {
   whisper: boolean;
   kokoro: boolean;
+  piper: boolean;
 }

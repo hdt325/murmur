@@ -78,6 +78,22 @@ let terminal: TerminalManager;
 
 const WHISPER_URL = "http://127.0.0.1:2022";
 const KOKORO_URL = "http://127.0.0.1:8880";
+const PIPER_BIN = "/Users/happythakkar/.pyenv/versions/3.13.5/bin/piper";
+const PIPER_MODEL = "/tmp/piper-models/en_US-lessac-medium.onnx";
+
+// ElevenLabs default voices (voice_id → display name)
+const ELEVENLABS_VOICES: Record<string, string> = {
+  "21m00Tcm4TlvDq8ikWAM": "Rachel",
+  "29vD33N1CtxCmqQRPOHJ": "Drew",
+  "2EiwWnXFnvU5JabPnv8n": "Clyde",
+  "ThT5KcBeYPX3keUQqHPh": "Dorothy",
+  "MF3mGyEYCl7XYWbV9V6O": "Elli",
+  "TxGEqnHWrfWFTfGW9XjX": "Josh",
+  "VR6AewLTigWG4xSOukaG": "Arnold",
+  "pNInz6obpgDQGcFmaJgB": "Adam",
+  "yoZ06aMxZJJ28mfd3POQ": "Sam",
+};
+const ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech";
 
 // Valid Kokoro TTS voice names
 const VALID_VOICES = new Set([
@@ -103,7 +119,31 @@ const VALID_VOICES = new Set([
   // Chinese
   "zf_xiaoxiao", "zf_xiaobei", "zf_xiaoni", "zf_xiaoyi",
   "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+  // Piper voices
+  "piper:lessac-medium",
 ]);
+
+// Valid ElevenLabs voice names (xi:DisplayName)
+const VALID_XI_VOICES = new Set(
+  Object.values(ELEVENLABS_VOICES).map(name => `xi:${name}`)
+);
+
+/** Resolve voice name to TTS engine: "kokoro" | "piper" | "elevenlabs" | "local" */
+function resolveVoiceEngine(voice: string): "kokoro" | "piper" | "elevenlabs" | "local" {
+  if (voice.startsWith("_local:")) return "local";
+  if (voice.startsWith("piper:")) return "piper";
+  if (voice.startsWith("xi:")) return "elevenlabs";
+  return "kokoro";
+}
+
+/** Look up ElevenLabs voice_id from xi:DisplayName */
+function resolveElevenLabsVoiceId(voice: string): string | null {
+  const displayName = voice.slice(3); // strip "xi:"
+  for (const [id, name] of Object.entries(ELEVENLABS_VOICES)) {
+    if (name === displayName) return id;
+  }
+  return null;
+}
 
 // --- Service Health Checks ---
 
@@ -119,18 +159,37 @@ async function checkService(name: string, url: string): Promise<boolean> {
   }
 }
 
-async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean }> {
+function checkPiper(): boolean {
+  try {
+    const hasBin = existsSync(PIPER_BIN);
+    const hasModel = existsSync(PIPER_MODEL);
+    if (hasBin && hasModel) {
+      console.log(`  ✓ Piper TTS is available (${PIPER_BIN})`);
+      return true;
+    }
+    if (!hasBin) console.warn(`  ✗ Piper binary not found (${PIPER_BIN})`);
+    if (!hasModel) console.warn(`  ✗ Piper model not found (${PIPER_MODEL})`);
+    return false;
+  } catch {
+    console.warn("  ✗ Piper TTS check failed");
+    return false;
+  }
+}
+
+async function checkAllServices(): Promise<{ whisper: boolean; kokoro: boolean; piper: boolean }> {
   console.log("Checking services...");
   const [whisper, kokoro] = await Promise.all([
     checkService("Whisper STT", WHISPER_URL),
     checkService("Kokoro TTS", KOKORO_URL),
   ]);
+  const piper = checkPiper();
   if (!whisper) console.warn("  → Transcription will fail until Whisper is started");
   if (!kokoro) console.warn("  → TTS will fail until Kokoro is started");
-  return { whisper, kokoro };
+  if (!piper) console.warn("  → Piper TTS unavailable (local subprocess)");
+  return { whisper, kokoro, piper };
 }
 
-let serviceStatus = { whisper: false, kokoro: false };
+let serviceStatus = { whisper: false, kokoro: false, piper: false };
 let lastServiceCheckAt = 0;
 
 // --- Primary Audio Client ---
@@ -163,8 +222,14 @@ function sendToAudioClient(data: Buffer | object) {
   }
   if (!target) return;
   try {
-    if (Buffer.isBuffer(data)) target.send(data);
-    else target.send(JSON.stringify(data));
+    if (Buffer.isBuffer(data)) {
+      target.send(data);
+    } else {
+      const json = JSON.stringify(data);
+      target.send(json);
+      // Log JSON messages for debugging (tts_play, local_tts, etc.)
+      wslog("out", (data as Record<string, unknown>).type as string || "audio_json", json.length);
+    }
   } catch { clients.delete(target); if (activeAudioClient === target) activeAudioClient = null; }
 }
 
@@ -257,6 +322,7 @@ interface TtsHistoryEntry {
   speakableText: string;
   generation: number;
   source: string; // "queueTts" | "sentence" | "final" | "replay"
+  window: string;
   chunkCount: number;
   chunkWordCounts: number[];
 }
@@ -266,6 +332,7 @@ function ttslog(entryId: number | null, text: string, generation: number, source
   _ttsHistory.push({
     ts: Date.now(), entryId, textSnippet: text.slice(0, 120),
     speakableText: speakableText.slice(0, 120), generation, source,
+    window: getWindowKey(),
     chunkCount, chunkWordCounts,
   });
   if (_ttsHistory.length > 50) _ttsHistory.shift();
@@ -400,6 +467,7 @@ interface PanelSettings {
   speed?: number;
   tmuxTarget?: string; // "session:windowIndex" — last used tmux session
   fillerAudio?: boolean; // Enable predictive filler audio while Claude thinks (default: true)
+  elevenLabsApiKey?: string; // ElevenLabs API key for cloud TTS
 }
 
 function loadSettings(): PanelSettings {
@@ -708,8 +776,9 @@ function cancelOldTurnJobs(): void {
 
 // --- Debug Pipeline Observability ---
 
-interface KokoroFetchLog {
+interface TtsFetchLog {
   ts: number;
+  engine: "kokoro" | "piper" | "elevenlabs";
   entryId: number | null;
   chunkIndex: number;
   text: string;
@@ -720,7 +789,9 @@ interface KokoroFetchLog {
   status: "success" | "failed" | "aborted";
   error?: string;
 }
-const _kokoroLog: KokoroFetchLog[] = []; // ring buffer, last 50
+const _ttsFetchLog: TtsFetchLog[] = []; // ring buffer, last 50
+// Backwards compat alias for debug endpoints
+const _kokoroLog = _ttsFetchLog;
 
 interface ChunkFlowLog {
   ts: number;
@@ -750,7 +821,7 @@ const _clientPlayback: ClientPlaybackState = {
 interface InputLog {
   ts: number;
   inputId: string;
-  source: "voice" | "text" | "passive";
+  source: "voice" | "text-input" | "terminal";
   userEntryId: number;
   responseEntryIds: number[];
   ttsEntryIds: number[];
@@ -770,16 +841,21 @@ function logChunkFlow(event: ChunkFlowLog["event"], entryId: number | null, chun
   _lastChunkFlowTs.set(key, now);
 }
 
-function logKokoroFetch(entryId: number | null, chunkIndex: number, text: string,
-  startTs: number, audioSizeBytes: number, status: KokoroFetchLog["status"], error?: string): void {
+function logTtsFetch(engine: TtsFetchLog["engine"], entryId: number | null, chunkIndex: number, text: string,
+  startTs: number, audioSizeBytes: number, status: TtsFetchLog["status"], error?: string): void {
   const now = Date.now();
-  const entry: KokoroFetchLog = {
-    ts: now, entryId, chunkIndex, text: text.slice(0, 50),
+  const entry: TtsFetchLog = {
+    ts: now, engine, entryId, chunkIndex, text: text.slice(0, 50),
     fetchStartTs: startTs, fetchEndTs: now, durationMs: now - startTs,
     audioSizeBytes, status, error,
   };
-  _kokoroLog.push(entry);
-  if (_kokoroLog.length > 50) _kokoroLog.shift();
+  _ttsFetchLog.push(entry);
+  if (_ttsFetchLog.length > 50) _ttsFetchLog.shift();
+}
+// Backwards compat — existing callers use this name
+function logKokoroFetch(entryId: number | null, chunkIndex: number, text: string,
+  startTs: number, audioSizeBytes: number, status: TtsFetchLog["status"], error?: string): void {
+  logTtsFetch("kokoro", entryId, chunkIndex, text, startTs, audioSizeBytes, status, error);
 }
 
 function logInput(inputId: string, source: InputLog["source"], userEntryId: number): void {
@@ -876,9 +952,10 @@ interface TtsJob {
   speakableText: string;   // Cleaned text that was split into chunks
   chunks: TtsChunk[];
   state: "fetching" | "ready" | "playing" | "done" | "failed";
-  mode: "kokoro" | "local";
+  mode: "kokoro" | "local" | "piper" | "elevenlabs";
   generation: number;      // ttsGeneration when job was created
   turn: number;            // conversation turn when job was created
+  window: string;          // tmux window key when job was created
   currentChunkIndex: number; // Index of chunk currently being played (chunk-level ack)
   playingSince: number;    // Timestamp when state became "playing" (0 if not playing)
 }
@@ -1031,9 +1108,187 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
 }
 
 /**
+ * Fetch audio from Piper TTS via subprocess. Produces WAV output.
+ * Same contract as fetchKokoroAudio — fills chunk.audioBuf or marks failed.
+ */
+async function fetchPiperAudio(job: TtsJob, chunkIndex: number): Promise<void> {
+  const chunk = job.chunks[chunkIndex];
+  if (!chunk || chunk.state !== "pending") return;
+
+  while (_activeFetchCount >= TTS_MAX_PARALLEL) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (isJobStale(job)) { chunk.state = "failed"; return; }
+
+  chunk.state = "fetching";
+  _activeFetchCount++;
+  const fetchStartTs = Date.now();
+
+  try {
+    const buf = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const proc = spawn("python3", ["-c", `
+import sys, io, wave
+from piper import PiperVoice
+voice = PiperVoice.load('${PIPER_MODEL}', '${PIPER_MODEL}.json')
+pcm = b''
+sr = None
+for audio in voice.synthesize(sys.stdin.read()):
+    pcm += audio.audio_int16_bytes
+    sr = audio.sample_rate
+buf = io.BytesIO()
+with wave.open(buf, 'wb') as wf:
+    wf.setnchannels(1)
+    wf.setsampwidth(2)
+    wf.setframerate(sr)
+    wf.writeframes(pcm)
+sys.stdout.buffer.write(buf.getvalue())
+`], { stdio: ["pipe", "pipe", "pipe"], timeout: 30000 });
+      proc.stdout.on("data", (d: Buffer) => chunks.push(d));
+      proc.stderr.on("data", () => {}); // suppress stderr
+      proc.on("close", (code) => {
+        if (code === 0) resolve(Buffer.concat(chunks));
+        else reject(new Error(`Piper exited with code ${code}`));
+      });
+      proc.on("error", reject);
+      proc.stdin.write(chunk.text);
+      proc.stdin.end();
+    });
+
+    if (isJobStale(job)) {
+      chunk.state = "failed";
+      logTtsFetch("piper", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
+      return;
+    }
+    if (buf.length < 100) throw new Error("Piper returned empty audio");
+
+    chunk.audioBuf = buf;
+    chunk.state = "ready";
+    logTtsFetch("piper", job.entryId, chunkIndex, chunk.text, fetchStartTs, buf.length, "success");
+    plog("tts_chunk_ready", `job=${job.jobId} chunk=${chunkIndex} ${buf.length}B piper`);
+
+    if (ttsCurrentlyPlaying === job && job.state === "playing" && job.currentChunkIndex === chunkIndex) {
+      if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+      sendChunk(job, chunkIndex);
+    } else if (job.state === "fetching") {
+      if (chunkIndex === 0 || job.chunks.every(c => c.state === "ready")) {
+        job.state = "ready";
+      }
+    }
+  } catch (err) {
+    console.error(`[tts2] Piper fetch failed (job=${job.jobId} chunk=${chunkIndex}):`, (err as Error).message);
+    chunk.state = "failed";
+    job.state = "failed";
+    logTtsFetch("piper", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
+  } finally {
+    _activeFetchCount--;
+  }
+}
+
+/**
+ * Fetch audio from ElevenLabs API. Produces MP3 output which the client handles.
+ * Same contract as fetchKokoroAudio — fills chunk.audioBuf or marks failed.
+ */
+async function fetchElevenLabsAudio(job: TtsJob, chunkIndex: number): Promise<void> {
+  const chunk = job.chunks[chunkIndex];
+  if (!chunk || chunk.state !== "pending") return;
+
+  while (_activeFetchCount >= TTS_MAX_PARALLEL) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (isJobStale(job)) { chunk.state = "failed"; return; }
+
+  chunk.state = "fetching";
+  chunk.abortController = new AbortController();
+  _activeFetchCount++;
+  const fetchStartTs = Date.now();
+
+  const settings = loadSettings();
+  const apiKey = settings.elevenLabsApiKey;
+  if (!apiKey) {
+    chunk.state = "failed";
+    job.state = "failed";
+    _activeFetchCount--;
+    chunk.abortController = null;
+    return;
+  }
+
+  const voiceId = resolveElevenLabsVoiceId(settings.voice || "");
+  if (!voiceId) {
+    console.error(`[tts2] Unknown ElevenLabs voice: ${settings.voice}`);
+    chunk.state = "failed";
+    job.state = "failed";
+    _activeFetchCount--;
+    chunk.abortController = null;
+    return;
+  }
+
+  try {
+    const resp = await fetch(`${ELEVENLABS_API_URL}/${voiceId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "xi-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        text: chunk.text,
+        model_id: "eleven_monolingual_v1",
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+      signal: chunk.abortController.signal,
+    });
+    if (!resp.ok) throw new Error(`ElevenLabs returned ${resp.status}: ${await resp.text().catch(() => "")}`);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length < 100) throw new Error("ElevenLabs returned empty audio");
+
+    if (isJobStale(job)) {
+      chunk.state = "failed";
+      logTtsFetch("elevenlabs", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
+      return;
+    }
+
+    chunk.audioBuf = buf;
+    chunk.state = "ready";
+    logTtsFetch("elevenlabs", job.entryId, chunkIndex, chunk.text, fetchStartTs, buf.length, "success");
+    plog("tts_chunk_ready", `job=${job.jobId} chunk=${chunkIndex} ${buf.length}B elevenlabs`);
+
+    if (ttsCurrentlyPlaying === job && job.state === "playing" && job.currentChunkIndex === chunkIndex) {
+      if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+      sendChunk(job, chunkIndex);
+    } else if (job.state === "fetching") {
+      if (chunkIndex === 0 || job.chunks.every(c => c.state === "ready")) {
+        job.state = "ready";
+      }
+    }
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      chunk.state = "failed";
+      logTtsFetch("elevenlabs", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
+      return;
+    }
+    console.error(`[tts2] ElevenLabs fetch failed (job=${job.jobId} chunk=${chunkIndex}):`, (err as Error).message);
+    chunk.state = "failed";
+    job.state = "failed";
+    logTtsFetch("elevenlabs", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
+  } finally {
+    _activeFetchCount--;
+    chunk.abortController = null;
+  }
+}
+
+/**
  * Queue text for TTS playback, labeled with an entry ID.
  */
 function queueTts(entryId: number | null, text: string, source = "queueTts"): void {
+  // Per-window guard: if the entry belongs to a different window, skip TTS
+  if (entryId != null) {
+    const entry = conversationEntries.find(e => e.id === entryId);
+    if (entry?.window && entry.window !== getWindowKey()) {
+      console.log(`[tts2] Skipping TTS for entry ${entryId} — belongs to window ${entry.window}, current is ${getWindowKey()}`);
+      return;
+    }
+  }
+
   // Stop filler audio when real response audio is queued (not another filler)
   if (entryId != null && entryId !== FILLER_ENTRY_ID && entryId !== _fillerEntryId) {
     stopFillerIfActive();
@@ -1054,10 +1309,10 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     return;
   }
 
-  // Dedup: skip if this entryId already has a pending/playing job
+  // Dedup: skip if this entryId already has a pending/playing job in CURRENT generation
   if (entryId != null) {
     const existing = ttsJobQueue.find(
-      j => j.entryId === entryId && j.state !== "done" && j.state !== "failed"
+      j => j.entryId === entryId && j.state !== "done" && j.state !== "failed" && !isJobStale(j)
     );
     if (existing) {
       // If the new text is longer than what's already queued, the entry grew.
@@ -1086,11 +1341,23 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
             abortController: null,
           }));
           existing.state = existing.mode === "local" ? "ready" : "fetching";
-          // Re-fire Kokoro fetches for new chunks
+          // Re-fire audio fetches for new chunks
           if (existing.mode === "kokoro") {
             for (const chunk of existing.chunks) {
               fetchKokoroAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
                 console.error(`[tts2] drainAudioBuffer error after re-fetch: ${(err as Error).message}`);
+              });
+            }
+          } else if (existing.mode === "piper") {
+            for (const chunk of existing.chunks) {
+              fetchPiperAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
+                console.error(`[tts2] drainAudioBuffer error after piper re-fetch: ${(err as Error).message}`);
+              });
+            }
+          } else if (existing.mode === "elevenlabs") {
+            for (const chunk of existing.chunks) {
+              fetchElevenLabsAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
+                console.error(`[tts2] drainAudioBuffer error after elevenlabs re-fetch: ${(err as Error).message}`);
               });
             }
           }
@@ -1112,22 +1379,31 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     return;
   }
 
-  // Determine mode: local voice or Kokoro
+  // Determine mode based on voice prefix
   const settings = loadSettings();
   const voice = settings.voice || "af_heart";
-  const isLocal = voice.startsWith("_local");
+  const engine = resolveVoiceEngine(voice);
 
-  // For local voices, check if audio client has the voice
-  let useLocal = false;
-  if (isLocal) {
+  let mode: "kokoro" | "local" | "piper" | "elevenlabs";
+  if (engine === "local") {
     const localName = voice.slice(7);
     const audioClient = activeAudioClient && activeAudioClient.readyState === WebSocket.OPEN
       ? activeAudioClient
       : Array.from(clients).find((c) => c.readyState === WebSocket.OPEN && !(c as any)._isTestClient) || null;
-    useLocal = localName === "default" ||
+    const useLocal = localName === "default" ||
       (audioClient != null && (audioClient as any)._localVoices?.has(localName));
+    mode = useLocal ? "local" : "kokoro"; // Fallback to Kokoro if local voice unavailable
+  } else if (engine === "elevenlabs") {
+    const apiKey = settings.elevenLabsApiKey;
+    if (!apiKey) {
+      console.warn("[tts2] ElevenLabs voice selected but no API key — falling back to Kokoro");
+      mode = "kokoro";
+    } else {
+      mode = "elevenlabs";
+    }
+  } else {
+    mode = engine; // "kokoro" or "piper"
   }
-  const mode: "kokoro" | "local" = useLocal ? "local" : "kokoro";
 
   // Split into chunks (first chunk smaller for faster initial audio)
   const chunkTexts = splitIntoChunks(speakableText, TTS_CHUNK_MAX_CHARS, TTS_FIRST_CHUNK_MAX);
@@ -1160,6 +1436,7 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     mode,
     generation: ttsGeneration,
     turn: currentTurn,
+    window: getWindowKey(),
     currentChunkIndex: 0,
     playingSince: 0,
   };
@@ -1178,7 +1455,7 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
   plog("tts2_queued", `job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} (${speakableText.length} chars)`);
   console.log(`[tts2] Queued job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} queue=${ttsJobQueue.length}`);
 
-  // Fire parallel Kokoro fetches (local jobs skip this — already "ready")
+  // Fire parallel audio fetches (local jobs skip this — already "ready")
   if (mode === "kokoro") {
     // Check Kokoro availability before firing fetches
     if (!serviceStatus.kokoro) {
@@ -1211,6 +1488,18 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
           console.error(`[tts2] drainAudioBuffer error after fetch: ${(err as Error).message}`);
         });
       }
+    }
+  } else if (mode === "piper") {
+    for (const chunk of chunks) {
+      fetchPiperAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
+        console.error(`[tts2] drainAudioBuffer error after piper fetch: ${(err as Error).message}`);
+      });
+    }
+  } else if (mode === "elevenlabs") {
+    for (const chunk of chunks) {
+      fetchElevenLabsAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
+        console.error(`[tts2] drainAudioBuffer error after elevenlabs fetch: ${(err as Error).message}`);
+      });
     }
   }
 
@@ -1365,7 +1654,7 @@ function queueFillerAudio(userText = ""): void {
     filler: true, // Tag so UI can style differently if desired
     ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
   };
-  conversationEntries.push(fillerEntry);
+  pushEntry(fillerEntry);
   elog(fillerEntryId, "assistant", "filler", phrase);
   broadcast({ type: "entry", entries: conversationEntries, partial: true });
 
@@ -1446,8 +1735,8 @@ function drainAudioBuffer(): void {
 
   const job = ttsJobQueue[0];
 
-  // For Kokoro jobs, we can start as soon as chunk 0 is ready (don't wait for all chunks)
-  if (job.state === "fetching" && job.mode === "kokoro") {
+  // For server-side TTS jobs, start as soon as chunk 0 is ready (don't wait for all chunks)
+  if (job.state === "fetching" && (job.mode === "kokoro" || job.mode === "piper" || job.mode === "elevenlabs")) {
     if (job.chunks[0]?.state === "ready") {
       job.state = "ready"; // Promote — remaining chunks may still be fetching
     }
@@ -1470,9 +1759,13 @@ function drainAudioBuffer(): void {
   console.log(`[tts2] Playing job=${job.jobId} entry=${job.entryId} mode=${job.mode} chunks=${job.chunks.length}`);
   plog("tts2_play", `job=${job.jobId} entry=${job.entryId} ${job.speakableText.slice(0, 80)}`);
 
+  // Unify state: set _clientPlayback atomically with ttsCurrentlyPlaying
+  _clientPlayback.currentEntryId = job.entryId;
+  _clientPlayback.currentChunkIndex = 0;
+
   if (job.mode === "local") {
     // Local TTS: send text to client for Web Speech API (single chunk, no ack needed)
-    sendToAudioClient({
+    const ttsPlayMsg = {
       type: "tts_play",
       entryId: job.entryId,
       fullText: job.fullText,
@@ -1480,7 +1773,8 @@ function drainAudioBuffer(): void {
       chunkCount: 1,
       chunkWordCounts: [job.speakableText.trim().split(/\s+/).length],
       localTts: true,
-    });
+    };
+    broadcast(ttsPlayMsg); // Send to ALL clients for highlight
     sendToAudioClient({ type: "local_tts", text: job.speakableText, entryId: job.entryId });
     broadcast({ type: "voice_status", state: "speaking" });
 
@@ -1494,9 +1788,9 @@ function drainAudioBuffer(): void {
       }
     }, timeoutMs);
   } else {
-    // Kokoro: send tts_play metadata + ONLY chunk 0 binary (chunk-level ack protocol)
+    // Server-side TTS: broadcast tts_play to ALL clients for highlight + send chunk 0 binary to audio client
     const chunkWordCounts = job.chunks.map(c => c.wordCount);
-    sendToAudioClient({
+    broadcast({
       type: "tts_play",
       entryId: job.entryId,
       fullText: job.fullText,
@@ -1523,7 +1817,7 @@ function sendChunk(job: TtsJob, chunkIndex: number): void {
   chunk.audioBuf = null; // Free after sending
   slog("tts", "chunk_sent", { bytes, entry: job.entryId, chunk: chunkIndex, of: job.chunks.length });
   logChunkFlow("chunk_sent", job.entryId, chunkIndex);
-  _clientPlayback.currentEntryId = job.entryId;
+  // currentEntryId is set atomically in drainAudioBuffer; only update chunk index here
   _clientPlayback.currentChunkIndex = chunkIndex;
   console.log(`[tts2] Sent chunk ${chunkIndex}/${job.chunks.length - 1} (${bytes}B) for entry=${job.entryId}`);
 
@@ -1719,6 +2013,15 @@ function stopClientPlayback2(reason: GenerationEvent["reason"] = "user_stop", en
 type StreamState = "IDLE" | "WAITING" | "THINKING" | "RESPONDING" | "FINALIZING" | "DONE";
 
 let streamState: StreamState = "IDLE";
+let _cleanMode = true; // Client clean/verbose mode: true = clean (only speakable), false = verbose (all entries)
+
+/** Should this entry be queued for TTS? In clean mode, only speakable entries. In verbose mode, all assistant entries. */
+function shouldTtsEntry(entry: ConversationEntry): boolean {
+  if (_cleanMode) return entry.speakable;
+  // Always respect speakable flag — tool output, file paths, etc. must never be spoken.
+  // Verbose mode controls display (showing non-speakable entries), not TTS.
+  return entry.speakable;
+}
 
 // Broadcast idle only when stream is not active (prevents mic button glow flicker)
 function broadcastIdleIfSafe() {
@@ -2024,6 +2327,8 @@ interface ConversationEntry {
   spoken: boolean;
   ts: number;
   turn: number;
+  window?: string;           // tmux window key — isolates entries per window
+  sourceTag?: string;        // origin: "voice", "text-input", "terminal", "text-input-test"
   queued?: boolean; // true = pending while Claude is active, not yet sent
   filler?: boolean; // true = auto-filler phrase ("Got it, let me look into that")
   inputId?: string;          // Unique ID for this voice/text input (user entries)
@@ -2037,6 +2342,41 @@ let entryTtsTimer: ReturnType<typeof setTimeout> | null = null;
 // Tracks how many chars of each entry have already been queued for TTS.
 // Allows sentence-level TTS: speak complete sentences as they arrive mid-stream.
 let entryTtsCursor: Map<number, number> = new Map();
+
+// --- Per-window conversation arrays ---
+// Each tmux window gets its own conversation entries array.
+// Prevents test entries and CLI output from leaking across windows.
+const windowEntries = new Map<string, ConversationEntry[]>();
+let currentWindowKey = ""; // Set on startup from terminal.currentTarget
+
+/** Get the window key for the currently active tmux pane */
+function getWindowKey(): string {
+  return terminal?.currentTarget ?? currentWindowKey ?? "_default";
+}
+
+/** Update conversationEntries and sync to the per-window map */
+function setConversationEntries(entries: ConversationEntry[]): void {
+  conversationEntries = entries;
+  const key = getWindowKey();
+  if (key) windowEntries.set(key, entries);
+}
+
+/** Save current entries to the per-window map (call before switching windows) */
+function saveCurrentWindowEntries(): void {
+  const key = getWindowKey();
+  if (key) windowEntries.set(key, conversationEntries);
+}
+
+/** Load entries for a window key from the map, or empty array if not cached */
+function loadWindowEntries(windowKey: string): ConversationEntry[] | null {
+  return windowEntries.get(windowKey) ?? null;
+}
+
+/** Push an entry into conversationEntries with window tag automatically set */
+function pushEntry(entry: ConversationEntry): void {
+  entry.window = getWindowKey();
+  conversationEntries.push(entry);
+}
 
 // Add a user entry and broadcast the updated entry list
 function addUserEntry(text: string, queued = false, _source = "unknown", inputId?: string) {
@@ -2112,7 +2452,7 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
 
   // Length guard: passive watcher inputs > 300 chars are suspicious — real voice/type inputs are short.
   // Log a warning but still create the entry (don't block legitimate long pastes).
-  if (_source === "passive-watcher" && text.length > 300) {
+  if (_source === "terminal" && text.length > 300) {
     console.warn(`[DEDUP-TRACE] LONG-INPUT-WARN: Passive watcher detected ${text.length}-char input (suspicious): "${text.slice(0, 80)}"`);
   }
 
@@ -2126,13 +2466,14 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
     spoken: false,
     ts: Date.now(),
     turn: currentTurn,
+    sourceTag: _source,
     queued,
     ...(inputId ? { inputId } : {}),
   };
-  conversationEntries.push(entry);
+  pushEntry(entry);
   elog(entry.id, "user", _source, text);
   if (inputId) {
-    const source = _source === "voice" ? "voice" as const : _source === "passive" ? "passive" as const : "text" as const;
+    const source = _source.startsWith("voice") ? "voice" as const : _source.startsWith("terminal") ? "terminal" as const : "text-input" as const;
     logInput(inputId, source, entry.id);
   }
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -2159,7 +2500,100 @@ function isToolOutputLine(text: string): boolean {
   return false;
 }
 
-// Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
+// ── State machine for extractStructuredOutput (BUG-116 redesign) ──
+// States: PROSE (capture as speakable), TOOL_BLOCK (skip — entered on tool marker,
+// exited on ⏺-prose / empty line / prompt), AGENT_BLOCK (skip — XML tags),
+// STATUS (skip — spinner/chrome). Each line transitions state based on markers.
+// No line evaluated in isolation — block context determines classification.
+type ParserState = "PROSE" | "TOOL_BLOCK" | "AGENT_BLOCK" | "STATUS";
+
+// Returns true if line is TUI chrome that should be skipped in ANY state
+function isChromeSkip(trimmed: string): string {
+  if (/^[─━═]{3,}/.test(trimmed)) return "separator";
+  if (/^❯/.test(trimmed)) return "prompt";
+  if (/bypass\s+permissions/i.test(trimmed)) return "bypass_permissions";
+  if (/^⏵/.test(trimmed)) return "arrow_marker";
+  if (isSpinnerLine(trimmed)) return "spinner_line";
+  if (/context left until/i.test(trimmed)) return "context_left";
+  if (/auto-compact/i.test(trimmed)) return "auto_compact";
+  if (MURMUR_CONTEXT_FILTER.test(trimmed)) {
+    if (/prose mode/i.test(trimmed)) console.log(`[PROSE-LEAK-TRACE] extractStructuredOutput FILTERED: "${trimmed.slice(0, 80)}"`);
+    return "murmur_context";
+  }
+  if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) return "json_notification";
+  if (/^Background command .+ completed/i.test(trimmed)) return "bg_task_notification";
+  // NOTE: Tool markers (⏺ Bash, ⎿, Read(...), ctrl+o expand, etc.) are NOT filtered here.
+  // They are handled by the state machine's TOOL_BLOCK transitions so that continuation
+  // lines are properly captured. Filtering them here would prevent state transitions
+  // and cause continuation lines to leak as prose (BUG-116).
+  if (/expand\s+permiss/i.test(trimmed)) return "expand_permissions";
+  if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) return "nav_hint";
+  if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) return "permission_choice";
+  if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) return "box_drawing";
+  if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) return "menu_fragment";
+  if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) return "menu_label";
+  if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) return "feedback_prompt";
+  if (/^[✻✶✢✽]/.test(trimmed)) return "status_cooking";
+  if (/@(code|ma)\b/.test(trimmed)) return "ink_tui";
+  if (/→\s*·/.test(trimmed)) return "arrow_dot";
+  if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) return "garbled_tui";
+  if (trimmed.length > 0 && trimmed.length < 100) {
+    const alphaCount = (trimmed.match(/[a-zA-Z0-9]/g) || []).length;
+    if (alphaCount / trimmed.length < 0.4) return "low_alpha_ratio";
+  }
+  const tuiKws = ["expand", "bypass", "permiss", "interrupt", "tasks", "team", "@code", "@ma", "ions"];
+  const hits = tuiKws.filter(k => trimmed.toLowerCase().includes(k));
+  if (hits.length >= 2) return "multi_tui_keywords";
+  return "";
+}
+
+// Returns non-speakable reason if line should be kept for display but not TTS
+function isNonSpeakableLine(trimmed: string): string {
+  if (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) return "timing_summary";
+  if (/^(ctrl|⌃|esc to|press)/i.test(trimmed)) return "ctrl_hint";
+  if (/\bctrl\+[a-z]\b/i.test(trimmed)) return "ctrl_shortcut";
+  if (/^⏸\s+plan mode/i.test(trimmed)) return "plan_mode";
+  if (/⏵⏵\s+bypass/i.test(trimmed)) return "bypass_mode";
+  if (/shift\+tab to cycle/i.test(trimmed)) return "shift_tab";
+  if (/^[├└│⎿]/.test(trimmed)) return "tree_output";
+  if (/^\d+\s+Explore\s+agents?\s+finished/i.test(trimmed)) return "agent_summary";
+  if (/Explore\s+.*finished.*ctrl/i.test(trimmed)) return "agent_summary";
+  if (/^Read \d+ files?/i.test(trimmed)) return "tool_read";
+  if (/^Searched for \d+/i.test(trimmed)) return "tool_search";
+  if (/^Wrote \d+/i.test(trimmed)) return "tool_write";
+  if (/^Edited \d+/i.test(trimmed)) return "tool_edit";
+  if (/^Ran /i.test(trimmed) && trimmed.length < 60) return "tool_ran";
+  if (/Interrupted/.test(trimmed)) return "interrupted";
+  if (/Running…/.test(trimmed)) return "running";
+  if (/^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed)) return "todo_item";
+  if (/ctrl\+o/i.test(trimmed)) return "expand_hint";
+  if (/^\+\d+ lines/.test(trimmed)) return "expand_lines";
+  if (/^… \+\d+/.test(trimmed)) return "expand_ellipsis";
+  if (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100 && trimmed.split(/\s+/).length <= 3) return "file_path";
+  if (/^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed)) return "choice_menu";
+  if (/permission/i.test(trimmed) && /allow|deny|grant|expand/i.test(trimmed)) return "permission_fragment";
+  if (/[↓↑←→]{2,}/.test(trimmed)) return "arrow_nav";
+  if (/\b(opus|sonnet|haiku|auto|compact|context)\b/i.test(trimmed) && trimmed.length < 40) return "status_bar";
+  return "";
+}
+
+// Returns true if line is a tool block entry marker (⏺ ToolName( or ⏺ ToolName, ⎿, Bash(...), etc.)
+function isToolMarker(trimmed: string): boolean {
+  if (/^⏺\s+\w+\(/.test(trimmed)) return true;   // ⏺ Bash(...)
+  if (/^⏺\s+\w+$/.test(trimmed)) return true;     // ⏺ Read (standalone)
+  if (/^⎿/.test(trimmed)) return true;              // ⎿ output continuation
+  if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/i.test(trimmed)) return true;
+  return false;
+}
+
+// Returns true if line is ⏺ followed by prose (not a tool name) — exits TOOL_BLOCK to PROSE
+function isProseMarker(trimmed: string): boolean {
+  return /^⏺\s+/.test(trimmed) && !/^⏺\s+\w+[\s(]?$/.test(trimmed);
+}
+
+// Unified extraction: state-machine parser. Returns tagged paragraphs (speakable vs non-speakable).
+// State machine approach (BUG-116 redesign): each line is classified based on block context,
+// not in isolation. Tool continuation lines that lack markers are captured by TOOL_BLOCK state.
 function extractStructuredOutput(preSnapshot: string, postSnapshot: string, userInput: string): ExtractedParagraph[] {
   const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
   // Tier 1: capture raw input snapshot (truncate to 4KB for reasonable size)
@@ -2168,9 +2602,9 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
   const result: ExtractedParagraph[] = [];
   let currentLines: string[] = [];
   let currentSpeakable = true;
-  let inToolBlock = false;
   let foundContent = false;
-  let inAgentBlock = false; // true while inside <teammate-message>, <task-notification>, <system-reminder> blocks
+  let state: ParserState = "PROSE";
+  let toolBlockEmptyLines = 0; // Count consecutive empty lines in TOOL_BLOCK
 
   function flushParagraph() {
     const text = reflowText(currentLines.join("\n").trim());
@@ -2184,148 +2618,98 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
   for (const line of lines) {
     const trimmed = line.trim();
 
-    // Skip blank lines before content
+    // Skip blank lines before any content found
     if (!foundContent && !trimmed) continue;
 
-    // ── Shared chrome filters (from both extractRawOutput + extractSpeakableText) ──
-    // Each filter logs its reason to _parseLog for debugging content suppression issues
-    let _skipReason = "";
-    if (/^[─━═]{3,}/.test(trimmed)) _skipReason = "separator";
-    else if (/^❯/.test(trimmed)) _skipReason = "prompt";
-    else if (/bypass\s+permissions/i.test(trimmed)) _skipReason = "bypass_permissions";
-    else if (/^⏵/.test(trimmed)) _skipReason = "arrow_marker";
-    else if (isSpinnerLine(trimmed)) _skipReason = "spinner_line";
-    else if (/context left until/i.test(trimmed)) _skipReason = "context_left";
-    else if (/auto-compact/i.test(trimmed)) _skipReason = "auto_compact";
-    else if (MURMUR_CONTEXT_FILTER.test(trimmed)) {
-      if (/prose mode/i.test(trimmed)) console.log(`[PROSE-LEAK-TRACE] extractStructuredOutput FILTERED: "${trimmed.slice(0, 80)}"`);
-      _skipReason = "murmur_context";
-    }
-    // Filter Claude Code team/agent messages — stateful block filter
-    else if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock = true; _skipReason = "agent_block_open"; }
-    else if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock = false; _skipReason = "agent_block_close"; }
-    else if (inAgentBlock) _skipReason = "inside_agent_block";
-    else if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) _skipReason = "json_notification";
-    // Background task completion notifications
-    else if (/^Background command .+ completed/i.test(trimmed)) _skipReason = "bg_task_notification";
-    // Claude Code tool invocations and output (⏺ Bash(...), ⏺ Searched, ⏺ Reading, ⎿ output)
-    else if (/^⏺\s*(Bash|Read|Write|Edit|Glob|Grep|Searched|Reading|Update)\b/i.test(trimmed)) _skipReason = "tool_invocation";
-    else if (/^Bash\(/i.test(trimmed)) _skipReason = "tool_invocation";
-    else if (/^⎿/.test(trimmed)) _skipReason = "tool_output_continuation";
-    else if (/ctrl\+o\s+to\s+expand/i.test(trimmed)) _skipReason = "collapsed_output_hint";
-    // Claude Code TUI chrome — status bar, menus, navigation hints, permission prompts
-    else if (/expand\s+permiss/i.test(trimmed)) _skipReason = "expand_permissions";
-    else if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) _skipReason = "nav_hint";
-    else if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) _skipReason = "permission_choice";
-    // Lines that are mostly Unicode box-drawing / arrow / UI decoration (not prose)
-    else if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) _skipReason = "box_drawing";
-    // Claude Code menu/status fragments — short lines with navigation chrome
-    else if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) _skipReason = "menu_fragment";
-    else if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) _skipReason = "menu_label";
-    // Session feedback prompts
-    else if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) _skipReason = "feedback_prompt";
-    // Claude Code status lines — these spinner chars only appear in status bar, never in conversation
-    else if (/^[✻✶✢✽]/.test(trimmed)) _skipReason = "status_cooking";
-    // Claude Code ink TUI status indicators (garbled tmux capture of redrawn regions)
-    else if (/@(code|ma)\b/.test(trimmed)) _skipReason = "ink_tui";
-    else if (/→\s*·/.test(trimmed)) _skipReason = "arrow_dot";
-    // Garbled TUI text detector: multiple 3+ space runs between short fragments = partial frame capture
-    else if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) _skipReason = "garbled_tui";
-    // High non-alpha ratio: >50% non-alphanumeric+space on short lines = UI chrome, not prose
-    else if (trimmed.length > 0 && trimmed.length < 100) {
-      const alphaCount = (trimmed.match(/[a-zA-Z0-9]/g) || []).length;
-      if (alphaCount / trimmed.length < 0.4) _skipReason = "low_alpha_ratio";
-    }
-    // Lines containing multiple TUI keywords mashed together (garbled ink redraws)
-    if (!_skipReason) {
-      const tuiKws = ["expand", "bypass", "permiss", "interrupt", "tasks", "team", "@code", "@ma", "ions"];
-      const hits = tuiKws.filter(k => trimmed.toLowerCase().includes(k));
-      if (hits.length >= 2) _skipReason = "multi_tui_keywords";
-    }
-    if (_skipReason) { parselog(trimmed, "skip", _skipReason); continue; }
+    // ── State transitions ──
 
-    // ── Non-speakable filters (from extractSpeakableText) ──
-    // These lines are kept for display (verbose mode) but marked non-speakable
-    let _nonSpeakableReason = "";
-    if (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) _nonSpeakableReason = "timing_summary";
-    else if (/^(ctrl|⌃|esc to|press)/i.test(trimmed)) _nonSpeakableReason = "ctrl_hint";
-    else if (/\bctrl\+[a-z]\b/i.test(trimmed)) _nonSpeakableReason = "ctrl_shortcut";
-    else if (/^⏸\s+plan mode/i.test(trimmed)) _nonSpeakableReason = "plan_mode";
-    else if (/⏵⏵\s+bypass/i.test(trimmed)) _nonSpeakableReason = "bypass_mode";
-    else if (/shift\+tab to cycle/i.test(trimmed)) _nonSpeakableReason = "shift_tab";
-    else if (/^[├└│⎿]/.test(trimmed)) _nonSpeakableReason = "tree_output";
-    else if (/^\d+\s+Explore\s+agents?\s+finished/i.test(trimmed)) _nonSpeakableReason = "agent_summary";
-    else if (/Explore\s+.*finished.*ctrl/i.test(trimmed)) _nonSpeakableReason = "agent_summary";
-    else if (/^Read \d+ files?/i.test(trimmed)) _nonSpeakableReason = "tool_read";
-    else if (/^Searched for \d+/i.test(trimmed)) _nonSpeakableReason = "tool_search";
-    else if (/^Wrote \d+/i.test(trimmed)) _nonSpeakableReason = "tool_write";
-    else if (/^Edited \d+/i.test(trimmed)) _nonSpeakableReason = "tool_edit";
-    else if (/^Ran /i.test(trimmed) && trimmed.length < 60) _nonSpeakableReason = "tool_ran";
-    else if (/Interrupted/.test(trimmed)) _nonSpeakableReason = "interrupted";
-    else if (/Running…/.test(trimmed)) _nonSpeakableReason = "running";
-    else if (/^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed)) _nonSpeakableReason = "todo_item";
-    else if (/ctrl\+o/i.test(trimmed)) _nonSpeakableReason = "expand_hint";
-    else if (/^\+\d+ lines/.test(trimmed)) _nonSpeakableReason = "expand_lines";
-    else if (/^… \+\d+/.test(trimmed)) _nonSpeakableReason = "expand_ellipsis";
-    // File paths — only standalone path lines (≤3 words), not prose containing paths
-    else if (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100 && trimmed.split(/\s+/).length <= 3) _nonSpeakableReason = "file_path";
-    else if (/^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed)) _nonSpeakableReason = "choice_menu";
-    else if (/permission/i.test(trimmed) && /allow|deny|grant|expand/i.test(trimmed)) _nonSpeakableReason = "permission_fragment";
-    else if (/[↓↑←→]{2,}/.test(trimmed)) _nonSpeakableReason = "arrow_nav";
-    else if (/\b(opus|sonnet|haiku|auto|compact|context)\b/i.test(trimmed) && trimmed.length < 40) _nonSpeakableReason = "status_bar";
-    const isNonSpeakable = _nonSpeakableReason !== "";
-    if (isNonSpeakable) parselog(trimmed, "nonspeakable", _nonSpeakableReason);
-
-    // ── Tool block tracking ──
-    if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
-      // Tool call start — flush any prose, start non-speakable block
+    // AGENT_BLOCK: XML block tags (<teammate-message>, etc.) — swallow everything inside
+    if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) {
       if (currentLines.length > 0) flushParagraph();
-      inToolBlock = true;
+      state = "AGENT_BLOCK";
+      parselog(trimmed, "skip", "agent_block_open");
+      continue;
+    }
+    if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) {
+      state = "PROSE";
+      parselog(trimmed, "skip", "agent_block_close");
+      continue;
+    }
+    if (state === "AGENT_BLOCK") {
+      parselog(trimmed, "skip", "inside_agent_block");
+      continue;
+    }
+
+    // Chrome skip — applies in any state, always discarded.
+    // Tool markers (⏺ Bash, ⎿, etc.) are NOT in isChromeSkip — they are handled
+    // by the TOOL_BLOCK state transitions below so continuation lines are captured.
+    const chromeReason = isChromeSkip(trimmed);
+    if (chromeReason) {
+      parselog(trimmed, "skip", chromeReason);
+      continue;
+    }
+
+    // ── TOOL_BLOCK state: swallow all continuation lines ──
+    if (state === "TOOL_BLOCK") {
+      // Exit conditions:
+      // 1. ⏺ followed by prose → transition to PROSE
+      if (isProseMarker(trimmed)) {
+        toolBlockEmptyLines = 0;
+        if (currentLines.length > 0) flushParagraph();
+        state = "PROSE";
+        currentSpeakable = true;
+        // Fall through to PROSE processing below for this line
+      }
+      // 2. Empty line — tool output can contain single blank lines (e.g. between
+      //    sections). Only exit TOOL_BLOCK after 2+ consecutive empty lines (paragraph
+      //    break), which indicates the tool output section has ended. Single blank lines
+      //    inside tool output caused premature exit and continuation line leaks (Bug 1).
+      else if (!trimmed) {
+        toolBlockEmptyLines++;
+        if (toolBlockEmptyLines >= 2) {
+          if (currentLines.length > 0) flushParagraph();
+          state = "PROSE";
+          currentSpeakable = true;
+          toolBlockEmptyLines = 0;
+        }
+        continue;
+      }
+      // 3. New tool marker → flush and stay in TOOL_BLOCK
+      else if (isToolMarker(trimmed)) {
+        toolBlockEmptyLines = 0;
+        if (currentLines.length > 0) flushParagraph();
+        currentSpeakable = false;
+        currentLines.push(line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, ""));
+        foundContent = true;
+        parselog(trimmed, "nonspeakable", "tool_block_new_marker");
+        continue;
+      }
+      // 4. Continuation line — stay in TOOL_BLOCK, capture as non-speakable
+      else {
+        toolBlockEmptyLines = 0;
+        currentLines.push(line);
+        foundContent = true;
+        parselog(trimmed, "nonspeakable", "tool_block_continuation");
+        continue;
+      }
+    }
+
+    // ── Transition INTO TOOL_BLOCK from PROSE ──
+    if (isToolMarker(trimmed)) {
+      if (currentLines.length > 0) flushParagraph();
+      state = "TOOL_BLOCK";
+      toolBlockEmptyLines = 0;
       currentSpeakable = false;
       currentLines.push(line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, ""));
       foundContent = true;
-      continue;
-    }
-    if (/^⎿/.test(trimmed)) {
-      // Tool output line
-      if (currentLines.length > 0 && currentSpeakable) flushParagraph();
-      inToolBlock = true;
-      currentSpeakable = false;
-      currentLines.push(line);
-      foundContent = true;
-      continue;
-    }
-    if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/.test(trimmed)) {
-      if (currentLines.length > 0 && currentSpeakable) flushParagraph();
-      inToolBlock = true;
-      currentSpeakable = false;
-      currentLines.push(line);
-      foundContent = true;
+      parselog(trimmed, "nonspeakable", "tool_block_enter");
       continue;
     }
 
-    // ⏺ followed by prose = new prose paragraph, exit tool block
-    if (/^⏺\s+/.test(trimmed) && !/^⏺\s+\w+[\s(]?$/.test(trimmed)) {
-      if (currentLines.length > 0) flushParagraph();
-      inToolBlock = false;
-      currentSpeakable = true;
-    }
+    // ── PROSE state: normal text processing ──
 
-    // Indented lines in tool block = still tool output
-    if (inToolBlock) {
-      if (/^\s{2,}/.test(line) || /^[^a-zA-Z⏺]/.test(trimmed)) {
-        currentLines.push(line);
-        foundContent = true;
-        continue;
-      }
-      // Non-indented prose = tool block ended
-      if (currentLines.length > 0) flushParagraph();
-      inToolBlock = false;
-      currentSpeakable = true;
-    }
-
-    // Strip ⏺ markers
-    let clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
+    // Strip ⏺ markers from prose lines
+    const clean = line.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
     const cleanTrimmed = clean.trim();
 
     if (!cleanTrimmed) {
@@ -2338,15 +2722,17 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
 
     foundContent = true;
 
-    // Mark non-speakable lines
-    if (isNonSpeakable) {
+    // Non-speakable check (kept for display, not TTS)
+    const nonSpeakableReason = isNonSpeakableLine(trimmed);
+    if (nonSpeakableReason) {
       if (currentLines.length > 0 && currentSpeakable) flushParagraph();
       currentSpeakable = false;
       currentLines.push(clean);
+      parselog(trimmed, "nonspeakable", nonSpeakableReason);
       continue;
     }
 
-    // Normal prose line — passed all filters
+    // Normal speakable prose line — passed all filters
     parselog(trimmed, "speakable", "speakable");
     if (!currentSpeakable && currentLines.length > 0) {
       flushParagraph();
@@ -2437,6 +2823,7 @@ function loadScrollbackEntries(): ConversationEntry[] {
       spoken: true,
       ts: Date.now() - (totalTurns - t) * 300000,
       turn: turnNum,
+      window: getWindowKey(),
     });
 
     // Collect and filter assistant response lines
@@ -2471,6 +2858,7 @@ function loadScrollbackEntries(): ConversationEntry[] {
         spoken: true, // silent — user replays on demand
         ts: Date.now() - (totalTurns - t) * 300000 + 1000,
         turn: turnNum,
+        window: getWindowKey(),
       });
     }
   }
@@ -2610,7 +2998,7 @@ function broadcastCurrentOutput() {
           turn: currentTurn,
           ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
         };
-        conversationEntries.push(entry);
+        pushEntry(entry);
         elog(entry.id, "assistant", "broadcastCurrentOutput", para.text);
         if (_currentInputId) {
           const il = _inputLog.find(l => l.inputId === _currentInputId);
@@ -2631,7 +3019,7 @@ function broadcastCurrentOutput() {
     const staleEntries = assistantEntries.slice(paragraphs.length);
     const staleIds = new Set(staleEntries.filter(e => !e.spoken).map(e => e.id));
     if (staleIds.size > 0) {
-      conversationEntries = conversationEntries.filter(e => !staleIds.has(e.id));
+      setConversationEntries(conversationEntries.filter(e => !staleIds.has(e.id)));
     }
   }
 
@@ -2662,7 +3050,7 @@ function broadcastCurrentOutput() {
   const currentAssistant = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
   for (let i = 0; i < currentAssistant.length - 1; i++) {
     const entry = currentAssistant[i];
-    if (entry.speakable && !entry.spoken) {
+    if (shouldTtsEntry(entry) && !entry.spoken) {
       // Check if sentence TTS already partially spoke this entry
       const cursor = entryTtsCursor.get(entry.id) ?? 0;
       if (cursor > 0) {
@@ -2689,7 +3077,7 @@ function broadcastCurrentOutput() {
   // so Kokoro starts generating audio before the entry is finalized. The dedup in
   // queueTts prevents double-generation; the re-queue logic handles text growth.
   const lastEntry = currentAssistant[currentAssistant.length - 1];
-  if (streamState === "RESPONDING" && lastEntry && lastEntry.speakable && !lastEntry.spoken) {
+  if (streamState === "RESPONDING" && lastEntry && shouldTtsEntry(lastEntry) && !lastEntry.spoken) {
     const speakable = cleanTtsText(lastEntry.text);
     if (speakable && speakable.length >= 50) {
       // queueTts dedup will skip if already queued; re-queue logic handles text growth
@@ -2701,7 +3089,7 @@ function broadcastCurrentOutput() {
   // Sentence-level TTS for the last (still-growing) entry.
   // Speak each complete sentence as it arrives rather than waiting for the full entry.
   // A sentence boundary is: [.!?] followed by whitespace + uppercase, or [.!?] + end of text.
-  if (lastEntry && lastEntry.speakable && !lastEntry.spoken) {
+  if (lastEntry && shouldTtsEntry(lastEntry) && !lastEntry.spoken) {
     const cursor = entryTtsCursor.get(lastEntry.id) ?? 0;
     const remaining = lastEntry.text.slice(cursor);
     // Match sentences: text ending in .!? followed by space+capital (mid-text) or end-of-string
@@ -2966,7 +3354,7 @@ function handleStreamDone() {
   // System context response — suppress current turn entries and TTS, keep old turns
   if (_isSystemContext) {
     _isSystemContext = false;
-    conversationEntries = conversationEntries.filter(e => e.turn !== currentTurn);
+    setConversationEntries(conversationEntries.filter(e => e.turn !== currentTurn));
     broadcast({ type: "entry", entries: conversationEntries, partial: false });
     broadcast({ type: "voice_status", state: "idle" });
     broadcastPipelineTrace();
@@ -2993,7 +3381,7 @@ function handleStreamDone() {
         (e.turn === currentTurn || currentTurn - e.turn <= 2));
       if (!isDup) {
         const newId = ++entryIdCounter;
-        conversationEntries.push({
+        pushEntry({
           id: newId,
           role: "assistant",
           text: para.text,
@@ -3022,7 +3410,7 @@ function handleStreamDone() {
   // then re-broadcast so the client sees accurate spoken flags.
   let spokeAnything = false;
   for (const entry of conversationEntries) {
-    if (entry.role === "assistant" && entry.turn === currentTurn && entry.speakable && !entry.spoken) {
+    if (entry.role === "assistant" && entry.turn === currentTurn && shouldTtsEntry(entry) && !entry.spoken) {
       // Check if sentence TTS already partially spoke this entry during streaming
       const cursor = entryTtsCursor.get(entry.id) ?? 0;
       if (cursor > 0) {
@@ -3244,7 +3632,7 @@ function startPassiveWatcher() {
     // Detect "Interrupted" prompt — runs in ANY state since interrupts happen mid-stream
     if (/Interrupted\s*.{0,3}\s*What should Claude do/i.test(pane)) {
       console.log("[passive] Detected interrupt prompt in pane");
-      broadcast({ type: "tool_status", text: "Interrupted — waiting for direction" });
+      // Don't show "Interrupted" status — fires spuriously from tmux pane content matching
       // Also end the stream if still active
       if (streamState !== "IDLE" && streamState !== "DONE") {
         console.log("[passive] Interrupted prompt detected — ending stream");
@@ -3284,19 +3672,27 @@ function startPassiveWatcher() {
     if (hasSpinnerChars(pane)) {
       console.log("[passive] Spinner detected — native CLI input");
 
-      // Try to extract the user's input from the pane (line starting with ❯, plus any
-      // continuation lines — long inputs wrap at terminal width without a ❯ prefix)
+      // Extract user input: find the LAST ❯ prompt line, then collect ALL subsequent
+      // lines until we hit spinner chars, a separator, or another ❯ prompt.
+      // This handles multi-line inputs that wrap at terminal width.
       const lines = pane.split("\n");
       let userInput = "";
       for (let i = lines.length - 1; i >= 0; i--) {
         const trimmed = lines[i].trim();
         if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
-          // Collect continuation lines that follow (tmux-wrapped input).
+          // Found the prompt line — collect it plus ALL continuation lines.
+          // Continuation lines are everything between the ❯ line and the spinner/end.
           const parts = [trimmed.slice(2).trim()];
           for (let j = i + 1; j < lines.length; j++) {
             const next = lines[j].trim();
-            // Stop at empty lines, spinner lines, separator lines, or new prompt lines
-            if (!next || next.startsWith("❯") || /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(next) || /^[─━═]{3,}/.test(next)) break;
+            // Stop at: spinner chars, separator lines, new prompt, or Claude output markers
+            if (!next) break;
+            if (next.startsWith("❯")) break;
+            if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(next)) break;
+            if (/^[─━═]{3,}/.test(next)) break;
+            if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(next)) break;
+            // Claude Code UI status lines — not user input
+            if (/^Press (up|down|esc|enter|tab)/i.test(next)) break;
             parts.push(next);
           }
           userInput = parts.join(" ");
@@ -3325,6 +3721,13 @@ function startPassiveWatcher() {
         _lastPassiveUserInputTs = Date.now();
       }
 
+      // Guard: skip if this text was sent programmatically via Murmur text box or STT.
+      // Those sources already created the user entry — don't re-detect from terminal scraping.
+      if (userInput && terminal.wasRecentlySent?.(userInput)) {
+        console.log(`[passive] Skipping programmatically-sent input: "${userInput.slice(0, 60)}"`);
+        // Still start streaming — spinner is active, Claude is processing
+      }
+
       // Start streaming just like a Murmur-initiated input
       if (streamState === "DONE" || streamState === "IDLE") {
         // New conversation turn — keep old entries for history
@@ -3332,8 +3735,19 @@ function startPassiveWatcher() {
         if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
         lastBroadcastText = "";
 
-        if (userInput && !_isSystemContext) {
-          addUserEntry(userInput, false, "passive-watcher");
+        // Only create user entry if NOT already sent programmatically
+        // Also check if this exact text already exists as a user entry (prevents duplicates
+        // when tmux pane shows same ❯ prompt across multiple passive watcher cycles)
+        if (userInput && !_isSystemContext && !terminal.wasRecentlySent?.(userInput)) {
+          const normalizedNew = userInput.trim().toLowerCase().replace(/\s+/g, "");
+          const alreadyExists = conversationEntries.some(
+            e => e.role === "user" && e.text.trim().toLowerCase().replace(/\s+/g, "") === normalizedNew
+          );
+          if (!alreadyExists) {
+            addUserEntry(userInput, false, "terminal");
+          } else {
+            console.log(`[passive] Skipping duplicate user entry: "${userInput.slice(0, 60)}"`);
+          }
         }
         trimEntriesToCap();
 
@@ -3688,7 +4102,7 @@ function handleVoiceModeExchange(exchange: {
   if (role === "user") {
     // New turn for each voice exchange cycle
     currentTurn++;
-    addUserEntry(exchange.text, false, "voicemode-exchange");
+    addUserEntry(exchange.text, false, "voice-exchange");
   } else {
     const entry: ConversationEntry = {
       id: ++entryIdCounter,
@@ -3699,7 +4113,7 @@ function handleVoiceModeExchange(exchange: {
       ts,
       turn: currentTurn,
     };
-    conversationEntries.push(entry);
+    pushEntry(entry);
     elog(entry.id, "assistant", "voicemode", exchange.text);
     broadcast({ type: "entry", entries: conversationEntries, partial: false });
   }
@@ -3776,12 +4190,32 @@ function broadcast(msg: Record<string, unknown>) {
     msg.ttsPendingIds = pendingIds;
   }
   wslog("out", (msg.type as string) || "unknown", JSON.stringify(msg).length);
-  const data = JSON.stringify(msg);
+
+  // For entry broadcasts: filter test entries out of the payload for non-test clients.
+  // Test entries (sourceTag starts with "text-input-test") should NOT appear in the
+  // user's conversation view. Filter by sourceTag on the entry itself (not by ID set)
+  // to avoid timing race where addUserEntry broadcasts before caller registers the ID.
+  let dataForReal: string | null = null;
+  let dataForTest: string | null = null;
+  const isEntryMsg = msg.type === "entry" && Array.isArray(msg.entries);
+  if (isEntryMsg) {
+    const entries = msg.entries as ConversationEntry[];
+    const hasTestEntries = entries.some(e => e.sourceTag?.startsWith("text-input-test"));
+    if (hasTestEntries) {
+      const realEntries = entries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+      dataForReal = JSON.stringify({ ...msg, entries: realEntries });
+      dataForTest = JSON.stringify(msg); // test clients see all entries
+    }
+  }
+  const data = dataForTest ?? JSON.stringify(msg);
+
   let sent = 0;
   for (const ws of Array.from(clients)) {
     if (ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(data);
+        // Non-test clients get filtered entries (no test entries)
+        const payload = (isEntryMsg && dataForReal && !(ws as any)._isTestMode) ? dataForReal : data;
+        ws.send(payload);
         sent++;
       } catch {
         clients.delete(ws);
@@ -3859,10 +4293,14 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
 
   // Send conversation entries so reconnecting clients see the full history
   // Cap to last 80 entries to avoid overwhelming mobile clients on reconnect
+  // Filter out test entries for non-test clients (by sourceTag, same as broadcast())
   if (conversationEntries.length > 0) {
-    const recentEntries = conversationEntries.length > 80
+    let recentEntries = conversationEntries.length > 80
       ? conversationEntries.slice(-80)
       : conversationEntries;
+    if (!(ws as any)._isTestMode) {
+      recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+    }
     ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: streamState === "RESPONDING" }));
   }
 
@@ -3872,9 +4310,10 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     const settings: Record<string, string> = {};
     if (persisted.speed) settings.speed = persisted.speed.toString();
     else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-speed"), "utf-8").trim(); if (v) settings.speed = v; } catch {} }
-    if (persisted.voice && (VALID_VOICES.has(persisted.voice) || persisted.voice.startsWith("_local:"))) settings.voice = persisted.voice;
+    if (persisted.voice && (VALID_VOICES.has(persisted.voice) || VALID_XI_VOICES.has(persisted.voice) || persisted.voice.startsWith("_local:"))) settings.voice = persisted.voice;
     else { try { const v = readFileSync(join(SIGNAL_DIR, "claude-tts-voice"), "utf-8").trim(); if (v) settings.voice = v; } catch {} }
     try { const v = readFileSync(join(SIGNAL_DIR, "claude-mic-mute"), "utf-8").trim(); settings.muted = v === "1" ? "1" : "0"; } catch {}
+    if (persisted.elevenLabsApiKey) settings.hasElevenLabsKey = "1";
     ws.send(JSON.stringify({ type: "settings", ...settings }));
   }
 
@@ -4039,7 +4478,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         (ws as any)._testTranscribeOnly = false;
         console.log(`[test] Transcribe-only mode — not sending to terminal`);
         plog("test_transcribe_only", `"${text.slice(0, 80)}"`);
-        addUserEntry(text, false, "stt-test-transcribe", audioInputId);
+        addUserEntry(text, false, "voice-test", audioInputId);
         broadcast({ type: "voice_status", state: "idle" });
         broadcastPipelineTrace();
         return;
@@ -4053,7 +4492,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           console.log("Wake word detected!");
           // Snapshot BEFORE sending, then send, then start polling
           startTmuxStreaming(text, audioInputId);
-          addUserEntry(text, false, "stt-wake-word", audioInputId);
+          addUserEntry(text, false, "voice", audioInputId);
+          terminal.recordSentInput?.(text);
           terminal.sendText(text);
           queueFillerAudio(text);
         } else {
@@ -4065,12 +4505,13 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if (streamState === "IDLE" || streamState === "DONE") {
           // Normal: send immediately
           startTmuxStreaming(text, audioInputId);
-          addUserEntry(text, false, "stt-direct", audioInputId);
+          addUserEntry(text, false, "voice", audioInputId);
+          terminal.recordSentInput?.(text);
           terminal.sendText(text);
           queueFillerAudio(text);
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
-          const queuedEntry = addUserEntry(text, true, "stt-queue", audioInputId);
+          const queuedEntry = addUserEntry(text, true, "voice", audioInputId);
           pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[voice] Queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
@@ -4092,7 +4533,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const safeTestPrefixes = [
         "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
         "mute:", "replay", "replay:", "text:",  // text: is handled separately with its own testmode check
-        "barge_in", "filler_audio:", "mictest:", "resend:",  // TTS control messages safe for testing
+        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:",  // TTS control messages safe for testing
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
       if (!isSafe) {
@@ -4207,7 +4648,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       // Remove queued entries from transcript and clear queue
       if (pendingVoiceInput.length > 0) {
         const queuedIds = new Set(pendingVoiceInput.map(p => p.entryId));
-        conversationEntries = conversationEntries.filter(e => !queuedIds.has(e.id));
+        setConversationEntries(conversationEntries.filter(e => !queuedIds.has(e.id)));
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
       }
       pendingVoiceInput = [];
@@ -4347,6 +4788,28 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
+    // Clean/Verbose mode toggle — controls which entries get TTS
+    if (msg.startsWith("clean_mode:")) {
+      _cleanMode = msg.slice(11) === "1";
+      console.log(`[ws] Clean mode ${_cleanMode ? "on" : "off (verbose)"}`);
+      return;
+    }
+
+    // ElevenLabs API key
+    if (msg.startsWith("elevenlabs_key:")) {
+      const key = msg.slice(15).trim();
+      if (key.length > 0 && key.length < 200 && /^[a-zA-Z0-9_-]+$/.test(key)) {
+        saveSettings({ elevenLabsApiKey: key });
+        console.log("[ws] ElevenLabs API key saved");
+      } else if (key.length === 0) {
+        saveSettings({ elevenLabsApiKey: undefined });
+        console.log("[ws] ElevenLabs API key cleared");
+      } else {
+        console.warn("[ws] Rejected invalid ElevenLabs API key format");
+      }
+      return;
+    }
+
     // Voice
     if (msg.startsWith("voice:")) {
       const voice = msg.slice(6).trim();
@@ -4355,7 +4818,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         console.warn(`[voice] Rejected unsafe local voice name: "${localVoiceName}"`);
         return;
       }
-      if (voice && (VALID_VOICES.has(voice) || voice.startsWith("_local:"))) {
+      if (voice && (VALID_VOICES.has(voice) || VALID_XI_VOICES.has(voice) || voice.startsWith("_local:"))) {
         writeFileSync(join(SIGNAL_DIR, "claude-tts-voice"), voice);
         saveSettings({ voice });
         // Stop in-flight TTS and flush queue so old voice doesn't keep playing
@@ -4415,16 +4878,17 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       if ((ws as any)._isTestMode) {
         // Test mode: create entry but do NOT forward to terminal
         console.log(`[resend] Test mode resend (not sent to Claude): "${text.slice(0, 60)}"`);
-        const testEntry = addUserEntry(text, false, "user-resend-testmode");
+        const testEntry = addUserEntry(text, false, "text-input-resend");
         if (testEntry.id > 0) (ws as any)._testEntryIds?.add(testEntry.id);
       } else if (streamState === "IDLE" || streamState === "DONE") {
         startTmuxStreaming(text);
-        addUserEntry(text, false, "user-resend");
+        addUserEntry(text, false, "text-input-resend");
+        terminal.recordSentInput?.(text);
         terminal.sendText(text);
         queueFillerAudio(text);
       } else {
         // Claude is active — queue
-        const queuedEntry = addUserEntry(text, true, "user-resend-queue");
+        const queuedEntry = addUserEntry(text, true, "text-input-resend");
         pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
         console.log(`[resend] Queued (state=${streamState}): ${pendingVoiceInput.length} pending`);
         broadcast({ type: "voice_queue", count: pendingVoiceInput.length });
@@ -4510,23 +4974,63 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         const session = decodeURIComponent(encodedSession);
         console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
         stopTmuxStreaming();
+        // Save current window's entries before switching
+        saveCurrentWindowEntries();
         terminal.switchTarget(session, windowIdx);
         saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
-        // Load historical entries for the new session
-        conversationEntries = loadScrollbackEntries();
-        if (conversationEntries.length > 0) {
-          entryIdCounter = Math.max(...conversationEntries.map(e => e.id));
-          console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
+        currentWindowKey = getWindowKey();
+        // Stop TTS BEFORE loading new entries — prevents old audio continuing
+        stopClientPlayback2("session_switch");
+        // Reset passive watcher state for the new pane — stale snapshots from
+        // the old pane cause diff comparisons against wrong baseline, which is
+        // the root cause of all entries being keyed to one window.
+        lastPassiveSnapshot = "";
+        _lastPassiveUserInput = "";
+        _lastPassiveUserInputTs = 0;
+        _cooldownThinking = false;
+        lastStreamEndTime = 0;
+        preInputSnapshot = "";
+        _scrollbackCache = { text: "", ts: 0 };
+        // Reset stream state — new window starts IDLE
+        if (streamState !== "IDLE") {
+          streamState = "IDLE";
+        }
+        // Clear TTS cursor — sentence progress is per-window
+        entryTtsCursor.clear();
+
+        // Load entries for the new window: from cache if available, else from scrollback
+        const cached = loadWindowEntries(currentWindowKey);
+        if (cached) {
+          setConversationEntries(cached);
+          console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
         } else {
-          conversationEntries = [];
-          console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
+          const scrollback = loadScrollbackEntries();
+          setConversationEntries(scrollback);
+          if (conversationEntries.length > 0) {
+            console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
+          } else {
+            console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
+          }
+        }
+        // Mark ALL loaded entries as spoken to prevent auto-TTS re-queueing on switch
+        for (const e of conversationEntries) {
+          e.spoken = true;
+        }
+        if (conversationEntries.length > 0) {
+          entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
         }
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
         // Reset status indicators for the new session
-        stopClientPlayback2("session_switch");
         broadcast({ type: "voice_status", state: "idle" });
         broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
         broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
+        // Initialize passive watcher snapshot for the new pane so it has a correct baseline
+        // (without this, lastPassiveSnapshot="" causes diff to detect all existing content as new)
+        try {
+          lastPassiveSnapshot = captureTmuxPane();
+          preInputSnapshot = lastPassiveSnapshot;
+          console.log(`[tmux] Initialized passive snapshot for ${currentWindowKey} (${lastPassiveSnapshot.length} chars)`);
+        } catch {}
       }
       return;
     }
@@ -4538,7 +5042,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         if ((ws as any)._isTestMode) {
           // Test mode: render user bubble in UI but do NOT forward to terminal
           console.log(`[terminal] Test mode text (not sent to Claude): "${text.slice(0, 60)}"`);
-          const testEntry = addUserEntry(text, false, "text-testmode");
+          const testEntry = addUserEntry(text, false, "text-input-test");
           // Track test-created entries so test:clear-entries can remove them
           if (testEntry.id > 0) (ws as any)._testEntryIds?.add(testEntry.id);
         } else if (interactivePromptActive) {
@@ -4549,12 +5053,13 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           // Normal: send immediately
           console.log(`[terminal] Text input: "${text}"`);
           startTmuxStreaming(text);
-          addUserEntry(text, false, "text-direct");
+          addUserEntry(text, false, "text-input");
+          terminal.recordSentInput?.(text);
           terminal.sendText(text);
           queueFillerAudio(text);
         } else {
           // Claude is active — queue typed text same as voice
-          const queuedEntry = addUserEntry(text, true, "text-queue");
+          const queuedEntry = addUserEntry(text, true, "text-input");
           pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
           const count = pendingVoiceInput.length;
           console.log(`[terminal] Text queued (state=${streamState}): "${text.slice(0, 60)}" — ${count} pending`);
@@ -4665,7 +5170,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
             ts: Date.now(),
             turn: currentTurn,
           };
-          conversationEntries.push(entry);
+          pushEntry(entry);
           (ws as any)._testEntryIds?.add(entry.id);
           i++;
           broadcast({ type: "entry", entries: conversationEntries, partial: i < paragraphs.length });
@@ -4695,7 +5200,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           ts: Date.now(),
           turn: currentTurn,
         };
-        conversationEntries.push(entry);
+        pushEntry(entry);
         (ws as any)._testEntryIds?.add(entry.id);
       }
       broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -4727,7 +5232,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
             ts: Date.now(),
             turn: currentTurn,
           };
-          conversationEntries.push(entry);
+          pushEntry(entry);
           (ws as any)._testEntryIds?.add(entry.id);
           newEntries.push(entry);
         }
@@ -4764,7 +5269,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         ts: Date.now(),
         turn: currentTurn,
       };
-      conversationEntries.push(entry);
+      pushEntry(entry);
       (ws as any)._testEntryIds?.add(entry.id);
       broadcast({ type: "entry", entries: conversationEntries, partial: false });
 
@@ -4795,7 +5300,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const ids: Set<number> = (ws as any)._testEntryIds;
       if (ids && ids.size > 0) {
         const before = conversationEntries.length;
-        conversationEntries = conversationEntries.filter(e => !ids.has(e.id));
+        setConversationEntries(conversationEntries.filter(e => !ids.has(e.id)));
         ids.clear();
         console.log(`[test] Cleared ${before - conversationEntries.length} test entries`);
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -4825,7 +5330,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
 
     // test:reset-entries — clear ALL conversation entries and broadcast empty list
     if (msg === "test:reset-entries") {
-      conversationEntries = [];
+      setConversationEntries([]);
       broadcast({ type: "entry", entries: [], partial: false });
       console.log("[test] All entries cleared");
       return;
@@ -4858,7 +5363,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     const testIds: Set<number> | undefined = (ws as any)._testEntryIds;
     if (testIds && testIds.size > 0) {
       const before = conversationEntries.length;
-      conversationEntries = conversationEntries.filter(e => !testIds.has(e.id));
+      setConversationEntries(conversationEntries.filter(e => !testIds.has(e.id)));
       console.log(`[test] Auto-cleaned ${before - conversationEntries.length} test entries on disconnect`);
       if (clients.size > 0) {
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -4953,6 +5458,7 @@ app.get("/debug", (_req, res) => {
     ttsGeneration,
     ttsQueueLength: ttsJobQueue.length,
     playback: _clientPlayback,
+    ttsFetchCount: _ttsFetchLog.length,
     kokoroFetchCount: _kokoroLog.length,
     chunkFlowCount: _chunkFlowLog.length,
     inputCount: _inputLog.length,
@@ -4962,7 +5468,7 @@ app.get("/debug", (_req, res) => {
 
 app.get("/api/state", (_req, res) => {
   const lastEntries = conversationEntries.slice(-3).map(e => ({
-    id: e.id, role: e.role, text: e.text.slice(0, 120), speakable: e.speakable, spoken: e.spoken, turn: e.turn,
+    id: e.id, role: e.role, text: e.text.slice(0, 120), speakable: e.speakable, spoken: e.spoken, turn: e.turn, window: e.window,
   }));
   res.json({
     ttsQueueLength: ttsJobQueue.length,
@@ -4971,11 +5477,27 @@ app.get("/api/state", (_req, res) => {
     ttsGeneration,
     streamState,
     entryCount: conversationEntries.length,
+    currentWindow: getWindowKey(),
+    windowCount: windowEntries.size,
+    windows: Array.from(windowEntries.keys()),
     lastEntries,
     pendingVoiceCount: pendingVoiceInput.length,
     lastPassiveSnapshotLength: lastPassiveSnapshot ? lastPassiveSnapshot.length : 0,
     contextSent,
+    services: serviceStatus,
+    cleanMode: _cleanMode,
   });
+});
+
+// Debug: view conversation entries — supports ?window= filter
+app.get("/debug/entries", (req, res) => {
+  const windowFilter = req.query.window as string | undefined;
+  if (windowFilter) {
+    const entries = windowEntries.get(windowFilter) ?? [];
+    res.json({ window: windowFilter, count: entries.length, entries });
+  } else {
+    res.json({ window: getWindowKey(), count: conversationEntries.length, entries: conversationEntries });
+  }
 });
 
 app.get("/debug/pipeline", (_req, res) => {
@@ -5142,12 +5664,17 @@ if (savedTarget && terminal.switchTarget) {
     }
   }
 }
+// Initialize per-window conversation tracking
+currentWindowKey = getWindowKey();
+console.log(`[startup] Window key: ${currentWindowKey}`);
 // Load historical entries from tmux scrollback so clients see prior context on connect
 const catchupEntries = loadScrollbackEntries();
 if (catchupEntries.length > 0) {
-  conversationEntries = catchupEntries;
+  setConversationEntries(catchupEntries);
   // currentTurn starts at 0; live turns will be positive, historical are negative
-  console.log(`[startup] Loaded ${catchupEntries.length} entries from scrollback`);
+  console.log(`[startup] Loaded ${catchupEntries.length} entries from scrollback for window ${currentWindowKey}`);
+} else {
+  setConversationEntries([]);
 }
 
 sendMurmurContext(5000);
@@ -5176,8 +5703,9 @@ setInterval(async () => {
   const prev = { ...serviceStatus };
   serviceStatus.whisper = await checkService("Whisper STT", WHISPER_URL);
   serviceStatus.kokoro = await checkService("Kokoro TTS", KOKORO_URL);
+  serviceStatus.piper = checkPiper();
   lastServiceCheckAt = Date.now();
-  if (prev.whisper !== serviceStatus.whisper || prev.kokoro !== serviceStatus.kokoro) {
+  if (prev.whisper !== serviceStatus.whisper || prev.kokoro !== serviceStatus.kokoro || prev.piper !== serviceStatus.piper) {
     broadcast({ type: "services", ...serviceStatus });
   }
 }, 30000);

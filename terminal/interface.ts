@@ -59,6 +59,12 @@ export interface TerminalManager {
 
   /** Human-readable session:window label (never a pane ID like %3) */
   readonly displayTarget?: string;
+
+  /** Record text that was just sent to terminal (for passive watcher dedup) */
+  recordSentInput?(text: string): void;
+
+  /** Check if text was recently sent (within TTL) to avoid passive watcher re-detection */
+  wasRecentlySent?(text: string): boolean;
 }
 
 /**

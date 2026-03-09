@@ -8,11 +8,14 @@ import { execSync, execFileSync } from "child_process";
 import type { TerminalManager, TerminalKey, TmuxSessionInfo, TmuxWindowInfo } from "./interface.js";
 
 const DEFAULT_SESSION = "claude-voice";
+const SENT_INPUT_TTL_MS = 30000; // How long to remember programmatically sent inputs
 
 export class TmuxBackend implements TerminalManager {
   private _session: string;
   private _window: number; // -1 = use active window
   private _paneId: string | null = null; // Pinned pane ID (e.g. "%3") — prevents agent panes stealing focus
+  // Track text sent via Murmur text box or STT so passive watcher skips re-detection
+  private _sentInputs: Array<{ normalized: string; ts: number }> = [];
 
   get sessionName(): string { return this._session; }
 
@@ -34,15 +37,22 @@ export class TmuxBackend implements TerminalManager {
     this._pinCurrentPane();
   }
 
-  /** Capture and lock the current active pane ID for this session */
+  /** Capture and lock the current active pane ID for this session+window */
   private _pinCurrentPane(): void {
     try {
+      // Target must include window index if set — otherwise tmux returns the
+      // session's active pane, which may be a different window entirely.
+      // This was the root cause of per-window conversations not working:
+      // switching to window 1 still pinned the pane from window 0.
+      const target = this._window >= 0
+        ? `${this._session}:${this._window}`
+        : this._session;
       const paneId = execFileSync("tmux", [
-        "display-message", "-t", this._session, "-p", "#{pane_id}"
+        "display-message", "-t", target, "-p", "#{pane_id}"
       ], { encoding: "utf-8", timeout: 3000 }).trim();
       if (paneId && paneId.startsWith("%")) {
         this._paneId = paneId;
-        console.log(`[tmux] Pinned to pane ${paneId} in session "${this._session}"`);
+        console.log(`[tmux] Pinned to pane ${paneId} in ${target}`);
       }
     } catch {
       console.log(`[tmux] Could not pin pane — will use session target`);
@@ -313,6 +323,22 @@ export class TmuxBackend implements TerminalManager {
         timeout: 2000,
       });
     } catch {}
+  }
+
+  /** Record that text was sent programmatically (via Murmur text box or STT) */
+  recordSentInput(text: string): void {
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, "");
+    this._sentInputs.push({ normalized, ts: Date.now() });
+    // Prune old entries
+    const cutoff = Date.now() - SENT_INPUT_TTL_MS;
+    this._sentInputs = this._sentInputs.filter(e => e.ts >= cutoff);
+  }
+
+  /** Check if text was recently sent programmatically (within last 30s) */
+  wasRecentlySent(text: string): boolean {
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, "");
+    const cutoff = Date.now() - SENT_INPUT_TTL_MS;
+    return this._sentInputs.some(e => e.ts >= cutoff && e.normalized === normalized);
   }
 
   destroy(): void {
