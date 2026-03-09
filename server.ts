@@ -2789,21 +2789,36 @@ function scheduleDoneCheck() {
   }, DONE_QUIET_MS);
 }
 
-/** Cap conversationEntries at ~200 by trimming oldest turns. Safe to call frequently. */
+const ENTRY_CAP = 200;
+
+/** Cap conversationEntries at ENTRY_CAP by trimming oldest entries. Safe to call frequently.
+ *  Two-phase trim: first try turn-based (remove entire old turns), then hard-cap if still over. */
 function trimEntriesToCap() {
-  if (conversationEntries.length > 200) {
-    const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
-    let trimCount = 0;
-    for (let i = 0; i < conversationEntries.length; i++) {
-      if (conversationEntries[i].turn >= oldestTurnToKeep) break;
-      trimCount++;
-    }
-    if (trimCount > 0 && trimCount < conversationEntries.length) {
-      const trimmedIds = conversationEntries.slice(0, trimCount).map(e => e.id);
-      conversationEntries.splice(0, trimCount);
-      for (const id of trimmedIds) entryTtsCursor.delete(id);
-      console.log(`[entries] Trimmed ${trimCount} old entries, ${conversationEntries.length} remaining`);
-    }
+  if (conversationEntries.length <= ENTRY_CAP) return;
+
+  console.log(`[entries] trimEntriesToCap fired: ${conversationEntries.length} entries (cap=${ENTRY_CAP})`);
+
+  // Phase 1: Turn-based trim — remove entire old turns (preserves turn boundaries)
+  const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
+  let trimCount = 0;
+  for (let i = 0; i < conversationEntries.length; i++) {
+    if (conversationEntries[i].turn >= oldestTurnToKeep) break;
+    trimCount++;
+  }
+  if (trimCount > 0 && trimCount < conversationEntries.length) {
+    const trimmedIds = conversationEntries.slice(0, trimCount).map(e => e.id);
+    conversationEntries.splice(0, trimCount);
+    for (const id of trimmedIds) entryTtsCursor.delete(id);
+    console.log(`[entries] Turn-based trim: removed ${trimCount} entries from ${oldestTurnToKeep - 1} old turns, ${conversationEntries.length} remaining`);
+  }
+
+  // Phase 2: Hard-cap — if still over ENTRY_CAP (entries from same/recent turns), force-trim from front
+  if (conversationEntries.length > ENTRY_CAP) {
+    const hardTrim = conversationEntries.length - ENTRY_CAP;
+    const trimmedIds = conversationEntries.slice(0, hardTrim).map(e => e.id);
+    conversationEntries.splice(0, hardTrim);
+    for (const id of trimmedIds) entryTtsCursor.delete(id);
+    console.log(`[entries] Hard-cap trim: removed ${hardTrim} entries, ${conversationEntries.length} remaining`);
   }
 }
 
@@ -3272,6 +3287,7 @@ function startPassiveWatcher() {
         if (userInput && !_isSystemContext) {
           addUserEntry(userInput, false, "passive-watcher");
         }
+        trimEntriesToCap();
 
         preInputSnapshot = snapshot;
         lastUserInput = userInput || "(native input)";

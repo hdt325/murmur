@@ -2186,6 +2186,9 @@ async function main() {
   // TTS stall — orphaned playing jobs
   await testTtsStallRecovery();
 
+  // Entry cap enforcement
+  await testEntryCapEnforcement();
+
   await teardown();
 }
 
@@ -2699,7 +2702,7 @@ async function testEntryBugs_dedupAndCap() {
   report("Entry cap has safety guard against emptying array", hasSafety);
 
   // Bug 2: Entry cap logs trimming
-  const hasLog = /Trimmed.*old entries/.test(src);
+  const hasLog = /Trimmed.*old entries/.test(src) || /trim.*removed.*entries/i.test(src);
   report("Entry cap logs when trimming occurs", hasLog);
 
   // WS runtime test: verify cross-turn dedup works
@@ -3432,6 +3435,56 @@ async function testTtsStallRecovery() {
   const jobCreation = src.slice(src.indexOf("jobId: ++ttsJobIdCounter"), src.indexOf("jobId: ++ttsJobIdCounter") + 300);
   const hasInit = jobCreation.includes("playingSince: 0");
   report("playingSince initialized to 0 in job constructor", hasInit);
+}
+
+// --- Entry Cap Enforcement ---
+async function testEntryCapEnforcement() {
+  console.log("\n[ENTRY-CAP] Entry cap enforcement and trimming");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. ENTRY_CAP constant defined at 200
+  const hasEntryCap = /const ENTRY_CAP\s*=\s*200/.test(src);
+  report("ENTRY_CAP constant defined at 200", hasEntryCap);
+
+  // 2. trimEntriesToCap uses ENTRY_CAP (not hardcoded 200)
+  const trimSection = src.slice(src.indexOf("function trimEntriesToCap"), src.indexOf("function trimEntriesToCap") + 1500);
+  const usesConstant = trimSection.includes("ENTRY_CAP");
+  report("trimEntriesToCap uses ENTRY_CAP constant", usesConstant);
+
+  // 3. trimEntriesToCap logs when fired
+  const hasFireLog = trimSection.includes("trimEntriesToCap fired");
+  report("trimEntriesToCap logs when fired", hasFireLog);
+
+  // 4. Two-phase trim: turn-based then hard-cap
+  const hasTurnTrim = trimSection.includes("Turn-based trim") || trimSection.includes("oldestTurnToKeep");
+  const hasHardCap = trimSection.includes("Hard-cap trim") || trimSection.includes("hardTrim");
+  report("trimEntriesToCap has turn-based trim phase", hasTurnTrim);
+  report("trimEntriesToCap has hard-cap trim phase (force-trim when same turn)", hasHardCap);
+
+  // 5. Hard-cap enforces exact ENTRY_CAP limit
+  const hardCapLine = trimSection.includes("conversationEntries.length - ENTRY_CAP") ||
+    trimSection.includes("length > ENTRY_CAP");
+  report("Hard-cap enforces exact ENTRY_CAP limit", hardCapLine);
+
+  // 6. trimEntriesToCap called at end of broadcastCurrentOutput
+  const bcoStart = src.indexOf("function broadcastCurrentOutput");
+  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoSection = bcoEnd > bcoStart ? src.slice(bcoStart, bcoEnd) : src.slice(bcoStart, bcoStart + 12000);
+  const trimInBco = bcoSection.includes("trimEntriesToCap()");
+  report("trimEntriesToCap called in broadcastCurrentOutput", trimInBco);
+
+  // 7. trimEntriesToCap called in passive watcher entry creation path
+  const passiveSection = src.slice(src.indexOf("passive-watcher"), src.indexOf("passive-watcher") + 500);
+  const trimInPassive = passiveSection.includes("trimEntriesToCap()");
+  report("trimEntriesToCap called in passive watcher path", trimInPassive);
+
+  // 8. splice(0, ...) removes from front correctly
+  const hasSplice = trimSection.includes("splice(0,");
+  report("Trim uses splice(0, N) to remove from front", hasSplice);
+
+  // 9. Trimmed entry IDs cleaned from entryTtsCursor
+  const cleansCursor = trimSection.includes("entryTtsCursor.delete");
+  report("Trim cleans entryTtsCursor for removed entries", cleansCursor);
 }
 
 main().catch(err => {
