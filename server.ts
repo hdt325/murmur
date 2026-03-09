@@ -2095,6 +2095,27 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
     console.log(`[DEDUP-TRACE] DEDUP HIT: Skipping duplicate from="${_source}" text="${text.slice(0, 60)}" (matches id=${dup.id})`);
     return dup;
   }
+  // Cross-check: reject if text substantially matches a recent assistant entry (role misattribution).
+  // Passive watcher can mistake Claude's response text near the ❯ prompt as user input.
+  const assistantRecent = conversationEntries.filter(e => e.role === "assistant" && e.ts >= cutoff);
+  const prefix40 = normalized.slice(0, 40);
+  if (prefix40.length >= 20) {
+    const assistantMatch = assistantRecent.find(e => {
+      const aNorm = e.text.trim().toLowerCase().replace(/[\s]+/g, " ");
+      return aNorm.startsWith(prefix40) || prefix40.startsWith(aNorm.slice(0, 40));
+    });
+    if (assistantMatch) {
+      console.log(`[DEDUP-TRACE] ROLE-GUARD: Rejected user entry matching assistant id=${assistantMatch.id} from="${_source}": "${text.slice(0, 60)}"`);
+      return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+    }
+  }
+
+  // Length guard: passive watcher inputs > 300 chars are suspicious — real voice/type inputs are short.
+  // Log a warning but still create the entry (don't block legitimate long pastes).
+  if (_source === "passive-watcher" && text.length > 300) {
+    console.warn(`[DEDUP-TRACE] LONG-INPUT-WARN: Passive watcher detected ${text.length}-char input (suspicious): "${text.slice(0, 80)}"`);
+  }
+
   console.log(`[DEDUP-TRACE] CREATING NEW entry from="${_source}" text="${text.slice(0, 60)}"`);
 
   const entry: ConversationEntry = {
@@ -2116,6 +2137,26 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   }
   broadcast({ type: "entry", entries: conversationEntries, partial: false });
   return entry;
+}
+
+/** Returns true if text looks like transient tool output that should NOT become a conversation entry.
+ *  These are tool chrome lines that flash briefly during streaming then disappear. */
+function isToolOutputLine(text: string): boolean {
+  const t = text.trim();
+  if (/^⏺\s*(Bash|Read|Write|Edit|Glob|Grep|Searched|Reading|Update|Agent|WebFetch|WebSearch|NotebookEdit)\b/i.test(t)) return true;
+  if (/^Bash\(/i.test(t)) return true;
+  if (/^⎿/.test(t)) return true;
+  if (/^(Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/i.test(t)) return true;
+  if (/ctrl\+o\s+to\s+expand/i.test(t)) return true;
+  if (/^Running…/i.test(t)) return true;
+  if (/^\+\d+ lines/.test(t)) return true;
+  if (/^… \+\d+/.test(t)) return true;
+  if (/^Ran /i.test(t) && t.length < 60) return true;
+  if (/^Read \d+ files?/i.test(t)) return true;
+  if (/^Searched for \d+/i.test(t)) return true;
+  if (/^Wrote \d+/i.test(t)) return true;
+  if (/^Edited \d+/i.test(t)) return true;
+  return false;
 }
 
 // Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
@@ -2544,6 +2585,13 @@ function broadcastCurrentOutput() {
         matched.speakable = para.speakable;
       }
     } else {
+      // During RESPONDING, skip transient tool output — these lines flash for ~2s then vanish
+      // when the tool finishes. Creating entries for them causes visible flash in conversation view.
+      if (streamState === "RESPONDING" && isToolOutputLine(para.text)) {
+        console.log(`[stream] Skipping transient tool output entry: "${para.text.slice(0, 80)}"`);
+        continue;
+      }
+
       // New paragraph — create entry (skip if identical text exists in recent entries).
       // Check last 20 entries regardless of turn to catch duplicates across generation bumps.
       const recentEntries = conversationEntries.slice(-20);

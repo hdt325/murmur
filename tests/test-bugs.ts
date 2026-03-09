@@ -2189,6 +2189,12 @@ async function main() {
   // Entry cap enforcement
   await testEntryCapEnforcement();
 
+  // Flash entries — tool output skipped during streaming
+  await testFlashEntryPrevention();
+
+  // Role misattribution — passive watcher guard
+  await testRoleMisattributionGuard();
+
   await teardown();
 }
 
@@ -3474,7 +3480,8 @@ async function testEntryCapEnforcement() {
   report("trimEntriesToCap called in broadcastCurrentOutput", trimInBco);
 
   // 7. trimEntriesToCap called in passive watcher entry creation path
-  const passiveSection = src.slice(src.indexOf("passive-watcher"), src.indexOf("passive-watcher") + 500);
+  const passiveWatcherIdx = src.indexOf('addUserEntry(userInput, false, "passive-watcher")');
+  const passiveSection = passiveWatcherIdx >= 0 ? src.slice(passiveWatcherIdx, passiveWatcherIdx + 500) : "";
   const trimInPassive = passiveSection.includes("trimEntriesToCap()");
   report("trimEntriesToCap called in passive watcher path", trimInPassive);
 
@@ -3485,6 +3492,71 @@ async function testEntryCapEnforcement() {
   // 9. Trimmed entry IDs cleaned from entryTtsCursor
   const cleansCursor = trimSection.includes("entryTtsCursor.delete");
   report("Trim cleans entryTtsCursor for removed entries", cleansCursor);
+}
+
+// --- Flash Entry Prevention: tool output not created as entries during streaming ---
+async function testFlashEntryPrevention() {
+  console.log("\n[FLASH-ENTRY] Tool output skipped during streaming");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. isToolOutputLine helper exists
+  const hasHelper = src.includes("function isToolOutputLine");
+  report("isToolOutputLine helper function exists", hasHelper);
+
+  // 2. Helper checks for ⏺ tool invocation patterns
+  const helperSection = src.slice(src.indexOf("function isToolOutputLine"), src.indexOf("function isToolOutputLine") + 800);
+  const checksTool = helperSection.includes("⏺") && helperSection.includes("Bash");
+  report("isToolOutputLine checks ⏺ tool invocations", checksTool);
+
+  // 3. Helper checks ⎿ output continuation
+  const checksOutput = helperSection.includes("⎿");
+  report("isToolOutputLine checks ⎿ output continuation", checksOutput);
+
+  // 4. Helper checks ctrl+o expand hint
+  const checksExpand = /ctrl.*o.*expand/i.test(helperSection);
+  report("isToolOutputLine checks ctrl+o expand hint", checksExpand);
+
+  // 5. Helper checks tool summary lines (Read N files, Edited N, etc.)
+  const checksSummary = helperSection.includes("Read ") && helperSection.includes("Edited");
+  report("isToolOutputLine checks tool summary lines", checksSummary);
+
+  // 6. broadcastCurrentOutput skips tool output during RESPONDING
+  const bcoStart = src.indexOf("function broadcastCurrentOutput");
+  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoSection = src.slice(bcoStart, bcoEnd > bcoStart ? bcoEnd : bcoStart + 12000);
+  const skipsInResponding = bcoSection.includes("isToolOutputLine(para.text)") && bcoSection.includes("RESPONDING");
+  report("broadcastCurrentOutput skips tool output during RESPONDING", skipsInResponding);
+
+  // 7. Skip logs the skipped text for debugging
+  const hasSkipLog = bcoSection.includes("Skipping transient tool output");
+  report("Transient tool output skip is logged", hasSkipLog);
+}
+
+// --- Role Misattribution Guard: passive watcher cross-checks assistant entries ---
+async function testRoleMisattributionGuard() {
+  console.log("\n[ROLE-GUARD] Passive watcher role misattribution guard");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. addUserEntry has assistant cross-check
+  const addUserSection = src.slice(src.indexOf("function addUserEntry"), src.indexOf("function addUserEntry") + 5000);
+  const hasCrossCheck = addUserSection.includes("ROLE-GUARD") && addUserSection.includes("assistantRecent");
+  report("addUserEntry cross-checks against recent assistant entries", hasCrossCheck);
+
+  // 2. Cross-check uses first 40 chars prefix matching
+  const hasPrefix = addUserSection.includes("prefix40") || addUserSection.includes("slice(0, 40)");
+  report("Role guard uses prefix matching (first 40 chars)", hasPrefix);
+
+  // 3. Cross-check rejects matching entries (returns dummy)
+  const rejectsMatch = addUserSection.includes("Rejected user entry matching assistant");
+  report("Role guard rejects entries matching assistant text", rejectsMatch);
+
+  // 4. Length warning for passive watcher long inputs
+  const hasLengthWarn = addUserSection.includes("LONG-INPUT-WARN") && addUserSection.includes("300");
+  report("Passive watcher warns on suspiciously long inputs (>300 chars)", hasLengthWarn);
+
+  // 5. Guard only checks entries with sufficient prefix length (>= 20 chars)
+  const hasMinLength = addUserSection.includes("prefix40.length >= 20");
+  report("Role guard requires minimum prefix length (20 chars)", hasMinLength);
 }
 
 main().catch(err => {
