@@ -44,6 +44,7 @@ export interface ConversationEntry {
   ts: number;
   turn: number;
   queued?: boolean;
+  filler?: boolean;          // True for auto-filler phrases ("Got it, let me look into that")
   inputId?: string;          // Unique ID for this voice/text input (user entries)
   parentInputId?: string;    // Links assistant responses to the user input that triggered them
 }

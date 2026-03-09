@@ -235,6 +235,18 @@ function wslog(dir: "in" | "out", type: string, size?: number) {
   if (_serverWsLog.length > 200) _serverWsLog.shift();
 }
 
+// --- Mic Persistence Test ---
+// Tracks audio chunk arrival times for iOS background mic investigation.
+interface MicPersistenceEntry {
+  ts: number;
+  type: "audio_chunk" | "rms_report" | "visibility" | "marker";
+  size?: number;
+  rms?: number;
+  note?: string;
+}
+const _micPersistenceLog: MicPersistenceEntry[] = [];
+let _micPersistenceActive = false;
+
 // --- Debug Ring Buffers ---
 // Specialized ring buffers for automated monitoring of TTS, highlight, and entry bugs.
 
@@ -270,6 +282,36 @@ const _entryLog: EntryLogEntry[] = [];
 function elog(id: number, role: string, sourceTag: string, text: string) {
   _entryLog.push({ ts: Date.now(), id, role, sourceTag, textSnippet: text.slice(0, 120) });
   if (_entryLog.length > 50) _entryLog.shift();
+}
+
+// ── 3-tier parse pipeline trace ──
+// Tier 1: Raw tmux input snapshot (last capture)
+let _parseRawSnapshot = "";
+let _parseRawSnapshotTs = 0;
+// Tier 2: Pre-filter discards (lines thrown away before paragraph formation)
+interface ParseDiscardEntry {
+  ts: number;
+  text: string;       // 120-char snippet
+  reason: string;     // which filter matched
+}
+const _parseDiscards: ParseDiscardEntry[] = [];
+// Tier 3: Paragraph classification (formed paragraphs with speakable/non-speakable)
+interface ParseParagraphEntry {
+  ts: number;
+  text: string;       // 120-char snippet
+  speakable: boolean;
+  reason: string;     // filter rule or "speakable"
+}
+const _parseParagraphs: ParseParagraphEntry[] = [];
+
+function parselog(text: string, action: "skip" | "nonspeakable" | "speakable", reason: string) {
+  if (action === "skip") {
+    _parseDiscards.push({ ts: Date.now(), text: text.slice(0, 120), reason });
+    if (_parseDiscards.length > 200) _parseDiscards.shift();
+  } else {
+    _parseParagraphs.push({ ts: Date.now(), text: text.slice(0, 120), speakable: action === "speakable", reason });
+    if (_parseParagraphs.length > 100) _parseParagraphs.shift();
+  }
 }
 
 interface HighlightLogEntry {
@@ -581,7 +623,13 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
 
 // --- TTS Text Cleaning ---
 
-let ttsGeneration = 0; // Bumped ONLY via bumpGeneration() on user interruption
+let ttsGeneration = 0; // Bumped ONLY via bumpGeneration()
+let _lastBumpReason: GenerationEvent["reason"] = "user_stop"; // Reason for last gen bump
+
+// User-initiated reasons that SHOULD cancel all queued TTS
+const USER_INITIATED_BUMP_REASONS = new Set<GenerationEvent["reason"]>([
+  "user_stop", "voice_change", "barge_in", "session_switch", "client_disconnect",
+]);
 
 interface GenerationEvent {
   gen: number;
@@ -594,10 +642,68 @@ const ttsGenerationLog: GenerationEvent[] = []; // ring buffer, last 20
 
 function bumpGeneration(reason: GenerationEvent["reason"], entryId?: number): void {
   ttsGeneration++;
+  _lastBumpReason = reason;
   const event: GenerationEvent = { gen: ttsGeneration, reason, ts: Date.now(), entryId };
   ttsGenerationLog.push(event);
   if (ttsGenerationLog.length > 20) ttsGenerationLog.shift();
   console.log(`[tts2] generation bumped to ${ttsGeneration} reason=${reason} entryId=${entryId ?? "none"}`);
+}
+
+/** Check if a TTS job is stale. Only user-initiated bumps invalidate jobs.
+ *  new_input bumps are deferred — old-turn jobs are cancelled later when new
+ *  response content actually arrives (see cancelOldTurnJobs). */
+function isJobStale(job: TtsJob): boolean {
+  if (job.generation === ttsGeneration) return false;
+  // User-initiated bumps always cancel
+  if (USER_INITIATED_BUMP_REASONS.has(_lastBumpReason)) return true;
+  // new_input: job is stale only if it's from an old turn AND new content has arrived
+  // (cancelOldTurnJobs handles the actual cancellation when new content appears)
+  return false;
+}
+
+let _lastOldTurnCancelledAt = 0; // Prevent redundant cancel calls within same turn
+
+/** Cancel TTS jobs from previous turns. Called when broadcastCurrentOutput detects
+ *  the first new assistant content in the current turn — the new response is actually
+ *  arriving, so old response audio should stop. Idempotent within a turn. */
+function cancelOldTurnJobs(): void {
+  if (_lastOldTurnCancelledAt === currentTurn) return; // Already cancelled for this turn
+  _lastOldTurnCancelledAt = currentTurn;
+
+  const oldJobs = ttsJobQueue.filter(j => j.turn < currentTurn && j.state !== "done" && j.state !== "failed");
+  if (oldJobs.length === 0) return;
+
+  console.log(`[tts2] New response arriving (turn ${currentTurn}) — cancelling ${oldJobs.length} old-turn TTS jobs`);
+
+  for (const job of oldJobs) {
+    // Abort in-flight fetches
+    for (const chunk of job.chunks) {
+      if (chunk.abortController) {
+        try { chunk.abortController.abort(); } catch {}
+        chunk.abortController = null;
+      }
+      chunk.audioBuf = null;
+    }
+    job.state = "failed";
+  }
+
+  // If currently playing job is from old turn, stop client playback with transition signal
+  if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.turn < currentTurn) {
+    ttsCurrentlyPlaying = null;
+    if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+    broadcast({ type: "tts_stop", reason: "turn_transition" });
+  } else {
+    // Even if nothing was actively playing, signal the transition so client plays tone
+    // (old queued jobs were cancelled — user should hear the "moving on" signal)
+    broadcast({ type: "tts_stop", reason: "turn_transition" });
+  }
+
+  // Remove failed old-turn jobs from queue
+  for (let i = ttsJobQueue.length - 1; i >= 0; i--) {
+    if (ttsJobQueue[i].turn < currentTurn && ttsJobQueue[i].state === "failed") {
+      ttsJobQueue.splice(i, 1);
+    }
+  }
 }
 
 // --- Debug Pipeline Observability ---
@@ -772,7 +878,9 @@ interface TtsJob {
   state: "fetching" | "ready" | "playing" | "done" | "failed";
   mode: "kokoro" | "local";
   generation: number;      // ttsGeneration when job was created
+  turn: number;            // conversation turn when job was created
   currentChunkIndex: number; // Index of chunk currently being played (chunk-level ack)
+  playingSince: number;    // Timestamp when state became "playing" (0 if not playing)
 }
 
 // --- New TTS state (v2) ---
@@ -783,28 +891,65 @@ let ttsPlaybackTimeout2: ReturnType<typeof setTimeout> | null = null; // Fallbac
 let _activeFetchCount = 0;                        // In-flight Kokoro fetch count (for TTS_MAX_PARALLEL)
 
 const TTS_MAX_PARALLEL = 10;
-const TTS_CHUNK_MAX_CHARS = 200;
-const TTS_FIRST_CHUNK_MAX = 100; // Smaller first chunk → faster initial audio from Kokoro
+const TTS_CHUNK_MIN_CHARS = 50;  // Floor — don't send tiny fragments to Kokoro
+const TTS_CHUNK_MAX_CHARS = 250;
+const TTS_FIRST_CHUNK_MAX = 120; // Smaller first chunk → faster initial audio from Kokoro
 const TTS_MAX_QUEUE = 50;
+const TTS_PLAYING_TIMEOUT_MS = 30000; // Max time a job can stay in "playing" without client ack
 
 /** Split text into chunks at word boundaries, each ≤ maxChars.
  *  Optional firstChunkMax allows a smaller first chunk for faster initial audio. */
 function splitIntoChunks(text: string, maxChars: number, firstChunkMax?: number): string[] {
   if (text.length <= (firstChunkMax ?? maxChars)) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    const limit = chunks.length === 0 && firstChunkMax ? firstChunkMax : maxChars;
-    if (remaining.length <= limit) {
-      chunks.push(remaining);
-      break;
-    }
-    // Find last space within limit window
-    let splitAt = remaining.lastIndexOf(" ", limit);
-    if (splitAt <= 0) splitAt = limit; // No space found — hard split
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
+
+  // Step 1: Split at sentence boundaries (.!? followed by space or end)
+  const sentences: string[] = [];
+  const sentenceRe = /[^.!?]*[.!?]+(?:\s+|$)/g;
+  let match: RegExpExecArray | null;
+  let lastEnd = 0;
+  while ((match = sentenceRe.exec(text)) !== null) {
+    sentences.push(match[0]);
+    lastEnd = match.index + match[0].length;
   }
+  // Capture any trailing text without sentence-ending punctuation
+  if (lastEnd < text.length) {
+    sentences.push(text.slice(lastEnd));
+  }
+  if (sentences.length === 0) sentences.push(text);
+
+  // Step 2: Group sentences into chunks respecting max chars
+  const chunks: string[] = [];
+  let current = "";
+  for (const sentence of sentences) {
+    const limit = chunks.length === 0 && firstChunkMax ? firstChunkMax : maxChars;
+    const trimmedSentence = sentence.trimStart();
+
+    // If adding this sentence would exceed limit AND current meets minimum, flush
+    if (current.length > 0 && current.length + trimmedSentence.length > limit && current.length >= TTS_CHUNK_MIN_CHARS) {
+      chunks.push(current.trimEnd());
+      current = "";
+    }
+
+    // If a single sentence exceeds max chars, split it at space boundaries
+    const sentenceLimit = chunks.length === 0 && !current && firstChunkMax ? firstChunkMax : maxChars;
+    if (trimmedSentence.length > sentenceLimit && !current) {
+      let rem = trimmedSentence;
+      while (rem.length > 0) {
+        const lim = chunks.length === 0 && firstChunkMax ? firstChunkMax : maxChars;
+        if (rem.length <= lim) {
+          current = rem;
+          break;
+        }
+        let splitAt = rem.lastIndexOf(" ", lim);
+        if (splitAt <= 0) splitAt = lim;
+        chunks.push(rem.slice(0, splitAt).trimEnd());
+        rem = rem.slice(splitAt).trimStart();
+      }
+    } else {
+      current += (current ? "" : "") + trimmedSentence;
+    }
+  }
+  if (current.trim()) chunks.push(current.trimEnd());
   return chunks;
 }
 
@@ -819,7 +964,7 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
   }
 
   // Stale check — job may have been cancelled while waiting for slot
-  if (job.generation !== ttsGeneration) {
+  if (isJobStale(job)) {
     chunk.state = "failed";
     return;
   }
@@ -846,7 +991,7 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
     if (buf.length < 100) throw new Error("Kokoro returned empty audio");
 
     // Stale check after async — generation may have changed
-    if (job.generation !== ttsGeneration) {
+    if (isJobStale(job)) {
       chunk.state = "failed";
       logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
       return;
@@ -888,9 +1033,9 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
 /**
  * Queue text for TTS playback, labeled with an entry ID.
  */
-function queueTts(entryId: number | null, text: string): void {
-  // Stop filler audio when real response audio is queued
-  if (entryId !== FILLER_ENTRY_ID && entryId != null) {
+function queueTts(entryId: number | null, text: string, source = "queueTts"): void {
+  // Stop filler audio when real response audio is queued (not another filler)
+  if (entryId != null && entryId !== FILLER_ENTRY_ID && entryId !== _fillerEntryId) {
     stopFillerIfActive();
   }
 
@@ -919,6 +1064,7 @@ function queueTts(entryId: number | null, text: string): void {
       // Update the existing job's text so final audio covers the complete text.
       if (speakableText.length > existing.speakableText.length) {
         console.log(`[tts2] Entry ${entryId} text grew (${existing.speakableText.length}→${speakableText.length} chars) — updating job=${existing.jobId}`);
+        ttslog(entryId, text, ttsGeneration, `${source}_update`, speakableText);
         existing.fullText = text;
         existing.speakableText = speakableText;
         // If still pending/fetching, re-chunk and re-fetch
@@ -1013,7 +1159,9 @@ function queueTts(entryId: number | null, text: string): void {
     state: mode === "local" ? "ready" : "fetching",
     mode,
     generation: ttsGeneration,
+    turn: currentTurn,
     currentChunkIndex: 0,
+    playingSince: 0,
   };
 
   ttsJobQueue.push(job);
@@ -1026,7 +1174,7 @@ function queueTts(entryId: number | null, text: string): void {
       if (il && !il.ttsEntryIds.includes(entryId)) il.ttsEntryIds.push(entryId);
     }
   }
-  ttslog(entryId, text, ttsGeneration, "queueTts", speakableText, chunks.length, rawCounts);
+  ttslog(entryId, text, ttsGeneration, source, speakableText, chunks.length, rawCounts);
   plog("tts2_queued", `job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} (${speakableText.length} chars)`);
   console.log(`[tts2] Queued job=${job.jobId} entry=${entryId} mode=${mode} chunks=${chunks.length} queue=${ttsJobQueue.length}`);
 
@@ -1071,19 +1219,129 @@ function queueTts(entryId: number | null, text: string): void {
 }
 
 // --- Predictive Filler Audio ---
-// Play a short filler phrase while Claude thinks, so there's no dead silence.
+// Play a contextual filler phrase while Claude thinks, so there's no dead silence.
+// Pattern-matches user transcription to pick a natural, conversational acknowledgement.
 
-const FILLER_PHRASES = [
-  "Let me think about that.",
-  "One moment.",
-  "Sure, let me work on that.",
-  "Good question.",
+const FILLER_CATEGORIES: { patterns: RegExp[]; phrases: string[] }[] = [
+  {
+    // Greetings — match first so "hey how are you" gets greeting, not question
+    patterns: [/^(hi|hello|hey|howdy|good morning|good afternoon|good evening|what'?s up)\b/],
+    phrases: [
+      "Hey there, good to hear from you.",
+      "Hi! Give me just a moment.",
+      "Hey, what's going on.",
+    ],
+  },
+  {
+    // Gratitude
+    patterns: [/\b(thank|thanks|appreciate|great job|nice work|well done)\b/],
+    phrases: [
+      "Happy to help, anytime!",
+      "Of course, glad that was useful.",
+      "You're welcome! Let me know if there's anything else.",
+    ],
+  },
+  {
+    // Jokes/humor
+    patterns: [/\b(joke|funny|laugh|humor|tell me a)\b/],
+    phrases: [
+      "Oh, I think I've got a good one for this.",
+      "Alright, let me think of something fun.",
+      "Ha, okay, give me just a second.",
+    ],
+  },
+  {
+    // Complaints/problems — match before generic requests
+    patterns: [/\b(broken|bug|wrong|error|not working|issue|problem|fix|crash|fail)\b/],
+    phrases: [
+      "Okay, let me take a closer look at that.",
+      "Got it, let me see what's going on here.",
+      "Alright, let me dig into that for you.",
+    ],
+  },
+  {
+    // Opinions
+    patterns: [/\b(what do you think|your opinion|your take|do you agree|thoughts on|what are your)\b/],
+    phrases: [
+      "That's a really interesting question, let me think about that.",
+      "Hmm, good one. Give me a moment to consider.",
+      "Oh, I actually have some thoughts on that.",
+    ],
+  },
+  {
+    // Requests — "can you", "please", "help me", etc.
+    patterns: [/\b(can you|could you|please|help me|i need|i want|make me|write me|show me|give me|create|build|set up)\b/],
+    phrases: [
+      "Sure thing, let me pull that together for you.",
+      "Absolutely, working on that right now.",
+      "On it, give me just a moment.",
+      "Sure, let me get that set up.",
+    ],
+  },
+  {
+    // Questions — broad catch after specific categories
+    patterns: [/\?/, /^(who|what|where|when|why|how|can|do|does|is|are|will|would|could|should)\b/],
+    phrases: [
+      "That's a great question, let me think about that.",
+      "Hmm, let me look into that for you.",
+      "Good question, give me a second to check.",
+      "Let me see what I can find on that.",
+    ],
+  },
+  {
+    // Continuation
+    patterns: [/^(and |also |another |one more|what about|how about|okay |ok )/],
+    phrases: [
+      "Sure, let me keep going.",
+      "Alright, coming right up.",
+      "Got it, one more moment.",
+    ],
+  },
 ];
-const FILLER_ENTRY_ID = -999; // Sentinel entryId for filler jobs
-let _fillerActive = false;
 
-/** Queue a filler phrase for playback while Claude processes input. */
-function queueFillerAudio(): void {
+const FILLER_DEFAULT_PHRASES = [
+  "Alright, give me just a moment.",
+  "Sure, let me work on that for you.",
+  "One moment, I'm on it.",
+  "Let me think about that.",
+  "Okay, working on it now.",
+];
+
+const FILLER_ENTRY_ID = -999; // Legacy sentinel (kept for stopFillerIfActive compatibility)
+let _fillerActive = false;
+let _fillerEntryId: number | null = null; // Real entry ID of current filler
+const _recentFillers: string[] = []; // Track last 3 to avoid repeats
+const FILLER_RECENT_MAX = 3;
+
+/** Pick a contextual filler phrase based on user's transcribed text. */
+function pickFillerPhrase(userText: string): string {
+  const lower = userText.toLowerCase().trim();
+
+  // Find first matching category
+  let pool = FILLER_DEFAULT_PHRASES;
+  for (const cat of FILLER_CATEGORIES) {
+    if (cat.patterns.some(p => p.test(lower))) {
+      pool = cat.phrases;
+      break;
+    }
+  }
+
+  // Filter out recently used phrases
+  const available = pool.filter(p => !_recentFillers.includes(p));
+  const choices = available.length > 0 ? available : pool;
+
+  const phrase = choices[Math.floor(Math.random() * choices.length)];
+
+  // Track recent usage
+  _recentFillers.push(phrase);
+  if (_recentFillers.length > FILLER_RECENT_MAX) _recentFillers.shift();
+
+  return phrase;
+}
+
+/** Queue a contextual filler phrase for playback while Claude processes input.
+ *  Creates a proper assistant entry so the filler appears in conversation view. */
+function queueFillerAudio(userText = ""): void {
   const settings = loadSettings();
   // fillerAudio defaults to true if unset
   if (settings.fillerAudio === false) return;
@@ -1091,20 +1349,43 @@ function queueFillerAudio(): void {
   // Don't play filler if TTS is already playing or queued
   if (ttsCurrentlyPlaying || ttsJobQueue.length > 0) return;
 
-  const phrase = FILLER_PHRASES[Math.floor(Math.random() * FILLER_PHRASES.length)];
-  console.log(`[tts2] Queueing filler: "${phrase}"`);
-  ttslog(FILLER_ENTRY_ID, phrase, ttsGeneration, "filler");
+  const phrase = pickFillerPhrase(userText);
+  console.log(`[tts2] Queueing filler: "${phrase}" (input: "${userText.slice(0, 40)}")`);
+
+  // Create a real assistant entry so the filler shows in conversation view
+  const fillerEntryId = ++entryIdCounter;
+  const fillerEntry: ConversationEntry = {
+    id: fillerEntryId,
+    role: "assistant",
+    text: phrase,
+    speakable: true,
+    spoken: true, // Will be spoken immediately
+    ts: Date.now(),
+    turn: currentTurn,
+    filler: true, // Tag so UI can style differently if desired
+    ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
+  };
+  conversationEntries.push(fillerEntry);
+  elog(fillerEntryId, "assistant", "filler", phrase);
+  broadcast({ type: "entry", entries: conversationEntries, partial: true });
+
+  ttslog(fillerEntryId, phrase, ttsGeneration, "filler");
   _fillerActive = true;
-  queueTts(FILLER_ENTRY_ID, phrase);
+  _fillerEntryId = fillerEntryId;
+  queueTts(fillerEntryId, phrase);
 }
 
 /** Stop filler playback when real response audio arrives. */
 function stopFillerIfActive(): void {
   if (!_fillerActive) return;
   _fillerActive = false;
+  const fid = _fillerEntryId;
+  _fillerEntryId = null;
 
-  // Check if filler job is still in queue or playing
-  const fillerIdx = ttsJobQueue.findIndex(j => j.entryId === FILLER_ENTRY_ID);
+  // Check if filler job is still in queue or playing (match by real entry ID or legacy sentinel)
+  const fillerIdx = ttsJobQueue.findIndex(j =>
+    (j.entryId === fid || j.entryId === FILLER_ENTRY_ID) && j.state !== "done" && j.state !== "failed"
+  );
   if (fillerIdx >= 0) {
     const fillerJob = ttsJobQueue[fillerIdx];
     for (const chunk of fillerJob.chunks) {
@@ -1118,13 +1399,15 @@ function stopFillerIfActive(): void {
     console.log("[tts2] Filler removed from queue (real audio arriving)");
   }
 
-  if (ttsCurrentlyPlaying?.entryId === FILLER_ENTRY_ID) {
+  const isFillerPlaying = ttsCurrentlyPlaying &&
+    (ttsCurrentlyPlaying.entryId === fid || ttsCurrentlyPlaying.entryId === FILLER_ENTRY_ID);
+  if (isFillerPlaying) {
     // Filler is currently playing — stop it
     ttsCurrentlyPlaying = null;
     if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
     broadcast({ type: "tts_stop" });
     console.log("[tts2] Filler playback stopped (real audio arriving)");
-    ttslog(FILLER_ENTRY_ID, "", ttsGeneration, "filler_replaced");
+    ttslog(fid ?? FILLER_ENTRY_ID, "", ttsGeneration, "filler_replaced");
   }
 }
 
@@ -1137,9 +1420,22 @@ function drainAudioBuffer(): void {
   // Already playing — wait for client chunk_done/tts_done
   if (ttsCurrentlyPlaying) return;
 
-  // Evict completed/failed jobs from the front of the queue
-  while (ttsJobQueue.length > 0 && (ttsJobQueue[0].state === "done" || ttsJobQueue[0].state === "failed")) {
-    ttsJobQueue.shift();
+  // Evict completed/failed/orphaned jobs from the front of the queue
+  while (ttsJobQueue.length > 0) {
+    const front = ttsJobQueue[0];
+    if (front.state === "done" || front.state === "failed") {
+      ttsJobQueue.shift();
+      continue;
+    }
+    // Orphan recovery: job stuck in "playing" but ttsCurrentlyPlaying is null (or different).
+    // This happens when handleTtsDone2 receives a stale tts_done for a different entryId.
+    if (front.state === "playing" && ttsCurrentlyPlaying !== front) {
+      console.warn(`[tts2] Orphan recovery: job=${front.jobId} entry=${front.entryId} stuck in playing — marking failed`);
+      front.state = "failed";
+      ttsJobQueue.shift();
+      continue;
+    }
+    break;
   }
 
   if (ttsJobQueue.length === 0) {
@@ -1158,8 +1454,8 @@ function drainAudioBuffer(): void {
   }
   if (job.state !== "ready") return; // Still fetching — will be called again when chunks complete
 
-  // Stale generation check
-  if (job.generation !== ttsGeneration) {
+  // Stale generation check — only user-initiated bumps cancel
+  if (isJobStale(job)) {
     job.state = "failed";
     drainAudioBuffer(); // Recurse to skip this job
     return;
@@ -1167,6 +1463,7 @@ function drainAudioBuffer(): void {
 
   // Mark playing
   job.state = "playing";
+  job.playingSince = Date.now();
   job.currentChunkIndex = 0;
   ttsCurrentlyPlaying = job;
 
@@ -1256,9 +1553,9 @@ function handleChunkDone(entryId: number | null, chunkIndex: number): void {
     return;
   }
 
-  // Stale generation check
-  if (job.generation !== ttsGeneration) {
-    console.log(`[tts2] chunk_done stale (gen ${job.generation} vs ${ttsGeneration}) — dropping job`);
+  // Stale generation check — only user-initiated bumps cancel
+  if (isJobStale(job)) {
+    console.log(`[tts2] chunk_done stale (gen ${job.generation} vs ${ttsGeneration}, reason=${_lastBumpReason}) — dropping job`);
     job.state = "failed";
     ttsCurrentlyPlaying = null;
     drainAudioBuffer();
@@ -1318,12 +1615,16 @@ function handleTtsDone2(entryId: number | null): void {
 
   if (job) {
     job.state = "done";
+    // Only null ttsCurrentlyPlaying if the matched job IS the currently playing one
+    if (ttsCurrentlyPlaying === job) {
+      ttsCurrentlyPlaying = null;
+    }
     console.log(`[tts2] Done job=${job.jobId} entry=${entryId}`);
   } else {
-    console.log(`[tts2] handleTtsDone2 — no matching job for entry=${entryId} (stale?)`);
+    // No matching job — stale tts_done. Do NOT null ttsCurrentlyPlaying,
+    // as the real playing job may still be active with a different entryId.
+    console.log(`[tts2] handleTtsDone2 — no matching job for entry=${entryId} (stale?) — NOT clearing ttsCurrentlyPlaying (current=${ttsCurrentlyPlaying?.entryId})`);
   }
-
-  ttsCurrentlyPlaying = null;
 
   // Mark conversation entry as spoken
   if (entryId != null) {
@@ -1340,31 +1641,75 @@ function handleTtsDone2(entryId: number | null): void {
 }
 
 /**
+ * Periodic sweep for stuck TTS jobs. Catches orphaned jobs that the per-chunk timeout
+ * missed (e.g., ttsCurrentlyPlaying was nulled by a stale tts_done for a different entry).
+ * Runs every 15 seconds.
+ */
+function sweepStaleTtsJobs(): void {
+  const now = Date.now();
+
+  // Check currently playing job for timeout
+  if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.playingSince > 0) {
+    const elapsed = now - ttsCurrentlyPlaying.playingSince;
+    if (elapsed > TTS_PLAYING_TIMEOUT_MS) {
+      console.warn(`[tts2] Sweep: currently playing job=${ttsCurrentlyPlaying.jobId} entry=${ttsCurrentlyPlaying.entryId} stuck for ${(elapsed / 1000).toFixed(0)}s — forcing done`);
+      const stuckJob = ttsCurrentlyPlaying;
+      stuckJob.state = "failed";
+      ttsCurrentlyPlaying = null;
+      if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+      broadcast({ type: "tts_stop", reason: "stall_recovery" });
+      drainAudioBuffer();
+      return;
+    }
+  }
+
+  // Check for orphaned playing jobs in the queue (ttsCurrentlyPlaying is null or different)
+  let recovered = 0;
+  for (const job of ttsJobQueue) {
+    if (job.state === "playing" && ttsCurrentlyPlaying !== job) {
+      console.warn(`[tts2] Sweep: orphaned job=${job.jobId} entry=${job.entryId} in playing state — marking failed`);
+      job.state = "failed";
+      recovered++;
+    }
+  }
+  if (recovered > 0) {
+    drainAudioBuffer();
+  }
+}
+
+/**
  * Stop all TTS playback — called on user interruption (stop button, new input).
  * Generation is bumped via bumpGeneration() with a tagged reason.
  */
 function stopClientPlayback2(reason: GenerationEvent["reason"] = "user_stop", entryId?: number): void {
   bumpGeneration(reason, entryId);
 
-  // Abort all in-flight Kokoro fetches
-  for (const job of ttsJobQueue) {
-    for (const chunk of job.chunks) {
-      if (chunk.abortController) {
-        try { chunk.abortController.abort(); } catch {}
-        chunk.abortController = null;
+  // For user-initiated interruptions, cancel everything.
+  // For new_input, preserve queued jobs from the previous response — they should finish playing.
+  const shouldCancelQueue = USER_INITIATED_BUMP_REASONS.has(reason);
+
+  if (shouldCancelQueue) {
+    // Abort all in-flight Kokoro fetches
+    for (const job of ttsJobQueue) {
+      for (const chunk of job.chunks) {
+        if (chunk.abortController) {
+          try { chunk.abortController.abort(); } catch {}
+          chunk.abortController = null;
+        }
+        chunk.audioBuf = null;
       }
-      chunk.audioBuf = null;
     }
+    // Clear queue and playing state
+    ttsJobQueue.length = 0;
+    ttsCurrentlyPlaying = null;
+    if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
+    // Tell client to stop playback
+    broadcast({ type: "tts_stop" });
+  } else {
+    // new_input: let existing queue drain naturally. Don't abort fetches or clear queue.
+    // The gen bump prevents NEW stale callbacks from old async paths, but existing jobs play through.
+    console.log(`[tts2] Soft gen bump (reason=${reason}) — preserving ${ttsJobQueue.length} queued jobs`);
   }
-
-  // Clear queue and playing state
-  ttsJobQueue.length = 0;
-  ttsCurrentlyPlaying = null;
-
-  if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
-
-  // Tell client to stop playback
-  broadcast({ type: "tts_stop" });
 }
 
 // --- Tmux Streaming State Machine ---
@@ -1680,6 +2025,7 @@ interface ConversationEntry {
   ts: number;
   turn: number;
   queued?: boolean; // true = pending while Claude is active, not yet sent
+  filler?: boolean; // true = auto-filler phrase ("Got it, let me look into that")
   inputId?: string;          // Unique ID for this voice/text input (user entries)
   parentInputId?: string;    // Links assistant responses to the user input that triggered them
 }
@@ -1775,6 +2121,9 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
 // Unified extraction: returns tagged paragraphs (speakable vs non-speakable)
 function extractStructuredOutput(preSnapshot: string, postSnapshot: string, userInput: string): ExtractedParagraph[] {
   const lines = getLinesAfterInput(postSnapshot, preSnapshot, userInput);
+  // Tier 1: capture raw input snapshot (truncate to 4KB for reasonable size)
+  _parseRawSnapshot = lines.join("\n").slice(0, 4096);
+  _parseRawSnapshotTs = Date.now();
   const result: ExtractedParagraph[] = [];
   let currentLines: string[] = [];
   let currentSpeakable = true;
@@ -1798,89 +2147,93 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
     if (!foundContent && !trimmed) continue;
 
     // ── Shared chrome filters (from both extractRawOutput + extractSpeakableText) ──
-    if (/^[─━═]{3,}/.test(trimmed)) continue;
-    if (/^❯/.test(trimmed)) continue;
-    if (/bypass\s+permissions/i.test(trimmed)) continue;
-    if (/^⏵/.test(trimmed)) continue;
-    if (isSpinnerLine(trimmed)) continue;
-    if (/context left until/i.test(trimmed)) continue;
-    if (/auto-compact/i.test(trimmed)) continue;
-    // Filter leaked system context lines (wrapped tmux continuation lines)
-    if (MURMUR_CONTEXT_FILTER.test(trimmed)) {
+    // Each filter logs its reason to _parseLog for debugging content suppression issues
+    let _skipReason = "";
+    if (/^[─━═]{3,}/.test(trimmed)) _skipReason = "separator";
+    else if (/^❯/.test(trimmed)) _skipReason = "prompt";
+    else if (/bypass\s+permissions/i.test(trimmed)) _skipReason = "bypass_permissions";
+    else if (/^⏵/.test(trimmed)) _skipReason = "arrow_marker";
+    else if (isSpinnerLine(trimmed)) _skipReason = "spinner_line";
+    else if (/context left until/i.test(trimmed)) _skipReason = "context_left";
+    else if (/auto-compact/i.test(trimmed)) _skipReason = "auto_compact";
+    else if (MURMUR_CONTEXT_FILTER.test(trimmed)) {
       if (/prose mode/i.test(trimmed)) console.log(`[PROSE-LEAK-TRACE] extractStructuredOutput FILTERED: "${trimmed.slice(0, 80)}"`);
-      continue;
+      _skipReason = "murmur_context";
     }
     // Filter Claude Code team/agent messages — stateful block filter
-    // Skips ALL lines between opening and closing tags, not just the tags themselves
-    if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock = true; continue; }
-    if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock = false; continue; }
-    if (inAgentBlock) continue;
-    if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) continue;
+    else if (/^<teammate-message|^<task-notification|^<system-reminder/.test(trimmed)) { inAgentBlock = true; _skipReason = "agent_block_open"; }
+    else if (/^<\/teammate-message|^<\/task-notification|^<\/system-reminder/.test(trimmed)) { inAgentBlock = false; _skipReason = "agent_block_close"; }
+    else if (inAgentBlock) _skipReason = "inside_agent_block";
+    else if (/^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"/.test(trimmed)) _skipReason = "json_notification";
+    // Background task completion notifications
+    else if (/^Background command .+ completed/i.test(trimmed)) _skipReason = "bg_task_notification";
+    // Claude Code tool invocations and output (⏺ Bash(...), ⏺ Searched, ⏺ Reading, ⎿ output)
+    else if (/^⏺\s*(Bash|Read|Write|Edit|Glob|Grep|Searched|Reading|Update)\b/i.test(trimmed)) _skipReason = "tool_invocation";
+    else if (/^Bash\(/i.test(trimmed)) _skipReason = "tool_invocation";
+    else if (/^⎿/.test(trimmed)) _skipReason = "tool_output_continuation";
+    else if (/ctrl\+o\s+to\s+expand/i.test(trimmed)) _skipReason = "collapsed_output_hint";
     // Claude Code TUI chrome — status bar, menus, navigation hints, permission prompts
-    if (/expand\s+permiss/i.test(trimmed)) continue;
-    if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) continue;
-    if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) continue;
+    else if (/expand\s+permiss/i.test(trimmed)) _skipReason = "expand_permissions";
+    else if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) _skipReason = "nav_hint";
+    else if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) _skipReason = "permission_choice";
     // Lines that are mostly Unicode box-drawing / arrow / UI decoration (not prose)
-    if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) continue;
+    else if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) _skipReason = "box_drawing";
     // Claude Code menu/status fragments — short lines with navigation chrome
-    if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) continue;
-    if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) continue;
+    else if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) _skipReason = "menu_fragment";
+    else if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) _skipReason = "menu_label";
     // Session feedback prompts
-    if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) continue;
+    else if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) _skipReason = "feedback_prompt";
+    // Claude Code status lines — these spinner chars only appear in status bar, never in conversation
+    else if (/^[✻✶✢✽]/.test(trimmed)) _skipReason = "status_cooking";
     // Claude Code ink TUI status indicators (garbled tmux capture of redrawn regions)
-    if (/@(code|ma)\b/.test(trimmed)) continue;
-    if (/→\s*·/.test(trimmed)) continue;
+    else if (/@(code|ma)\b/.test(trimmed)) _skipReason = "ink_tui";
+    else if (/→\s*·/.test(trimmed)) _skipReason = "arrow_dot";
     // Garbled TUI text detector: multiple 3+ space runs between short fragments = partial frame capture
-    if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) continue;
+    else if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) _skipReason = "garbled_tui";
     // High non-alpha ratio: >50% non-alphanumeric+space on short lines = UI chrome, not prose
-    if (trimmed.length > 0 && trimmed.length < 100) {
+    else if (trimmed.length > 0 && trimmed.length < 100) {
       const alphaCount = (trimmed.match(/[a-zA-Z0-9]/g) || []).length;
-      if (alphaCount / trimmed.length < 0.4) continue;
+      if (alphaCount / trimmed.length < 0.4) _skipReason = "low_alpha_ratio";
     }
     // Lines containing multiple TUI keywords mashed together (garbled ink redraws)
-    { const tuiKws = ["expand", "bypass", "permiss", "interrupt", "tasks", "team", "@code", "@ma", "ions"]; const hits = tuiKws.filter(k => trimmed.toLowerCase().includes(k)); if (hits.length >= 2) continue; }
+    if (!_skipReason) {
+      const tuiKws = ["expand", "bypass", "permiss", "interrupt", "tasks", "team", "@code", "@ma", "ions"];
+      const hits = tuiKws.filter(k => trimmed.toLowerCase().includes(k));
+      if (hits.length >= 2) _skipReason = "multi_tui_keywords";
+    }
+    if (_skipReason) { parselog(trimmed, "skip", _skipReason); continue; }
 
     // ── Non-speakable filters (from extractSpeakableText) ──
     // These lines are kept for display (verbose mode) but marked non-speakable
-    const isNonSpeakable =
-      // Timing summaries
-      (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) ||
-      // Ctrl hints
-      /^(ctrl|⌃|esc to|press)/i.test(trimmed) ||
-      /\bctrl\+[a-z]\b/i.test(trimmed) ||
-      // Mode indicators (plan mode, bypass permissions)
-      /^⏸\s+plan mode/i.test(trimmed) ||
-      /⏵⏵\s+bypass/i.test(trimmed) ||
-      /shift\+tab to cycle/i.test(trimmed) ||
-      // Tree-style agent output (├─, └─, │, ⎿)
-      /^[├└│⎿]/.test(trimmed) ||
-      // Agent completion summaries
-      /^\d+\s+Explore\s+agents?\s+finished/i.test(trimmed) ||
-      /Explore\s+.*finished.*ctrl/i.test(trimmed) ||
-      // Tool summaries
-      /^Read \d+ files?/i.test(trimmed) ||
-      /^Searched for \d+/i.test(trimmed) ||
-      /^Wrote \d+/i.test(trimmed) ||
-      /^Edited \d+/i.test(trimmed) ||
-      (/^Ran /i.test(trimmed) && trimmed.length < 60) ||
-      /Interrupted/.test(trimmed) ||
-      /Running…/.test(trimmed) ||
-      // Todo items
-      /^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed) ||
-      // Expand hints
-      /ctrl\+o/i.test(trimmed) ||
-      /^\+\d+ lines/.test(trimmed) ||
-      /^… \+\d+/.test(trimmed) ||
-      // File paths
-      (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100) ||
-      // Numbered choice menus (e.g. "1: Bad  2: Fine  3: Good  0: Dismiss")
-      /^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed) ||
-      // Claude Code TUI fragments that slip through skip filters (partial lines, wrapped)
-      /permission/i.test(trimmed) && /allow|deny|grant|expand/i.test(trimmed) ||
-      // Arrow-heavy navigation hints
-      /[↓↑←→]{2,}/.test(trimmed) ||
-      // Status bar fragments (e.g. "Opus  Auto  >" or "compact  12% context")
-      (/\b(opus|sonnet|haiku|auto|compact|context)\b/i.test(trimmed) && trimmed.length < 40);
+    let _nonSpeakableReason = "";
+    if (/^[^\w\d\s]\s+\S+.*\d+[sm]/.test(trimmed) && trimmed.length < 60) _nonSpeakableReason = "timing_summary";
+    else if (/^(ctrl|⌃|esc to|press)/i.test(trimmed)) _nonSpeakableReason = "ctrl_hint";
+    else if (/\bctrl\+[a-z]\b/i.test(trimmed)) _nonSpeakableReason = "ctrl_shortcut";
+    else if (/^⏸\s+plan mode/i.test(trimmed)) _nonSpeakableReason = "plan_mode";
+    else if (/⏵⏵\s+bypass/i.test(trimmed)) _nonSpeakableReason = "bypass_mode";
+    else if (/shift\+tab to cycle/i.test(trimmed)) _nonSpeakableReason = "shift_tab";
+    else if (/^[├└│⎿]/.test(trimmed)) _nonSpeakableReason = "tree_output";
+    else if (/^\d+\s+Explore\s+agents?\s+finished/i.test(trimmed)) _nonSpeakableReason = "agent_summary";
+    else if (/Explore\s+.*finished.*ctrl/i.test(trimmed)) _nonSpeakableReason = "agent_summary";
+    else if (/^Read \d+ files?/i.test(trimmed)) _nonSpeakableReason = "tool_read";
+    else if (/^Searched for \d+/i.test(trimmed)) _nonSpeakableReason = "tool_search";
+    else if (/^Wrote \d+/i.test(trimmed)) _nonSpeakableReason = "tool_write";
+    else if (/^Edited \d+/i.test(trimmed)) _nonSpeakableReason = "tool_edit";
+    else if (/^Ran /i.test(trimmed) && trimmed.length < 60) _nonSpeakableReason = "tool_ran";
+    else if (/Interrupted/.test(trimmed)) _nonSpeakableReason = "interrupted";
+    else if (/Running…/.test(trimmed)) _nonSpeakableReason = "running";
+    else if (/^[◻◼☐☑✓✗●○■□▪▫]\s/.test(trimmed)) _nonSpeakableReason = "todo_item";
+    else if (/ctrl\+o/i.test(trimmed)) _nonSpeakableReason = "expand_hint";
+    else if (/^\+\d+ lines/.test(trimmed)) _nonSpeakableReason = "expand_lines";
+    else if (/^… \+\d+/.test(trimmed)) _nonSpeakableReason = "expand_ellipsis";
+    // File paths — only standalone path lines (≤3 words), not prose containing paths
+    else if (/^\s*(\/[\w.~/-]+){2,}/.test(trimmed) && trimmed.length < 100 && trimmed.split(/\s+/).length <= 3) _nonSpeakableReason = "file_path";
+    else if (/^\d+:\s+\w+.*\d+:\s+\w+/.test(trimmed)) _nonSpeakableReason = "choice_menu";
+    else if (/permission/i.test(trimmed) && /allow|deny|grant|expand/i.test(trimmed)) _nonSpeakableReason = "permission_fragment";
+    else if (/[↓↑←→]{2,}/.test(trimmed)) _nonSpeakableReason = "arrow_nav";
+    else if (/\b(opus|sonnet|haiku|auto|compact|context)\b/i.test(trimmed) && trimmed.length < 40) _nonSpeakableReason = "status_bar";
+    const isNonSpeakable = _nonSpeakableReason !== "";
+    if (isNonSpeakable) parselog(trimmed, "nonspeakable", _nonSpeakableReason);
 
     // ── Tool block tracking ──
     if (/^⏺\s+\w+\(/.test(trimmed) || /^⏺\s+\w+$/.test(trimmed)) {
@@ -1952,7 +2305,8 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
       continue;
     }
 
-    // Normal prose line
+    // Normal prose line — passed all filters
+    parselog(trimmed, "speakable", "speakable");
     if (!currentSpeakable && currentLines.length > 0) {
       flushParagraph();
       currentSpeakable = true;
@@ -2148,32 +2502,56 @@ function broadcastCurrentOutput() {
   if (normalized === lastBroadcastText) return;
   lastBroadcastText = normalized;
 
-  // Diff paragraphs against current turn's assistant entries only
+  // Match paragraphs to existing entries by TEXT SIMILARITY, not positional index.
+  // This prevents gen bumps (which re-parse tmux content with shifted positions)
+  // from overwriting entries with wrong text.
   const assistantEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
+  const matchedEntryIds = new Set<number>(); // Track which entries were matched this cycle
 
   for (let i = 0; i < paragraphs.length; i++) {
     const para = paragraphs[i];
-    if (i < assistantEntries.length) {
-      // Existing entry — update text if changed
-      const existing = assistantEntries[i];
-      if (existing.text !== para.text) {
-        // During streaming, if paragraphs shrunk (content scrolled off tmux top),
-        // positional matching shifts — don't overwrite entries with unrelated text.
-        // Only update if the new text is a growth/continuation of the existing text
-        // (shares at least the first 20 chars), or if we're not mid-stream.
-        const minLen = Math.min(20, existing.text.length, para.text.length);
-        const isGrowth = minLen === 0 ||
-          para.text.slice(0, minLen) === existing.text.slice(0, minLen);
-        if (streamState !== "RESPONDING" || isGrowth || paragraphs.length >= assistantEntries.length) {
-          existing.text = para.text;
-          existing.speakable = para.speakable;
+
+    // Find best matching existing entry by text similarity (first 30 chars prefix match)
+    // Prefer exact matches, then prefix/growth matches, then positional fallback
+    let matched: ConversationEntry | null = null;
+    const paraPrefix = para.text.slice(0, 30).toLowerCase();
+
+    // Pass 1: exact text match
+    for (const e of assistantEntries) {
+      if (matchedEntryIds.has(e.id)) continue;
+      if (e.text === para.text) { matched = e; break; }
+    }
+    // Pass 2: prefix match (text growth — same start, paragraph grew)
+    if (!matched && paraPrefix.length >= 10) {
+      for (const e of assistantEntries) {
+        if (matchedEntryIds.has(e.id)) continue;
+        const ePrefix = e.text.slice(0, 30).toLowerCase();
+        if (ePrefix === paraPrefix || para.text.startsWith(e.text.slice(0, 20)) || e.text.startsWith(para.text.slice(0, 20))) {
+          matched = e;
+          break;
         }
       }
+    }
+    // Pass 3: positional fallback ONLY if not mid-stream (final extraction is trustworthy)
+    if (!matched && streamState !== "RESPONDING" && i < assistantEntries.length && !matchedEntryIds.has(assistantEntries[i].id)) {
+      matched = assistantEntries[i];
+    }
+
+    if (matched) {
+      matchedEntryIds.add(matched.id);
+      if (matched.text !== para.text) {
+        matched.text = para.text;
+        matched.speakable = para.speakable;
+      }
     } else {
-      // New paragraph — create entry (but skip if identical text already exists in the CURRENT turn.
-      // Cross-turn dedup was blocking repeated content when user asks Claude to repeat something.)
-      const isDup = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.text === para.text);
+      // New paragraph — create entry (skip if identical text exists in recent entries).
+      // Check last 20 entries regardless of turn to catch duplicates across generation bumps.
+      const recentEntries = conversationEntries.slice(-20);
+      const isDup = recentEntries.some(e => e.role === "assistant" && e.text === para.text &&
+        (e.turn === currentTurn || currentTurn - e.turn <= 2));
       if (!isDup) {
+        // First new assistant content in this turn — cancel old-turn TTS so new response plays
+        cancelOldTurnJobs();
         const entry: ConversationEntry = {
           id: ++entryIdCounter,
           role: "assistant",
@@ -2268,8 +2646,7 @@ function broadcastCurrentOutput() {
     if (speakable && speakable.length >= 50) {
       // queueTts dedup will skip if already queued; re-queue logic handles text growth
       console.log(`[stream] Speculative TTS queue (id=${lastEntry.id}, ${speakable.length} chars)`);
-      ttslog(lastEntry.id, lastEntry.text, ttsGeneration, "speculative", speakable);
-      queueTts(lastEntry.id, lastEntry.text);
+      queueTts(lastEntry.id, lastEntry.text, "speculative");
     }
   }
 
@@ -2318,6 +2695,9 @@ function broadcastCurrentOutput() {
       }
     }, ENTRY_TTS_DELAY_MS);
   }
+
+  // Enforce entry cap on every cycle (not just startTmuxStreaming)
+  trimEntriesToCap();
 }
 
 // Called when new pipe-pane bytes arrive — schedules a capture-pane content check.
@@ -2409,6 +2789,24 @@ function scheduleDoneCheck() {
   }, DONE_QUIET_MS);
 }
 
+/** Cap conversationEntries at ~200 by trimming oldest turns. Safe to call frequently. */
+function trimEntriesToCap() {
+  if (conversationEntries.length > 200) {
+    const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
+    let trimCount = 0;
+    for (let i = 0; i < conversationEntries.length; i++) {
+      if (conversationEntries[i].turn >= oldestTurnToKeep) break;
+      trimCount++;
+    }
+    if (trimCount > 0 && trimCount < conversationEntries.length) {
+      const trimmedIds = conversationEntries.slice(0, trimCount).map(e => e.id);
+      conversationEntries.splice(0, trimCount);
+      for (const id of trimmedIds) entryTtsCursor.delete(id);
+      console.log(`[entries] Trimmed ${trimCount} old entries, ${conversationEntries.length} remaining`);
+    }
+  }
+}
+
 function startTmuxStreaming(userInput: string, inputId?: string) {
   if (streamState !== "IDLE") {
     stopTmuxStreaming();
@@ -2427,14 +2825,7 @@ function startTmuxStreaming(userInput: string, inputId?: string) {
   // Reset sentence cursor for new turn (after stopClientPlayback drains stale TTS)
   // Start a new conversation turn — keep old entries for history
   currentTurn++;
-  // Cap at ~200 entries to prevent unbounded memory growth (trim oldest turns)
-  if (conversationEntries.length > 200) {
-    const oldestTurnToKeep = conversationEntries[conversationEntries.length - 100].turn;
-    conversationEntries = conversationEntries.filter(e => e.turn >= oldestTurnToKeep);
-    // Clean up entryTtsCursor for trimmed entries to prevent memory leak
-    const liveIds = new Set(conversationEntries.map(e => e.id));
-    entryTtsCursor.forEach((_, id) => { if (!liveIds.has(id)) entryTtsCursor.delete(id); });
-  }
+  trimEntriesToCap();
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
   streamFileOffset = 0;
   stopClientPlayback2("new_input"); // Stop any current TTS before new input
@@ -2533,8 +2924,10 @@ function handleStreamDone() {
       assistantEntries[i].text = para.text;
       assistantEntries[i].speakable = para.speakable;
     } else {
-      // Skip if identical text already exists in the CURRENT turn (same-turn dedup only)
-      const isDup = conversationEntries.some(e => e.role === "assistant" && e.turn === currentTurn && e.text === para.text);
+      // Skip if identical text exists in recent entries (cross-turn dedup for gen bumps)
+      const recentEntries = conversationEntries.slice(-20);
+      const isDup = recentEntries.some(e => e.role === "assistant" && e.text === para.text &&
+        (e.turn === currentTurn || currentTurn - e.turn <= 2));
       if (!isDup) {
         const newId = ++entryIdCounter;
         conversationEntries.push({
@@ -2589,6 +2982,9 @@ function handleStreamDone() {
       spokeAnything = true;
     }
   }
+
+  // Enforce entry cap before final broadcast
+  trimEntriesToCap();
 
   // Broadcast final entries — spoken flags reflect actual TTS state (not preemptive)
   broadcast({
@@ -2768,6 +3164,8 @@ function stopTmuxStreaming() {
 // Polls tmux pane every 2s while IDLE. If spinner detected, starts streaming.
 let passiveWatcher: ReturnType<typeof setInterval> | null = null;
 let lastPassiveSnapshot: string = "";
+let _lastPassiveUserInput = ""; // Track last user input detected by passive watcher to prevent triplicates
+let _lastPassiveUserInputTs = 0;
 let _cooldownThinking = false; // Track if we sent thinking state during cooldown
 let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
 const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
@@ -2850,6 +3248,18 @@ function startPassiveWatcher() {
         const paneLines = pane.split("\n");
         const promptIdx = paneLines.findIndex(l => l.trim().startsWith("❯ ") && l.trim().length > 3);
         snapshot = promptIdx >= 0 ? paneLines.slice(0, promptIdx).join("\n") : pane;
+      }
+
+      // Guard: skip if we already processed this same user input recently
+      // (prevents triplicates when tmux shows same ❯ text across multiple poll cycles)
+      if (userInput) {
+        const normalizedPassive = userInput.trim().toLowerCase().replace(/\s+/g, "");
+        if (normalizedPassive === _lastPassiveUserInput && Date.now() - _lastPassiveUserInputTs < 30000) {
+          console.log(`[passive] Skipping already-processed input: "${userInput.slice(0, 60)}"`);
+          return;
+        }
+        _lastPassiveUserInput = normalizedPassive;
+        _lastPassiveUserInputTs = Date.now();
       }
 
       // Start streaming just like a Murmur-initiated input
@@ -3476,6 +3886,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     if (isBinary) {
       const audioData = raw as Buffer;
 
+      // Mic persistence test: log every incoming audio chunk with timestamp
+      if (_micPersistenceActive) {
+        _micPersistenceLog.push({ ts: Date.now(), type: "audio_chunk", size: audioData.length });
+        if (_micPersistenceLog.length > 500) _micPersistenceLog.shift();
+      }
+
       // Streaming STT: partial transcription during recording (preview only)
       if ((ws as any)._expectPartial) {
         (ws as any)._expectPartial = false;
@@ -3575,7 +3991,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text, audioInputId);
           addUserEntry(text, false, "stt-wake-word", audioInputId);
           terminal.sendText(text);
-          queueFillerAudio();
+          queueFillerAudio(text);
         } else {
           console.log(`No wake word in: "${text}"`);
           broadcast({ type: "voice_status", state: "wake_no_match" });
@@ -3587,7 +4003,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text, audioInputId);
           addUserEntry(text, false, "stt-direct", audioInputId);
           terminal.sendText(text);
-          queueFillerAudio();
+          queueFillerAudio(text);
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
           const queuedEntry = addUserEntry(text, true, "stt-queue", audioInputId);
@@ -3611,7 +4027,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     if ((ws as any)._isTestMode) {
       const safeTestPrefixes = [
         "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
-        "mute:", "replay:", "text:",  // text: is handled separately with its own testmode check
+        "mute:", "replay", "replay:", "text:",  // text: is handled separately with its own testmode check
+        "barge_in", "filler_audio:", "mictest:", "resend:",  // TTS control messages safe for testing
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
       if (!isSafe) {
@@ -3789,6 +4206,30 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
+    // Mic persistence test — client reports RMS levels and visibility changes
+    if (msg.startsWith("mictest:")) {
+      const payload = msg.slice(8);
+      if (payload === "start") {
+        _micPersistenceActive = true;
+        _micPersistenceLog.length = 0;
+        _micPersistenceLog.push({ ts: Date.now(), type: "marker", note: "test_started" });
+        console.log("[mictest] Persistence test started");
+      } else if (payload === "stop") {
+        _micPersistenceLog.push({ ts: Date.now(), type: "marker", note: "test_stopped" });
+        _micPersistenceActive = false;
+        console.log(`[mictest] Test stopped. ${_micPersistenceLog.length} entries logged.`);
+      } else if (payload.startsWith("rms:")) {
+        const rms = parseFloat(payload.slice(4));
+        _micPersistenceLog.push({ ts: Date.now(), type: "rms_report", rms });
+        if (_micPersistenceLog.length > 500) _micPersistenceLog.shift();
+      } else if (payload.startsWith("vis:")) {
+        const state = payload.slice(4); // "hidden" or "visible"
+        _micPersistenceLog.push({ ts: Date.now(), type: "visibility", note: state });
+        console.log(`[mictest] Visibility change: ${state}`);
+      }
+      return;
+    }
+
     // TTS playback complete (from client)
     // Accepts both old "tts_done" and new "tts_done:ENTRY_ID" format
     if (msg === "tts_done" || msg.startsWith("tts_done:")) {
@@ -3902,6 +4343,31 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
+    // Resend: re-send a user message as fresh input
+    if (msg.startsWith("resend:")) {
+      const text = msg.slice(7);
+      if (!text) { console.log("[resend] Empty text, ignoring"); return; }
+      console.log(`[resend] Resending user message: "${text.slice(0, 60)}"`);
+      if ((ws as any)._isTestMode) {
+        // Test mode: create entry but do NOT forward to terminal
+        console.log(`[resend] Test mode resend (not sent to Claude): "${text.slice(0, 60)}"`);
+        const testEntry = addUserEntry(text, false, "user-resend-testmode");
+        if (testEntry.id > 0) (ws as any)._testEntryIds?.add(testEntry.id);
+      } else if (streamState === "IDLE" || streamState === "DONE") {
+        startTmuxStreaming(text);
+        addUserEntry(text, false, "user-resend");
+        terminal.sendText(text);
+        queueFillerAudio(text);
+      } else {
+        // Claude is active — queue
+        const queuedEntry = addUserEntry(text, true, "user-resend-queue");
+        pendingVoiceInput.push({ text, entryId: queuedEntry.id, target: terminal.currentTarget ?? "" });
+        console.log(`[resend] Queued (state=${streamState}): ${pendingVoiceInput.length} pending`);
+        broadcast({ type: "voice_queue", count: pendingVoiceInput.length });
+      }
+      return;
+    }
+
     // Replay: replay specific entry by ID, or last spoken speakable entry
     if (msg === "replay" || msg === "replay:all" || msg.startsWith("replay:")) {
       // replay:all — replay every speakable assistant entry since the last user message
@@ -3919,7 +4385,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           stopClientPlayback2("user_stop");
           broadcast({ type: "voice_status", state: "speaking" });
           for (const e of toReplay) {
-            queueTts(e.id, e.text);
+            queueTts(e.id, e.text, "replay");
           }
         } else {
           console.log("[replay:all] Nothing to replay");
@@ -3955,7 +4421,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         console.log(`[replay] Speaking (${replayText.length} chars): "${replayText.slice(0, 80)}..."`);
         stopClientPlayback2("user_stop");
         broadcast({ type: "voice_status", state: "speaking" });
-        queueTts(replayEntryId, replayText);
+        queueTts(replayEntryId, replayText, "replay");
       } else {
         console.log("[replay] No text to replay");
       }
@@ -4021,7 +4487,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           startTmuxStreaming(text);
           addUserEntry(text, false, "text-direct");
           terminal.sendText(text);
-          queueFillerAudio();
+          queueFillerAudio(text);
         } else {
           // Claude is active — queue typed text same as voice
           const queuedEntry = addUserEntry(text, true, "text-queue");
@@ -4476,6 +4942,14 @@ app.get("/debug/entry-log", (_req, res) => {
   res.json(_entryLog);
 });
 
+app.get("/debug/parse-log", (_req, res) => {
+  res.json({
+    raw: { snapshot: _parseRawSnapshot, ts: _parseRawSnapshotTs },
+    discards: _parseDiscards,
+    paragraphs: _parseParagraphs,
+  });
+});
+
 app.get("/debug/kokoro-log", (_req, res) => {
   res.json(_kokoroLog);
 });
@@ -4517,6 +4991,25 @@ app.get("/debug/input-log", (_req, res) => {
 
 app.get("/debug/whisper-log", (_req, res) => {
   res.json(_whisperLog);
+});
+
+app.get("/debug/mic-persistence", (_req, res) => {
+  // Analyze gaps in audio chunk arrivals
+  const chunks = _micPersistenceLog.filter(e => e.type === "audio_chunk");
+  const visEvents = _micPersistenceLog.filter(e => e.type === "visibility");
+  const gaps: Array<{ afterTs: number; gapMs: number }> = [];
+  for (let i = 1; i < chunks.length; i++) {
+    const gap = chunks[i].ts - chunks[i - 1].ts;
+    if (gap > 2000) gaps.push({ afterTs: chunks[i - 1].ts, gapMs: gap });
+  }
+  res.json({
+    active: _micPersistenceActive,
+    totalEntries: _micPersistenceLog.length,
+    audioChunks: chunks.length,
+    visibilityChanges: visEvents,
+    largeGaps: gaps,
+    log: _micPersistenceLog,
+  });
 });
 
 app.get("/debug/log/stream", (_req, res) => {
@@ -4657,6 +5150,7 @@ server.listen(PORT, "0.0.0.0", () => {
   } catch {}
   startPassiveWatcher();
   console.log(`  Passive pane watcher: active (2s poll)`);
+  setInterval(sweepStaleTtsJobs, 15000); // Periodic sweep for stuck TTS jobs
 });
 
 // HTTPS server for remote access (Tailscale) — needed for mic permission on non-localhost

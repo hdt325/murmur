@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
   <meta name="theme-color" content="#1a1a1e">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -722,6 +722,7 @@
     body.flow-mode .msg .role,
     body.flow-mode .msg .time,
     body.flow-mode .msg-replay,
+    body.flow-mode .msg-resend,
     body.flow-mode .entry-queued-icon {
       display: none;
     }
@@ -890,6 +891,7 @@
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       transition: background 0.2s, color 0.2s;
+      touch-action: manipulation;
     }
 
     body.flow-mode .flow-gear-btn:hover,
@@ -936,6 +938,7 @@
       backdrop-filter: blur(8px);
       -webkit-backdrop-filter: blur(8px);
       transition: background 0.2s, color 0.2s;
+      touch-action: manipulation;
     }
 
     body.flow-mode .flow-mute-btn:hover {
@@ -1324,7 +1327,7 @@
       max-width: 100%;
     }
 
-    .msg-replay {
+    .msg-replay, .msg-resend {
       position: absolute;
       top: 4px;
       right: 4px;
@@ -1337,13 +1340,19 @@
       cursor: pointer;
       opacity: 0;
       transition: opacity 0.2s;
+      touch-action: manipulation;
     }
 
-    .msg-wrap:hover .msg-replay {
+    .msg-resend {
+      right: auto;
+      left: 4px;
+    }
+
+    .msg-wrap:hover .msg-replay, .msg-wrap:hover .msg-resend {
       opacity: 0.7;
     }
 
-    .msg-replay:hover {
+    .msg-replay:hover, .msg-resend:hover {
       opacity: 1 !important;
       color: #e8636b;
       border-color: #e8636b88;
@@ -1472,6 +1481,7 @@
       justify-content: center;
       gap: 6px;
       height: 52px;
+      touch-action: manipulation; /* Disable iOS double-tap zoom on mic button */
       position: relative;
       overflow: hidden;
     }
@@ -1760,6 +1770,7 @@
       width: 28px;
       height: 28px;
       flex-shrink: 0;
+      touch-action: manipulation; /* Disable iOS double-tap zoom */
     }
 
     .controls button:hover {
@@ -1937,6 +1948,7 @@
       cursor: pointer;
       font-weight: 600;
       flex-shrink: 0;
+      touch-action: manipulation;
     }
 
     .input-bar button:hover {
@@ -3283,9 +3295,9 @@
       window.scrollTo(0, window.scrollY + delta);
     }
 
-    // Event delegation for transcript — handles click-to-copy and replay for all bubbles
+    // Event delegation for transcript — handles click-to-copy, replay, and resend for all bubbles
     transcript.addEventListener("click", (e) => {
-      // Replay button click
+      // Replay button click (assistant bubbles)
       const replayBtn = e.target.closest(".msg-replay");
       if (replayBtn) {
         e.stopPropagation();
@@ -3293,7 +3305,31 @@
         const bubble = wrap?.querySelector(".msg");
         if (bubble?.dataset.replayPayload && ws?.readyState === WebSocket.OPEN) {
           _replayTargetBubble = bubble;
-          ws.send("replay:" + bubble.dataset.replayPayload);
+          const payload = bubble.dataset.replayPayload;
+          console.log(`[replay] Bubble replay clicked, payload=${payload}, ws=${ws.readyState}`);
+          ws.send("replay:" + payload);
+          rlog("[replay] Bubble replay: " + payload);
+        } else {
+          console.warn("[replay] Bubble replay failed — no payload or ws not open");
+        }
+        return;
+      }
+      // Resend button click (user bubbles)
+      const resendBtn = e.target.closest(".msg-resend");
+      if (resendBtn) {
+        e.stopPropagation();
+        const wrap = resendBtn.closest(".msg-wrap");
+        const bubble = wrap?.querySelector(".msg");
+        if (bubble?.dataset.resendPayload && ws?.readyState === WebSocket.OPEN) {
+          const text = bubble.dataset.resendPayload;
+          console.log(`[resend] Resending user message: "${text.slice(0, 60)}"`);
+          ws.send("resend:" + text);
+          rlog("[resend] User resend: " + text.slice(0, 60));
+          // Brief visual feedback
+          resendBtn.textContent = "✓";
+          setTimeout(() => { resendBtn.textContent = "\u21ba"; }, 600);
+        } else {
+          console.warn("[resend] Resend failed — no payload or ws not open");
         }
         return;
       }
@@ -4606,6 +4642,10 @@
             el.classList.remove("bubble-active");
             el.classList.add("bubble-spoken");
           });
+          // Turn transition: play a brief descending tone to signal "moving on to new content"
+          if (msg.reason === "turn_transition") {
+            _playTurnTransitionTone();
+          }
         }
 
         if (msg.type === "restarting") {
@@ -4691,22 +4731,28 @@
         div.innerHTML = metaHtml + escapeHtml(para);
         div.dataset.copyText = para;
 
-        if (role === "assistant") {
-          div.dataset.replayPayload = para;
+        {
           const wrap = document.createElement("div");
           wrap.className = "msg-wrap";
-          const replayBtn = document.createElement("button");
-          replayBtn.className = "msg-replay";
-          replayBtn.textContent = "↻";
           wrap.appendChild(div);
-          wrap.appendChild(replayBtn);
-          transcript.appendChild(wrap);
-          // Track new assistant bubbles arriving during TTS so advanceBubbleHighlight can reach them
-          if (talkBtn.classList.contains("speaking")) {
-            activeSpeakBubbles.push(div);
+          if (role === "assistant") {
+            div.dataset.replayPayload = para;
+            const replayBtn = document.createElement("button");
+            replayBtn.className = "msg-replay";
+            replayBtn.textContent = "↻";
+            wrap.appendChild(replayBtn);
+            // Track new assistant bubbles arriving during TTS so advanceBubbleHighlight can reach them
+            if (talkBtn.classList.contains("speaking")) {
+              activeSpeakBubbles.push(div);
+            }
+          } else {
+            div.dataset.resendPayload = para;
+            const resendBtn = document.createElement("button");
+            resendBtn.className = "msg-resend";
+            resendBtn.textContent = "\u21ba";
+            wrap.appendChild(resendBtn);
           }
-        } else {
-          transcript.appendChild(div);
+          transcript.appendChild(wrap);
         }
       });
 
@@ -4903,19 +4949,23 @@
             `<span class="entry-text">${entryTextToHtml(entry.text)}</span>`;
           div.dataset.copyText = entry.text;
 
+          const wrap = document.createElement("div");
+          wrap.className = "msg-wrap";
+          wrap.appendChild(div);
           if (entry.role === "assistant") {
             div.dataset.replayPayload = String(entry.id);
-            const wrap = document.createElement("div");
-            wrap.className = "msg-wrap";
             const replayBtn = document.createElement("button");
             replayBtn.className = "msg-replay";
             replayBtn.textContent = "\u21bb";
-            wrap.appendChild(div);
             wrap.appendChild(replayBtn);
-            transcript.appendChild(wrap);
           } else {
-            transcript.appendChild(div);
+            div.dataset.resendPayload = entry.text;
+            const resendBtn = document.createElement("button");
+            resendBtn.className = "msg-resend";
+            resendBtn.textContent = "\u21ba"; // ↺ resend icon
+            wrap.appendChild(resendBtn);
           }
+          transcript.appendChild(wrap);
         }
 
         // Apply speakable/non-speakable class (only assistant entries — user entries always visible)
@@ -6056,6 +6106,8 @@
 
     function applyIdleState() {
       pendingIdle = false;
+      // Stop iOS background keepalive when going fully idle
+      if (!ttsPlaying) _bgAudioPause();
       // Don't override recording/transcribing state with idle
       if (isRecording || talkBtn.classList.contains("recording") || talkBtn.classList.contains("transcribing")) {
         rlog(`[voice_status] idle SKIPPED — isRecording=${isRecording} btnClass=${talkBtn.className}`);
@@ -6522,6 +6574,8 @@
     }
 
     function playTtsAudio(blob) {
+      // iOS background keepalive: start silent loop when TTS begins playing
+      _bgAudioPlay();
       // In text-out mode, skip TTS playback entirely
       if (ttsMuted) {
         rlog(`[tts] Skipping TTS (${blob.size} bytes) — text-out mode`);
@@ -6859,6 +6913,8 @@
       ttsPlaying = false;
       ttsEndedAt = Date.now();
       _msUpdate(false);
+      _bgAudioPause(); // Stop iOS background keepalive when TTS idle
+      if (document.hidden) _stopAudioKeepAlive(); // Also stop oscillator keepalive
       if (sendDone && wasPlaying) _sendTtsDone();
     }
 
@@ -6891,19 +6947,65 @@
     }
 
     function _startBgAudioSession() {
-      if (_bgAudioStarted) return;
-      _bgAudioStarted = true;
+      // Build the silent audio element once (must happen from user gesture context)
+      if (!_bgAudio) {
+        try {
+          _bgAudio = new Audio(_buildSilentWavUrl());
+          _bgAudio.loop = true;
+          _bgAudio.volume = 0.001; // -60 dB: inaudible, but non-zero so iOS keeps session alive
+          _bgAudioStarted = true;
+          console.log("[bg-audio] iOS background audio element created (paused until TTS plays)");
+        } catch (e) { console.warn("[bg-audio] Could not create background audio:", e.message); }
+      }
+    }
+    /** Start silent loop when TTS begins — keeps iOS audio session alive during background */
+    function _bgAudioPlay() {
+      if (!_bgAudio || !_bgAudio.paused) return;
+      _bgAudio.play().catch(() => {});
+    }
+    /** Pause silent loop when TTS goes idle — don't drain battery */
+    function _bgAudioPause() {
+      if (!_bgAudio || _bgAudio.paused) return;
+      _bgAudio.pause();
+    }
+
+    // Turn transition tone — brief descending two-note signal meaning "moving on to new content"
+    // Uses Web Audio API oscillator on the existing ttsAudioCtx. ~200ms total.
+    function _playTurnTransitionTone() {
       try {
-        _bgAudio = new Audio(_buildSilentWavUrl());
-        _bgAudio.loop = true;
-        _bgAudio.volume = 0.001; // -60 dB: inaudible, but non-zero so iOS keeps session alive
-        _bgAudio.play().then(() => {
-          console.log("[bg-audio] iOS background audio session active");
-        }).catch(e => {
-          console.warn("[bg-audio] Could not start background session:", e.message);
-          _bgAudioStarted = false;
-        });
-      } catch (e) { _bgAudioStarted = false; }
+        const ctx = ttsAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        if (!ttsAudioCtx) ttsAudioCtx = ctx;
+        if (ctx.state === "suspended") ctx.resume();
+
+        const now = ctx.currentTime;
+        const gain = ctx.createGain();
+        gain.connect(ctx.destination);
+        // Gentle volume — audible but not jarring
+        gain.gain.setValueAtTime(0.12, now);
+        gain.gain.linearRampToValueAtTime(0.12, now + 0.08);
+        gain.gain.linearRampToValueAtTime(0.08, now + 0.12);
+        gain.gain.linearRampToValueAtTime(0, now + 0.22);
+
+        // Note 1: higher pitch (E5 = 659 Hz), 100ms
+        const osc1 = ctx.createOscillator();
+        osc1.type = "sine";
+        osc1.frequency.setValueAtTime(659, now);
+        osc1.connect(gain);
+        osc1.start(now);
+        osc1.stop(now + 0.1);
+
+        // Note 2: lower pitch (C5 = 523 Hz), 100ms — descending interval
+        const osc2 = ctx.createOscillator();
+        osc2.type = "sine";
+        osc2.frequency.setValueAtTime(523, now + 0.1);
+        osc2.connect(gain);
+        osc2.start(now + 0.1);
+        osc2.stop(now + 0.22);
+
+        console.log("[tone] Turn transition tone played");
+      } catch (e) {
+        console.warn("[tone] Failed to play transition tone:", e);
+      }
     }
 
     // MediaSession: tells iOS lock screen to show "Murmur" instead of generic controls
@@ -6932,7 +7034,8 @@
     }
 
     // Talk button click
-    talkBtn.addEventListener("click", () => {
+    talkBtn.addEventListener("click", (e) => {
+      e.preventDefault(); // Suppress iOS double-tap zoom on mic button
       // Flow choice confirm: mic button acts as submit when a choice is selected
       if (window._flowChoiceSelected && talkBtn.classList.contains("flow-confirm")) {
         const num = window._flowChoiceSelected;
@@ -7160,10 +7263,11 @@
     try { connect(); } catch (e) { console.warn("[ws] connect() error:", e); }
 
     // =============================================
-    // Background keep-alive: prevent Chromium from suspending AudioContext
-    // when the window goes behind other apps (Electron on macOS).
-    // A zero-gain oscillator tricks the context into thinking audio is active.
+    // Background keep-alive: prevent iOS/Chromium from suspending AudioContext.
+    // Only active during TTS playback — don't drain battery when idle.
+    // Uses a near-silent oscillator to keep the audio session alive.
     let _bgKeepAliveOsc = null;
+    let _bgKeepAliveGain = null;
     function _startAudioKeepAlive() {
       if (!ttsAudioCtx || _bgKeepAliveOsc) return;
       try {
@@ -7174,12 +7278,17 @@
         gain.connect(ttsAudioCtx.destination);
         osc.start();
         _bgKeepAliveOsc = osc;
+        _bgKeepAliveGain = gain;
         console.log("[bg] AudioContext keep-alive started");
       } catch (e) { console.warn("[bg] keep-alive error:", e); }
     }
     function _stopAudioKeepAlive() {
       if (!_bgKeepAliveOsc) return;
       try { _bgKeepAliveOsc.stop(); } catch { }
+      if (_bgKeepAliveGain) {
+        try { _bgKeepAliveGain.disconnect(); } catch { }
+        _bgKeepAliveGain = null;
+      }
       _bgKeepAliveOsc = null;
       console.log("[bg] AudioContext keep-alive stopped");
     }
@@ -7199,21 +7308,38 @@
     // App-switch visibility handler
     // =============================================
     let _micStoppedForBg = false; // Track whether we stopped mic on background
+    let _wasRecordingBeforeBg = false; // Track mic recording state for clean resume
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
-        // Going to background: stop mic so iOS mic indicator clears
-        _startAudioKeepAlive();
-        if (micStream && !isRecording) {
-          console.log("[visibility] Stopping mic for background");
-          micStream.getTracks().forEach(t => t.stop());
-          micStream = null;
-          micAnalyser = null;
-          micDataArray = null;
-          _micStoppedForBg = true;
+        // Going to background: only keep audio alive if TTS is actively playing
+        if (ttsPlaying) {
+          _startAudioKeepAlive();
+          // Ensure AudioContext stays running for iOS background audio
+          if (ttsAudioCtx && ttsAudioCtx.state === "suspended") {
+            ttsAudioCtx.resume().catch(() => {});
+          }
+          console.log("[visibility] Background with TTS active — keep-alive enabled");
+        }
+        // Stop mic so iOS mic indicator clears (mic can't work in background anyway)
+        if (micStream) {
+          _wasRecordingBeforeBg = isRecording;
+          if (!isRecording) {
+            console.log("[visibility] Stopping mic for background");
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+            micAnalyser = null;
+            micDataArray = null;
+            _micStoppedForBg = true;
+          }
         }
         return;
       }
       // Coming back to foreground
+      console.log("[visibility] Returning to foreground" + (ttsPlaying ? " (TTS active)" : ""));
+
+      // Stop keep-alive if TTS finished while in background
+      if (!ttsPlaying) _stopAudioKeepAlive();
+
       // Only re-init mic if we stopped it — avoids repeated getUserMedia calls/prompts
       if (_micStoppedForBg) {
         _micStoppedForBg = false;
@@ -7231,6 +7357,65 @@
         try { connect(); } catch (e) { console.warn("[ws] reconnect error:", e); }
       }
     });
+
+    // =============================================
+    // Mic Persistence Test (?mictest=1)
+    // =============================================
+    // Investigative: tests whether AirPods mic input survives iOS backgrounding.
+    // Logs RMS levels every 500ms to server's /debug/mic-persistence endpoint.
+    // Usage: open with ?mictest=1, start recording, background the app, check endpoint.
+    if (new URLSearchParams(location.search).has("mictest")) {
+      let _micTestInterval = null;
+      let _micTestRunning = false;
+
+      function startMicTest() {
+        if (_micTestRunning) return;
+        _micTestRunning = true;
+        if (ws?.readyState === WebSocket.OPEN) ws.send("mictest:start");
+        console.log("[mictest] Started — recording RMS every 500ms");
+
+        _micTestInterval = setInterval(() => {
+          // Compute RMS from mic analyser
+          let rms = 0;
+          if (micAnalyser && micDataArray) {
+            micAnalyser.getFloatTimeDomainData(micDataArray);
+            let sum = 0;
+            for (let i = 0; i < micDataArray.length; i++) sum += micDataArray[i] * micDataArray[i];
+            rms = Math.sqrt(sum / micDataArray.length);
+          }
+          if (ws?.readyState === WebSocket.OPEN) ws.send("mictest:rms:" + rms.toFixed(6));
+          console.log(`[mictest] RMS: ${rms.toFixed(4)} | vis: ${document.hidden ? "hidden" : "visible"}`);
+        }, 500);
+      }
+
+      function stopMicTest() {
+        _micTestRunning = false;
+        if (_micTestInterval) { clearInterval(_micTestInterval); _micTestInterval = null; }
+        if (ws?.readyState === WebSocket.OPEN) ws.send("mictest:stop");
+        console.log("[mictest] Stopped");
+      }
+
+      // Hook into visibility changes for mic test
+      document.addEventListener("visibilitychange", () => {
+        if (_micTestRunning && ws?.readyState === WebSocket.OPEN) {
+          ws.send("mictest:vis:" + (document.hidden ? "hidden" : "visible"));
+        }
+      });
+
+      // Auto-start mic test when recording starts (if ?mictest=1)
+      const _origStartRec = window.startRecording || startRecording;
+      const _origStopRec = window.stopRecording || stopRecording;
+      // Expose start/stop controls via console for manual use
+      window._micTestStart = startMicTest;
+      window._micTestStop = stopMicTest;
+
+      // Add a visible indicator
+      const micTestBanner = document.createElement("div");
+      micTestBanner.style.cssText = "position:fixed;top:0;left:0;right:0;background:#e74c3c;color:#fff;text-align:center;padding:4px;font-size:11px;z-index:9999;";
+      micTestBanner.innerHTML = 'MIC TEST MODE — <button onclick="window._micTestStart()" style="color:#fff;background:#333;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;">Start</button> <button onclick="window._micTestStop()" style="color:#fff;background:#333;border:none;padding:2px 8px;border-radius:3px;cursor:pointer;">Stop</button> — Check /debug/mic-persistence';
+      document.body.appendChild(micTestBanner);
+      console.log("[mictest] Mic persistence test mode enabled. Use Start/Stop buttons or window._micTestStart()/_micTestStop()");
+    }
 
     // =============================================
     // Terminal Panel
@@ -7254,16 +7439,22 @@
 
     // Replay button
     document.getElementById("replayBtn").addEventListener("click", () => {
+      console.log("[replay] Replay Last clicked, ws state:", ws?.readyState);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send("replay");
         rlog("[replay] Requested replay of last response");
+      } else {
+        console.warn("[replay] Cannot replay — WebSocket not open");
       }
     });
 
     document.getElementById("replayAllBtn").addEventListener("click", () => {
+      console.log("[replay] Replay All clicked, ws state:", ws?.readyState);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send("replay:all");
         rlog("[replay] Requested replay of all since last message");
+      } else {
+        console.warn("[replay] Cannot replay:all — WebSocket not open");
       }
     });
 

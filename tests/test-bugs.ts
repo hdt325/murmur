@@ -2119,6 +2119,66 @@ async function main() {
   await testFlowButton_visibleBothModes();
   await testFlowButton_gearOverlayNotBlocked();
 
+  // Contextual filler audio
+  await testFillerAudio_contextualPhrases();
+
+  // Entry dedup + cap bugs
+  await testEntryBugs_dedupAndCap();
+
+  // REQUEUE-WARN: TTS dedup logging
+  await testRequeueWarn_ttsDedupLogging();
+
+  // CAP-OVERFLOW: Entry cap on every cycle
+  await testCapOverflow_trimOnEveryCycle();
+
+  // Status line filter
+  await testStatusLineFilter();
+
+  // Triplicate user entry guard
+  await testTriplicateUserEntry_passiveGuard();
+
+  // Debug parse-log endpoint
+  await testDebugParseLog();
+
+  // TTS sentence-accumulation chunking
+  await testTtsChunking_sentenceAccumulation();
+
+  // File path filter narrowing
+  await testFilePathFilter_proseNotBlocked();
+
+  // BUG-A: positional shift fix
+  await testBugA_textSimilarityMatching();
+
+  // TASK-21: iOS background audio keepalive
+  await testTask21_iOSBackgroundAudio();
+
+  // TTS gen bump preservation
+  await testTtsGenBump_preserveQueue();
+
+  // Replay testmode fix
+  await testReplayTestmodeFix();
+
+  // Tool output filter
+  await testToolOutputFilter();
+
+  // Mic persistence test infrastructure
+  await testMicPersistenceEndpoint();
+
+  // iOS double-tap zoom fix
+  await testDoubleTapZoomFix();
+
+  // Filler phrases as conversation entries
+  await testFillerPhraseEntries();
+
+  // Resend button on user bubbles
+  await testResendButton();
+
+  // Replay button audit
+  await testReplayAudit();
+
+  // TTS stall — orphaned playing jobs
+  await testTtsStallRecovery();
+
   await teardown();
 }
 
@@ -2552,6 +2612,818 @@ async function testFlowButton_gearOverlayNotBlocked() {
   await page.evaluate(() => localStorage.setItem("murmur-flow-mode", "0"));
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForTimeout(300);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Contextual filler audio: pickFillerPhrase matches input patterns
+// ──────────────────────────────────────────────────────────────
+async function testFillerAudio_contextualPhrases() {
+  console.log("\n[FILLER] Contextual filler phrase selection");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // pickFillerPhrase function exists
+  const hasFn = /function pickFillerPhrase\(/.test(src);
+  report("pickFillerPhrase function exists", hasFn);
+
+  // Has pattern categories (at least 5)
+  const catCount = (src.match(/patterns:\s*\[/g) || []).length;
+  report(
+    "At least 5 filler pattern categories defined",
+    catCount >= 5,
+    `categories=${catCount}`
+  );
+
+  // Has recent-phrase dedup tracking
+  const hasDedup = /_recentFillers/.test(src);
+  report("Recent filler phrase dedup tracking exists", hasDedup);
+
+  // queueFillerAudio accepts userText parameter
+  const hasParam = /function queueFillerAudio\(userText/.test(src);
+  report("queueFillerAudio accepts userText parameter", hasParam);
+
+  // Call sites pass text to queueFillerAudio
+  const callSites = (src.match(/queueFillerAudio\(text\)/g) || []).length;
+  report(
+    "All filler call sites pass user text",
+    callSites >= 3,
+    `callSites=${callSites}`
+  );
+
+  // Has question pattern (? or who/what/how)
+  const hasQuestion = /patterns:.*\\\?/.test(src) || /who\|what\|where/.test(src);
+  report("Question pattern category exists", hasQuestion);
+
+  // Has greeting pattern
+  const hasGreeting = /hi\|hello\|hey/.test(src);
+  report("Greeting pattern category exists", hasGreeting);
+
+  // Default fallback phrases exist
+  const hasDefault = /FILLER_DEFAULT_PHRASES/.test(src);
+  report("Default fallback phrase pool exists", hasDefault);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Entry dedup across generation bumps (Bug 1) + entry cap safety (Bug 2)
+// ──────────────────────────────────────────────────────────────
+async function testEntryBugs_dedupAndCap() {
+  console.log("\n[ENTRY-BUGS] Cross-turn dedup + entry cap safety");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Bug 1: Dedup should check recent entries across turns, not just currentTurn
+  const hasRecentSlice = /recentEntries\s*=\s*conversationEntries\.slice\(-20\)/.test(src);
+  report("Dedup checks last 20 entries (not just currentTurn)", hasRecentSlice);
+
+  // Bug 1: Dedup should allow repeats for distant turns (>2 apart)
+  const hasDistanceCheck = /currentTurn\s*-\s*e\.turn\s*<=\s*2/.test(src);
+  report("Dedup allows repeats for distant turns (>2 apart)", hasDistanceCheck);
+
+  // Bug 1: Both dedup sites use the new cross-turn logic
+  const dedupSites = (src.match(/recentEntries\.some/g) || []).length;
+  report("Both dedup sites use cross-turn check", dedupSites >= 2, `sites=${dedupSites}`);
+
+  // Bug 2: Entry cap uses splice instead of array reassignment
+  const hasSplice = /conversationEntries\.splice\(0,\s*trimCount\)/.test(src);
+  report("Entry cap uses splice (not reassignment)", hasSplice);
+
+  // Bug 2: Entry cap has safety check (trimCount < length)
+  const hasSafety = /trimCount\s*<\s*conversationEntries\.length/.test(src);
+  report("Entry cap has safety guard against emptying array", hasSafety);
+
+  // Bug 2: Entry cap logs trimming
+  const hasLog = /Trimmed.*old entries/.test(src);
+  report("Entry cap logs when trimming occurs", hasLog);
+
+  // WS runtime test: verify cross-turn dedup works
+  // Verify no array reassignment in entry cap (the root cause of Bug 2)
+  const capSection = src.slice(src.indexOf("Cap at ~200 entries"), src.indexOf("Cap at ~200 entries") + 500);
+  const noReassign = !capSection.includes("conversationEntries = conversationEntries.filter");
+  report("Entry cap does NOT use array reassignment", noReassign);
+}
+
+// ──────────────────────────────────────────────────────────────
+// REQUEUE-WARN: queueTts dedup prevents redundant ttslog entries
+// ──────────────────────────────────────────────────────────────
+async function testRequeueWarn_ttsDedupLogging() {
+  console.log("\n[REQUEUE-WARN] TTS queue dedup prevents redundant history entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // queueTts accepts a source parameter
+  const hasSource = /function queueTts\(entryId.*source\s*=/.test(src);
+  report("queueTts accepts source parameter", hasSource);
+
+  // Speculative path does NOT call ttslog externally (only queueTts logs)
+  const specSection = src.slice(
+    src.indexOf("Speculative TTS: during streaming"),
+    src.indexOf("Speculative TTS: during streaming") + 500
+  );
+  const noExternalTtslog = !specSection.includes("ttslog(lastEntry.id");
+  report("Speculative path does not call ttslog externally", noExternalTtslog);
+
+  // Speculative path passes source to queueTts
+  const passesSource = /queueTts\(lastEntry\.id,\s*lastEntry\.text,\s*"speculative"\)/.test(src);
+  report("Speculative path passes 'speculative' source to queueTts", passesSource);
+
+  // ttslog inside queueTts uses the source parameter (not hardcoded "queueTts")
+  const usesSource = /ttslog\(entryId,\s*text,\s*ttsGeneration,\s*source[,)]/.test(src);
+  report("ttslog inside queueTts uses source parameter", usesSource);
+
+  // Text-growth update path logs with _update suffix
+  const hasUpdateLog = /ttslog\(entryId.*source.*_update/.test(src) ||
+    /`\$\{source\}_update`/.test(src);
+  report("Text-growth update logs with _update suffix", hasUpdateLog);
+
+  // queueTts dedup still skips duplicates (unchanged text)
+  const hasSkipLog = /Skipping duplicate queue for entry/.test(src);
+  report("queueTts still logs skip for unchanged duplicates", hasSkipLog);
+}
+
+// ──────────────────────────────────────────────────────────────
+// CAP-OVERFLOW: Entry cap must run on every broadcastCurrentOutput cycle
+// ──────────────────────────────────────────────────────────────
+async function testCapOverflow_trimOnEveryCycle() {
+  console.log("\n[CAP-OVERFLOW] Entry cap runs on every broadcast cycle");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // trimEntriesToCap is a standalone function
+  const hasFn = /function trimEntriesToCap\(\)/.test(src);
+  report("trimEntriesToCap is a standalone function", hasFn);
+
+  // Called in broadcastCurrentOutput
+  const bcoStart = src.indexOf("function broadcastCurrentOutput()");
+  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoBody = src.slice(bcoStart, bcoEnd);
+  const inBCO = bcoBody.includes("trimEntriesToCap()");
+  report("trimEntriesToCap called in broadcastCurrentOutput", inBCO);
+
+  // Called in handleStreamDone
+  const hsdStart = src.indexOf("function handleStreamDone()");
+  const hsdEnd = src.indexOf("function startReEngageWatcher()");
+  const hsdBody = src.slice(hsdStart, hsdEnd);
+  const inHSD = hsdBody.includes("trimEntriesToCap()");
+  report("trimEntriesToCap called in handleStreamDone", inHSD);
+
+  // Called in startTmuxStreaming
+  const stsStart = src.indexOf("function startTmuxStreaming(");
+  const stsEnd = src.indexOf("preInputSnapshot = captureTmuxPane()");
+  const stsBody = src.slice(stsStart, stsEnd);
+  const inSTS = stsBody.includes("trimEntriesToCap()");
+  report("trimEntriesToCap called in startTmuxStreaming", inSTS);
+
+  // trimEntriesToCap uses splice (not reassignment)
+  const fnStart = src.indexOf("function trimEntriesToCap()");
+  const fnBody = src.slice(fnStart, fnStart + 800);
+  const usesSplice = fnBody.includes(".splice(0, trimCount)");
+  report("trimEntriesToCap uses splice for trimming", usesSplice);
+
+  // Has safety guard
+  const hasSafety = fnBody.includes("trimCount < conversationEntries.length");
+  report("trimEntriesToCap has safety guard against emptying", hasSafety);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Claude Code status lines filtered from extractStructuredOutput
+// ──────────────────────────────────────────────────────────────
+async function testStatusLineFilter() {
+  console.log("\n[STATUS-FILTER] Claude Code status lines filtered from entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Filter pattern exists for spinner chars (these only appear in Claude Code status lines)
+  const hasPattern = /\[✻✶✢✽\]/.test(src);
+  report("Status line filter pattern exists (spinner char prefix)", hasPattern);
+
+  // Pattern is in the skip section (uses continue), not just non-speakable
+  const filterSection = src.slice(
+    src.indexOf("Shared chrome filters"),
+    src.indexOf("Non-speakable filters")
+  );
+  const isSkipFilter = filterSection.includes("[✻✶✢✽]");
+  report("Status lines are skip-filtered (not just non-speakable)", isSkipFilter);
+
+  // Simple pattern: starts with spinner char — no verb/timing checks needed
+  const hasSimplePattern = /\^\[✻✶✢✽\]/.test(src);
+  report("Pattern uses simple spinner-char-at-start check", hasSimplePattern);
+
+  // Verify the filter matches known status lines
+  const matchFn = (t: string) => /^[✻✶✢✽]/.test(t);
+  report("Filter matches '✻ Baked for 1m 20s · ...'", matchFn("✻ Baked for 1m 20s · 4 background tasks still running"));
+  report("Filter matches '✶ Cogitating for 5s'", matchFn("✶ Cogitating for 5s"));
+  report("Filter matches '✻ Crunched for 35s · ...'", matchFn("✻ Crunched for 35s · 5 background tasks still running"));
+
+  // Ensure real prose is NOT filtered (the critical regression check)
+  report("Regular prose NOT filtered", !matchFn("Here is the answer to your question."));
+  report("'· item 3s delay' NOT filtered", !matchFn("· The item has a 3s delay before appearing"));
+  report("Prose with timing NOT filtered", !matchFn("I completed the task in about 5m and 30s of work."));
+}
+
+// ──────────────────────────────────────────────────────────────
+// Triplicate user entry: passive watcher re-detection guard
+// ──────────────────────────────────────────────────────────────
+async function testTriplicateUserEntry_passiveGuard() {
+  console.log("\n[TRIPLICATE] Passive watcher user input re-detection guard");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Passive watcher tracks last processed user input
+  const hasTracking = /_lastPassiveUserInput/.test(src);
+  report("Passive watcher tracks last processed user input", hasTracking);
+
+  // Has timestamp tracking for the guard
+  const hasTs = /_lastPassiveUserInputTs/.test(src);
+  report("Passive watcher tracks input timestamp", hasTs);
+
+  // Guard exists in passive watcher section (between "Spinner detected" and "Start streaming")
+  const passiveSection = src.slice(
+    src.indexOf("Spinner detected — native CLI input"),
+    src.indexOf("Start streaming just like a Murmur-initiated input")
+  );
+  const hasGuard = passiveSection.includes("_lastPassiveUserInput") &&
+    passiveSection.includes("Skipping already-processed input");
+  report("Passive watcher has re-detection guard before streaming", hasGuard);
+
+  // Guard uses space-stripped normalization (handles tmux wrap differences)
+  const hasNorm = /normalizedPassive.*replace.*\\s\+/s.test(src) ||
+    /userInput.*trim\(\).*toLowerCase\(\).*replace\(\/\\s\+\/g/s.test(src);
+  report("Guard uses space-stripped normalization", hasNorm);
+
+  // Guard has 30s time window
+  const hasWindow = /30000/.test(passiveSection);
+  report("Guard has 30-second time window", hasWindow);
+
+  // addUserEntry still has its own dedup as defense-in-depth
+  const hasDedup = /DEDUP-TRACE.*DEDUP HIT/.test(src);
+  report("addUserEntry retains dedup as defense-in-depth", hasDedup);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Debug parse-log: 3-tier pipeline trace for content suppression diagnosis
+// ──────────────────────────────────────────────────────────────
+async function testDebugParseLog() {
+  console.log("\n[PARSE-LOG] 3-tier parse pipeline trace");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Tier 1: Raw snapshot capture
+  const hasRawSnapshot = /_parseRawSnapshot/.test(src) && /_parseRawSnapshotTs/.test(src);
+  report("Tier 1: Raw snapshot variables exist", hasRawSnapshot);
+
+  // Raw snapshot captured in extractStructuredOutput
+  const esoSection = src.slice(src.indexOf("function extractStructuredOutput"), src.indexOf("function extractStructuredOutput") + 500);
+  const capturesRaw = esoSection.includes("_parseRawSnapshot");
+  report("Tier 1: Raw snapshot captured in extractStructuredOutput", capturesRaw);
+
+  // Tier 2: Discards ring buffer (200 entries)
+  const hasDiscards = /_parseDiscards.*ParseDiscardEntry/.test(src) && /_parseDiscards\.length > 200/.test(src);
+  report("Tier 2: Discards ring buffer with 200 cap", hasDiscards);
+
+  // Tier 3: Paragraphs ring buffer (100 entries)
+  const hasParagraphs = /_parseParagraphs.*ParseParagraphEntry/.test(src) && /_parseParagraphs\.length > 100/.test(src);
+  report("Tier 3: Paragraphs ring buffer with 100 cap", hasParagraphs);
+
+  // parselog routes to correct tier
+  const routesSkip = /action === "skip"[\s\S]*?_parseDiscards\.push/.test(src);
+  report("parselog routes skip→discards, speakable/nonspeakable→paragraphs", routesSkip);
+
+  // Endpoint returns 3-tier object
+  const hasEndpoint = /debug\/parse-log/.test(src);
+  const parseLogSection = src.slice(src.indexOf('"/debug/parse-log"'), src.indexOf('"/debug/parse-log"') + 300);
+  const returns3Tier = parseLogSection.includes("_parseRawSnapshot") &&
+    parseLogSection.includes("_parseDiscards") &&
+    parseLogSection.includes("_parseParagraphs");
+  report("/debug/parse-log returns { raw, discards, paragraphs }", hasEndpoint && returns3Tier);
+
+  // parselog called with all 3 actions
+  const hasSkip = /parselog\(trimmed,\s*"skip"/.test(src);
+  const hasNs = /parselog\(trimmed,\s*"nonspeakable"/.test(src);
+  const hasSp = /parselog\(trimmed,\s*"speakable"/.test(src);
+  report("parselog called with skip, nonspeakable, and speakable actions", hasSkip && hasNs && hasSp);
+}
+
+// ──────────────────────────────────────────────────────────────
+// TTS chunking: sentence-accumulation splitting for better prosody
+// ──────────────────────────────────────────────────────────────
+async function testTtsChunking_sentenceAccumulation() {
+  console.log("\n[TTS-CHUNK] Sentence-accumulation TTS chunking");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // splitIntoChunks uses sentence splitting
+  const fnStart = src.indexOf("function splitIntoChunks(");
+  const fnBody = src.slice(fnStart, fnStart + 2000);
+  const hasSentenceSplit = /[.!?]/.test(fnBody) && /sentence/i.test(fnBody);
+  report("splitIntoChunks uses sentence boundary detection", hasSentenceSplit);
+
+  // First chunk max is 120 (was 100)
+  const hasFirstMax = /TTS_FIRST_CHUNK_MAX\s*=\s*120/.test(src);
+  report("TTS_FIRST_CHUNK_MAX = 120", hasFirstMax);
+
+  // Max chunk is 250 (was 200)
+  const hasMax = /TTS_CHUNK_MAX_CHARS\s*=\s*250/.test(src);
+  report("TTS_CHUNK_MAX_CHARS = 250", hasMax);
+
+  // Has sentence accumulation (grouping sentences into chunks)
+  const hasAccumulation = fnBody.includes("current.length") && fnBody.includes("trimmedSentence");
+  report("Sentence accumulation groups short sentences into chunks", hasAccumulation);
+
+  // Has fallback for long sentences (split at space)
+  const hasFallback = fnBody.includes("lastIndexOf") && /exceed/i.test(fnBody) || fnBody.includes("splitAt");
+  report("Falls back to space-split for long sentences", hasFallback);
+
+  // Verify firstChunkMax behavior preserved
+  const hasFirstChunkLogic = fnBody.includes("firstChunkMax") && fnBody.includes("chunks.length === 0");
+  report("First-chunk-smaller behavior preserved", hasFirstChunkLogic);
+
+  // Minimum chunk size constant exists
+  const hasMin = /TTS_CHUNK_MIN_CHARS\s*=\s*50/.test(src);
+  report("TTS_CHUNK_MIN_CHARS = 50 (minimum floor)", hasMin);
+
+  // Minimum enforced in flush logic
+  const hasMinCheck = fnBody.includes("TTS_CHUNK_MIN_CHARS");
+  report("Minimum chunk size enforced before flushing", hasMinCheck);
+}
+
+// ──────────────────────────────────────────────────────────────
+// File path filter: only standalone paths, not prose containing paths
+// ──────────────────────────────────────────────────────────────
+async function testFilePathFilter_proseNotBlocked() {
+  console.log("\n[PATH-FILTER] File path filter narrowed to standalone paths only");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Filter has word count guard
+  const hasWordGuard = /file_path.*split.*\\s\+.*length\s*<=\s*3/.test(src) ||
+    src.includes("split(/\\s+/).length <= 3") && src.includes("file_path");
+  report("File path filter has word count guard (≤3 words)", hasWordGuard);
+
+  // Verify standalone paths ARE caught
+  const pathRegex = /^\s*(\/[\w.~/-]+){2,}/;
+  const isStandalone = (t: string) => pathRegex.test(t) && t.length < 100 && t.split(/\s+/).length <= 3;
+  report("Standalone '/tmp/coder-bug.md' is non-speakable", isStandalone("/tmp/coder-bug.md"));
+  report("Standalone '/Users/me/project/src/file.ts' is non-speakable", isStandalone("/Users/me/project/src/file.ts"));
+
+  // Verify prose with paths is NOT caught
+  report("'I wrote the spec to /tmp/coder-bug.md.' passes filter", !isStandalone("I wrote the spec to /tmp/coder-bug.md."));
+  report("'Check /Users/me/project/src/file.ts for details' passes filter", !isStandalone("Check /Users/me/project/src/file.ts for details"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-A: Positional shift — text-similarity matching instead of index
+// ──────────────────────────────────────────────────────────────
+async function testBugA_textSimilarityMatching() {
+  console.log("\n[BUG-A] Text-similarity matching in broadcastCurrentOutput");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // broadcastCurrentOutput uses text-similarity matching
+  const bcoStart = src.indexOf("function broadcastCurrentOutput()");
+  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoBody = src.slice(bcoStart, bcoEnd);
+
+  // Has matchedEntryIds tracking set
+  const hasTracking = bcoBody.includes("matchedEntryIds") && bcoBody.includes("new Set<number>()");
+  report("Uses matchedEntryIds tracking set", hasTracking);
+
+  // Pass 1: exact text match
+  const hasExactMatch = bcoBody.includes("e.text === para.text");
+  report("Pass 1: exact text match", hasExactMatch);
+
+  // Pass 2: prefix-based similarity match
+  const hasPrefixMatch = bcoBody.includes("paraPrefix") || bcoBody.includes("slice(0, 30)");
+  report("Pass 2: prefix/growth similarity match", hasPrefixMatch);
+
+  // Pass 3: positional fallback only when NOT mid-stream
+  const hasPositionalGuard = /streamState !== "RESPONDING".*assistantEntries\[i\]/.test(bcoBody) ||
+    bcoBody.includes('streamState !== "RESPONDING"') && bcoBody.includes("assistantEntries[i]");
+  report("Pass 3: positional fallback only when not RESPONDING", hasPositionalGuard);
+
+  // No longer uses simple `i < assistantEntries.length` for positional matching
+  const noSimplePositional = !bcoBody.includes("if (i < assistantEntries.length) {");
+  report("No simple positional index matching", noSimplePositional);
+
+  // matchedEntryIds prevents double-matching
+  const preventsDouble = bcoBody.includes("matchedEntryIds.has(e.id)") && bcoBody.includes("matchedEntryIds.add(");
+  report("matchedEntryIds prevents double-matching entries", preventsDouble);
+
+  // Dedup still works for genuinely new paragraphs
+  const hasDedup = bcoBody.includes("isDup") && bcoBody.includes("recentEntries");
+  report("Cross-turn dedup preserved for new paragraphs", hasDedup);
+}
+
+// ──────────────────────────────────────────────────────────────
+// TASK-21: iOS background audio keepalive
+// ──────────────────────────────────────────────────────────────
+async function testTask21_iOSBackgroundAudio() {
+  console.log("\n[TASK-21] iOS background audio keepalive");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // _bgAudioPlay / _bgAudioPause functions exist
+  const hasPlay = /function _bgAudioPlay\(\)/.test(src);
+  const hasPause = /function _bgAudioPause\(\)/.test(src);
+  report("_bgAudioPlay and _bgAudioPause functions exist", hasPlay && hasPause);
+
+  // _bgAudioPlay called in playTtsAudio (TTS start)
+  const playTtsSection = src.slice(src.indexOf("function playTtsAudio("), src.indexOf("function playTtsAudio(") + 500);
+  report("_bgAudioPlay called when TTS starts", playTtsSection.includes("_bgAudioPlay()"));
+
+  // _bgAudioPause called in stopTtsPlaybackInternal (TTS stop)
+  const stopStart = src.indexOf("function stopTtsPlaybackInternal(");
+  const stopSection = src.slice(stopStart, stopStart + 1500);
+  report("_bgAudioPause called when TTS stops", stopSection.includes("_bgAudioPause()"));
+
+  // visibilitychange only starts keep-alive when ttsPlaying
+  const visStart = src.indexOf("App-switch visibility handler");
+  const visSection = src.slice(visStart, visStart + 2500);
+  const conditionalKeepAlive = visSection.includes("ttsPlaying") && visSection.includes("_startAudioKeepAlive");
+  report("Visibility handler only starts keep-alive when TTS active", conditionalKeepAlive);
+
+  // Stops keep-alive on foreground return when TTS not playing
+  const stopsOnReturn = visSection.includes("!ttsPlaying") && visSection.includes("_stopAudioKeepAlive");
+  report("Stops keep-alive on foreground if TTS idle", stopsOnReturn);
+
+  // applyIdleState pauses background audio
+  const idleSection = src.slice(src.indexOf("function applyIdleState()"), src.indexOf("function applyIdleState()") + 400);
+  report("applyIdleState pauses background audio", idleSection.includes("_bgAudioPause"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// TTS gen bump: new_input preserves queue, user_stop cancels
+// ──────────────────────────────────────────────────────────────
+async function testTtsGenBump_preserveQueue() {
+  console.log("\n[GEN-BUMP] TTS gen bump preserves queue for new_input, cancels for user_stop");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // isJobStale function exists
+  const hasIsJobStale = /function isJobStale\(job/.test(src);
+  report("isJobStale helper function exists", hasIsJobStale);
+
+  // USER_INITIATED_BUMP_REASONS set exists with correct members
+  const hasReasonSet = /USER_INITIATED_BUMP_REASONS/.test(src) &&
+    /user_stop.*voice_change.*barge_in.*session_switch.*client_disconnect/s.test(src);
+  report("USER_INITIATED_BUMP_REASONS set with correct members", hasReasonSet);
+
+  // new_input is NOT in user-initiated set (queue preserved)
+  const reasonSetSection = src.slice(src.indexOf("USER_INITIATED_BUMP_REASONS"), src.indexOf("USER_INITIATED_BUMP_REASONS") + 200);
+  const newInputInSet = reasonSetSection.includes('"new_input"');
+  report("new_input NOT in user-initiated set (preserves queue)", !newInputInSet);
+
+  // stopClientPlayback2 checks shouldCancelQueue
+  const stopSection = src.slice(src.indexOf("function stopClientPlayback2"), src.indexOf("function stopClientPlayback2") + 1000);
+  const hasCancelCheck = stopSection.includes("shouldCancelQueue") && stopSection.includes("USER_INITIATED_BUMP_REASONS");
+  report("stopClientPlayback2 checks shouldCancelQueue", hasCancelCheck);
+
+  // Stale checks use isJobStale instead of raw generation comparison
+  const staleChecks = (src.match(/isJobStale\(job\)/g) || []).length;
+  report("At least 4 stale checks use isJobStale", staleChecks >= 4);
+
+  // _lastBumpReason tracking exists
+  const hasLastReason = /_lastBumpReason/.test(src);
+  report("_lastBumpReason tracked for stale checks", hasLastReason);
+
+  // Soft gen bump log for preserved queue
+  const hasSoftLog = stopSection.includes("Soft gen bump");
+  report("Soft gen bump logged when queue preserved", hasSoftLog);
+
+  // TtsJob has turn field for old-turn detection
+  const hasTurnField = /turn:\s*number/.test(src) && /turn:\s*currentTurn/.test(src);
+  report("TtsJob has turn field, set to currentTurn", hasTurnField);
+
+  // cancelOldTurnJobs function exists
+  const hasCancelOld = /function cancelOldTurnJobs/.test(src);
+  report("cancelOldTurnJobs function exists", hasCancelOld);
+
+  // cancelOldTurnJobs called when new assistant content created in broadcastCurrentOutput
+  const bcoSection = src.slice(src.indexOf("function broadcastCurrentOutput"), src.indexOf("function broadcastCurrentOutput") + 5000);
+  const cancelInBco = bcoSection.includes("cancelOldTurnJobs()");
+  report("cancelOldTurnJobs called in broadcastCurrentOutput on new entry", cancelInBco);
+
+  // cancelOldTurnJobs is idempotent (tracks last cancelled turn)
+  const hasIdempotent = /_lastOldTurnCancelledAt/.test(src);
+  report("cancelOldTurnJobs is idempotent (tracks _lastOldTurnCancelledAt)", hasIdempotent);
+
+  // cancelOldTurnJobs broadcasts tts_stop with reason "turn_transition"
+  const cancelSection = src.slice(src.indexOf("function cancelOldTurnJobs"), src.indexOf("function cancelOldTurnJobs") + 1000);
+  const hasTurnTransition = cancelSection.includes('reason: "turn_transition"');
+  report("cancelOldTurnJobs sends tts_stop with reason turn_transition", hasTurnTransition);
+
+  // Client: transition tone function exists
+  const clientSrc = readFileSync("index.html", "utf-8");
+  const hasToneFunc = /function _playTurnTransitionTone/.test(clientSrc);
+  report("Client has _playTurnTransitionTone function", hasToneFunc);
+
+  // Client: tts_stop handler checks for turn_transition reason
+  const ttsStopSection = clientSrc.slice(clientSrc.indexOf('msg.type === "tts_stop"'), clientSrc.indexOf('msg.type === "tts_stop"') + 500);
+  const hasReasonCheck = ttsStopSection.includes('msg.reason === "turn_transition"') && ttsStopSection.includes("_playTurnTransitionTone");
+  report("tts_stop handler plays transition tone on turn_transition", hasReasonCheck);
+
+  // Tone uses descending interval (two oscillators at different frequencies)
+  const toneSection = clientSrc.slice(clientSrc.indexOf("function _playTurnTransitionTone"), clientSrc.indexOf("function _playTurnTransitionTone") + 800);
+  const hasDescending = /659/.test(toneSection) && /523/.test(toneSection);
+  report("Transition tone uses descending two-note interval (E5→C5)", hasDescending);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Replay: bare "replay" message allowed in testmode
+// ──────────────────────────────────────────────────────────────
+async function testReplayTestmodeFix() {
+  console.log("\n[REPLAY] Replay messages pass testmode safe-prefix filter");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Safe prefix list includes both "replay" (bare) and "replay:" (with colon)
+  const prefixSection = src.slice(src.indexOf("safeTestPrefixes"), src.indexOf("safeTestPrefixes") + 300);
+  const hasBareReplay = prefixSection.includes('"replay"');
+  const hasColonReplay = prefixSection.includes('"replay:"');
+  report("Testmode safe-prefixes include bare 'replay'", hasBareReplay);
+  report("Testmode safe-prefixes include 'replay:' with colon", hasColonReplay);
+
+  // Client replay handlers have debug logging
+  const clientSrc = readFileSync("index.html", "utf-8");
+  const replaySection = clientSrc.slice(clientSrc.indexOf('getElementById("replayBtn")'), clientSrc.indexOf('getElementById("replayBtn")') + 300);
+  const hasDebugLog = replaySection.includes("console.log") && replaySection.includes("ws state");
+  report("Replay handler has debug logging for diagnosis", hasDebugLog);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Tool output filter: ⏺ Bash, ⎿, ctrl+o, etc. skip-filtered
+// ──────────────────────────────────────────────────────────────
+async function testToolOutputFilter() {
+  console.log("\n[TOOL-FILTER] Claude Code tool output lines filtered from entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Tool invocation filter exists
+  const hasToolFilter = /tool_invocation/.test(src) && /⏺.*Bash/.test(src);
+  report("Tool invocation skip filter exists (⏺ Bash, etc.)", hasToolFilter);
+
+  // Tool output continuation filter (⎿)
+  const hasContinuation = /tool_output_continuation/.test(src) && /\^⎿/.test(src);
+  report("Tool output continuation filter exists (⎿ prefix)", hasContinuation);
+
+  // Collapsed output hint filter
+  const hasCollapsed = /collapsed_output_hint/.test(src) && /ctrl\+o/.test(src);
+  report("Collapsed output hint filter exists (ctrl+o)", hasCollapsed);
+
+  // Bare Bash( filter (without ⏺)
+  const hasBashParen = /Bash\(/.test(src) && /tool_invocation/.test(src);
+  report("Bare Bash() invocation filtered", hasBashParen);
+
+  // Verify patterns match expected tool output lines
+  const toolMatch = (t: string) => /^⏺\s*(Bash|Read|Write|Edit|Glob|Grep|Searched|Reading|Update)\b/i.test(t);
+  report("Filter matches '⏺ Bash(echo hello)'", toolMatch("⏺ Bash(echo hello)"));
+  report("Filter matches '⏺ Searched for files'", toolMatch("⏺ Searched for files in src/"));
+  report("Filter matches '⏺ Reading index.html'", toolMatch("⏺ Reading index.html"));
+
+  // Ensure regular prose NOT filtered
+  report("Regular prose NOT filtered", !toolMatch("Here is the updated code."));
+  report("'bash' in sentence NOT filtered", !toolMatch("The bash shell supports piping."));
+}
+
+// ──────────────────────────────────────────────────────────────
+// Mic persistence test: debug endpoint and client mode exist
+// ──────────────────────────────────────────────────────────────
+async function testMicPersistenceEndpoint() {
+  console.log("\n[MIC-TEST] Mic persistence test infrastructure exists");
+
+  const serverSrc = readFileSync("server.ts", "utf-8");
+  const clientSrc = readFileSync("index.html", "utf-8");
+
+  // Server: MicPersistenceEntry interface
+  const hasInterface = /interface MicPersistenceEntry/.test(serverSrc);
+  report("MicPersistenceEntry interface exists", hasInterface);
+
+  // Server: /debug/mic-persistence endpoint
+  const hasEndpoint = /\/debug\/mic-persistence/.test(serverSrc);
+  report("/debug/mic-persistence endpoint exists", hasEndpoint);
+
+  // Server: mictest: message handler
+  const hasHandler = /mictest:.*start/.test(serverSrc) && /mictest:.*rms:/.test(serverSrc);
+  report("mictest: WS message handler exists", hasHandler);
+
+  // Server: audio chunks logged when test active
+  const hasChunkLog = /_micPersistenceActive.*audio_chunk/.test(serverSrc) ||
+    (serverSrc.includes("_micPersistenceActive") && serverSrc.includes("audio_chunk"));
+  report("Audio chunks logged when persistence test active", hasChunkLog);
+
+  // Client: ?mictest=1 URL param mode
+  const hasClientMode = /mictest/.test(clientSrc) && /MIC TEST MODE/.test(clientSrc);
+  report("Client mic test mode with ?mictest=1", hasClientMode);
+
+  // Client: RMS reporting interval
+  const hasRmsReport = /mictest:rms:/.test(clientSrc);
+  report("Client sends RMS reports to server", hasRmsReport);
+}
+
+// ──────────────────────────────────────────────────────────────
+// iOS double-tap zoom: touch-action: manipulation on buttons
+// ──────────────────────────────────────────────────────────────
+async function testDoubleTapZoomFix() {
+  console.log("\n[DOUBLE-TAP] iOS double-tap zoom prevention on interactive elements");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // Viewport meta has user-scalable=no
+  const hasViewport = /user-scalable=no/.test(src);
+  report("Viewport meta includes user-scalable=no", hasViewport);
+
+  // Talk bar button has touch-action: manipulation
+  const talkBarSection = src.slice(src.indexOf(".talk-bar button {"), src.indexOf(".talk-bar button {") + 500);
+  const hasTalkTouch = /touch-action:\s*manipulation/.test(talkBarSection);
+  report("Talk bar button has touch-action: manipulation", hasTalkTouch);
+
+  // Controls buttons have touch-action: manipulation
+  const controlsSection = src.slice(src.indexOf(".controls button {"), src.indexOf(".controls button {") + 500);
+  const hasControlsTouch = /touch-action:\s*manipulation/.test(controlsSection);
+  report("Controls buttons have touch-action: manipulation", hasControlsTouch);
+
+  // Talk button click handler calls preventDefault
+  const clickSection = src.slice(src.indexOf('talkBtn.addEventListener("click"'), src.indexOf('talkBtn.addEventListener("click"') + 200);
+  const hasPrevent = /preventDefault/.test(clickSection);
+  report("Talk button click handler calls preventDefault", hasPrevent);
+
+  // Flow mode buttons also have touch-action
+  const gearSection = src.slice(src.indexOf("flow-gear-btn {"), src.indexOf("flow-gear-btn {") + 500);
+  const hasGearTouch = /touch-action:\s*manipulation/.test(gearSection);
+  report("Flow gear button has touch-action: manipulation", hasGearTouch);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Filler phrases: created as proper conversation entries
+// ──────────────────────────────────────────────────────────────
+async function testFillerPhraseEntries() {
+  console.log("\n[FILLER] Filler phrases appear as assistant conversation entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // ConversationEntry has filler? field
+  const hasFiller = /filler\?:\s*boolean/.test(src);
+  report("ConversationEntry has filler?: boolean field", hasFiller);
+
+  // queueFillerAudio creates a real assistant entry
+  const fillerSection = src.slice(src.indexOf("function queueFillerAudio"), src.indexOf("function queueFillerAudio") + 1000);
+  const createsEntry = fillerSection.includes("conversationEntries.push") && fillerSection.includes("role: \"assistant\"");
+  report("queueFillerAudio creates assistant entry", createsEntry);
+
+  // Filler entry has filler: true tag
+  const hasFillerTag = fillerSection.includes("filler: true");
+  report("Filler entry tagged with filler: true", hasFillerTag);
+
+  // Filler entry is broadcast to clients
+  const hasBroadcast = fillerSection.includes("broadcast(") && fillerSection.includes("type: \"entry\"");
+  report("Filler entry broadcast to clients immediately", hasBroadcast);
+
+  // _fillerEntryId tracks the real entry ID
+  const hasTracking = /_fillerEntryId/.test(src);
+  report("_fillerEntryId tracks real filler entry ID", hasTracking);
+
+  // stopFillerIfActive uses real entry ID (not just FILLER_ENTRY_ID sentinel)
+  const stopSection = src.slice(src.indexOf("function stopFillerIfActive"), src.indexOf("function stopFillerIfActive") + 500);
+  const usesRealId = stopSection.includes("_fillerEntryId") || stopSection.includes("fid");
+  report("stopFillerIfActive uses real entry ID", usesRealId);
+}
+
+// --- Resend Button on User Bubbles ---
+async function testResendButton() {
+  console.log("\n[RESEND] Resend button on user bubbles");
+  const src = readFileSync("server.ts", "utf-8");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. Server has resend: handler
+  const hasResendHandler = src.includes('msg.startsWith("resend:")');
+  report("Server has resend: WS handler", hasResendHandler);
+
+  // 2. Resend handler creates user entry with user-resend source tag
+  const resendSection = src.slice(src.indexOf('msg.startsWith("resend:")'), src.indexOf('msg.startsWith("resend:")') + 1200);
+  const hasResendSource = resendSection.includes('"user-resend"');
+  report("Resend creates entry tagged user-resend", hasResendSource);
+
+  // 3. Testmode handling — creates entry but does not forward to terminal
+  const hasTestmodeGuard = resendSection.includes("_isTestMode") && resendSection.includes("user-resend-testmode");
+  report("Resend has testmode guard (no terminal forward)", hasTestmodeGuard);
+
+  // 4. Resend queues when Claude is active
+  const hasQueuePath = resendSection.includes("user-resend-queue") && resendSection.includes("pendingVoiceInput");
+  report("Resend queues input when Claude is active", hasQueuePath);
+
+  // 5. resend: is in testmode safe prefixes
+  const hasSafePrefix = src.includes('"resend:"') && src.includes("safeTestPrefixes");
+  report("resend: in testmode safe prefixes", hasSafePrefix);
+
+  // 6. Client sends resend: via WS
+  const htmlHasResend = html.includes('ws.send("resend:"');
+  report("Client sends resend: via WebSocket", htmlHasResend);
+
+  // 7. data-resend-payload on user bubbles
+  const hasResendPayload = html.includes("resendPayload") || html.includes("data-resend-payload");
+  report("User bubbles have resendPayload data attribute", hasResendPayload);
+
+  // 8. .msg-resend button exists in CSS
+  const hasCss = html.includes(".msg-resend");
+  report(".msg-resend CSS class defined", hasCss);
+
+  // 9. Event delegation on #transcript for resend clicks
+  const hasDelegation = html.includes('.closest(".msg-resend")');
+  report("Event delegation handles .msg-resend clicks", hasDelegation);
+
+  // 10. Flow mode hides resend button
+  const flowHidesResend = html.includes("flow-mode .msg-resend");
+  report("Flow mode hides resend buttons", flowHidesResend);
+}
+
+// --- Replay Button Audit ---
+async function testReplayAudit() {
+  console.log("\n[REPLAY] Replay button audit");
+  const src = readFileSync("server.ts", "utf-8");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. Replay handler exists for replay: messages
+  const hasReplayHandler = src.includes('msg === "replay"') || src.includes('msg.startsWith("replay:")');
+  report("Server has replay WS handler", hasReplayHandler);
+
+  // 2. replay is in testmode safe prefixes
+  const replaySafe = src.includes('"replay"') && src.includes("safeTestPrefixes");
+  report("replay in testmode safe prefixes", replaySafe);
+
+  // 3. Replay calls queueTts with replay source
+  const replaySection = src.slice(src.indexOf('msg === "replay"'), src.indexOf('msg === "replay"') + 2000);
+  const hasReplaySource = replaySection.includes('"replay"') && replaySection.includes("queueTts");
+  report("Replay calls queueTts with replay source tag", hasReplaySource);
+
+  // 4. Client sends replay: via WS on button click
+  const htmlHasReplay = html.includes('ws.send("replay:');
+  report("Client sends replay: via WebSocket", htmlHasReplay);
+
+  // 5. Event delegation on #transcript for replay clicks
+  const hasDelegation = html.includes('.closest(".msg-replay")');
+  report("Event delegation handles .msg-replay clicks", hasDelegation);
+
+  // 6. .msg-replay button rendered on assistant bubbles
+  const hasReplayBtn = html.includes('className = "msg-replay"');
+  report("Assistant bubbles have .msg-replay button", hasReplayBtn);
+
+  // 7. replay:all handler exists
+  const hasReplayAll = src.includes('replay:all');
+  report("replay:all handler exists for full response replay", hasReplayAll);
+
+  // 8. Flow mode hides replay button
+  const flowHidesReplay = html.includes("flow-mode .msg-replay");
+  report("Flow mode hides replay buttons", flowHidesReplay);
+}
+
+// --- TTS Stall Recovery: orphaned playing jobs ---
+async function testTtsStallRecovery() {
+  console.log("\n[TTS-STALL] TTS stall recovery — orphaned playing jobs");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. handleTtsDone2 only nulls ttsCurrentlyPlaying when matching job found
+  const ttsDone2Section = src.slice(src.indexOf("function handleTtsDone2"), src.indexOf("function handleTtsDone2") + 1500);
+  const conditionalNull = ttsDone2Section.includes("ttsCurrentlyPlaying === job") && ttsDone2Section.includes("NOT clearing ttsCurrentlyPlaying");
+  report("handleTtsDone2 conditionally nulls ttsCurrentlyPlaying", conditionalNull);
+
+  // 2. drainAudioBuffer has orphan recovery for playing jobs
+  const drainSection = src.slice(src.indexOf("function drainAudioBuffer"), src.indexOf("function drainAudioBuffer") + 1000);
+  const hasOrphanRecovery = drainSection.includes("Orphan recovery") && drainSection.includes('front.state === "playing"');
+  report("drainAudioBuffer has orphan recovery for stuck playing jobs", hasOrphanRecovery);
+
+  // 3. TtsJob has playingSince timestamp
+  const jobInterface = src.slice(src.indexOf("interface TtsJob"), src.indexOf("interface TtsJob") + 500);
+  const hasPlayingSince = jobInterface.includes("playingSince");
+  report("TtsJob has playingSince timestamp field", hasPlayingSince);
+
+  // 4. playingSince set when job enters playing state
+  const playingAssignment = src.includes('job.state = "playing"') && src.includes("job.playingSince = Date.now()");
+  report("playingSince set when job enters playing state", playingAssignment);
+
+  // 5. TTS_PLAYING_TIMEOUT_MS constant defined
+  const hasTimeout = src.includes("TTS_PLAYING_TIMEOUT_MS") && /TTS_PLAYING_TIMEOUT_MS\s*=\s*\d+/.test(src);
+  report("TTS_PLAYING_TIMEOUT_MS constant defined", hasTimeout);
+
+  // 6. sweepStaleTtsJobs function exists
+  const hasSweep = src.includes("function sweepStaleTtsJobs");
+  report("sweepStaleTtsJobs periodic sweep function exists", hasSweep);
+
+  // 7. Sweep checks ttsCurrentlyPlaying timeout
+  const sweepSection = src.slice(src.indexOf("function sweepStaleTtsJobs"), src.indexOf("function sweepStaleTtsJobs") + 1200);
+  const checksTimeout = sweepSection.includes("TTS_PLAYING_TIMEOUT_MS") && sweepSection.includes("playingSince");
+  report("Sweep checks playing timeout via playingSince", checksTimeout);
+
+  // 8. Sweep detects orphaned playing jobs (ttsCurrentlyPlaying !== job)
+  const checksOrphan = sweepSection.includes("ttsCurrentlyPlaying !== job") && sweepSection.includes("orphaned");
+  report("Sweep detects orphaned playing jobs in queue", checksOrphan);
+
+  // 9. Sweep runs on interval (setInterval)
+  const hasInterval = src.includes("setInterval(sweepStaleTtsJobs");
+  report("sweepStaleTtsJobs runs on periodic interval", hasInterval);
+
+  // 10. playingSince initialized to 0 in job creation
+  const jobCreation = src.slice(src.indexOf("jobId: ++ttsJobIdCounter"), src.indexOf("jobId: ++ttsJobIdCounter") + 300);
+  const hasInit = jobCreation.includes("playingSince: 0");
+  report("playingSince initialized to 0 in job constructor", hasInit);
 }
 
 main().catch(err => {
