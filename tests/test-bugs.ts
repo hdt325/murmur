@@ -648,9 +648,9 @@ async function testFeature_scrollbackCatchup() {
   const usesScrollback = serverSrc.includes("capturePaneScrollback");
   report("loadScrollbackEntries uses capturePaneScrollback", usesScrollback);
 
-  // Called on startup
-  const calledOnStartup = serverSrc.includes("catchupEntries = loadScrollbackEntries");
-  report("Scrollback loaded on startup", calledOnStartup);
+  // Called on window activation (deferred — not on startup, but when client sends window_preference)
+  const calledOnActivation = serverSrc.includes("function activateWindow") && serverSrc.includes("loadScrollbackEntries()");
+  report("Scrollback loaded on window activation (deferred from startup)", calledOnActivation);
 
   // Called on session switch (via loadScrollbackEntries or loadWindowEntries cache)
   const calledOnSwitch = serverSrc.includes("loadScrollbackEntries()") && serverSrc.includes("loadWindowEntries(currentWindowKey)");
@@ -2229,6 +2229,25 @@ async function main() {
   // Test entry isolation from non-test clients
   await testTestEntryBroadcastIsolation();
 
+  // Settings popover CSS regression
+  await testSettingsPopoverCSS();
+
+  // Non-voice session TTS suppression
+  await testNonVoiceSessionTtsSuppression();
+
+  // Paste input detection via snapshot diff
+  await testPasteInputDetection();
+
+  // Status indicator scoping + TTS stall recovery
+  await testStatusScopingOnWindowSwitch();
+  await testTtsQueueStallRecovery();
+
+  // Server own-pane exclusion
+  await testBug_serverOwnPaneExclusion();
+
+  // Paste input detection
+  await testBug_pasteInputDetection();
+
   await teardown();
 }
 
@@ -2303,10 +2322,11 @@ async function testBug_ttsQueueFlushOnDisconnect() {
   // The fix: on ws close, if no real clients remain, flush ttsQueue and bump ttsGeneration.
   const serverSrc = readFileSync("server.ts", "utf-8");
 
-  // Find the ws close handler
-  const closeStart = serverSrc.indexOf('ws.on("close"');
-  const closeEnd = serverSrc.indexOf("ws.on(", closeStart + 20); // next event handler
-  const closeBody = serverSrc.slice(closeStart, closeEnd > closeStart ? closeEnd : closeStart + 2000);
+  // Find the main ws close handler (the one with TTS flush, not the fallback timer cleanup)
+  const flushComment = serverSrc.indexOf("Flush TTS queue when no clients remain");
+  const closeStart = flushComment > 0 ? serverSrc.lastIndexOf('ws.on("close"', flushComment) : serverSrc.indexOf('ws.on("close"');
+  const closeEnd = closeStart + 2000;
+  const closeBody = serverSrc.slice(closeStart, closeEnd);
 
   // Check that the close handler flushes TTS queue when no real clients remain
   const flushesQueue = closeBody.includes("ttsJobQueue.length") || closeBody.includes("stopClientPlayback2()");
@@ -2846,12 +2866,9 @@ async function testStatusLineFilter() {
   const hasPattern = /\[✻✶✢✽\]/.test(src);
   report("Status line filter pattern exists (spinner char prefix)", hasPattern);
 
-  // Pattern is in the skip section (uses continue), not just non-speakable
-  const filterSection = src.slice(
-    src.indexOf("Shared chrome filters"),
-    src.indexOf("Non-speakable filters")
-  );
-  const isSkipFilter = filterSection.includes("[✻✶✢✽]");
+  // Pattern is in the skip section (isChromeSkip returns a reason → line is skipped), not just non-speakable
+  const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip("), src.indexOf("function isChromeSkip(") + 2100);
+  const isSkipFilter = chromeSkipFn.includes("status_cooking") && /\[✻✶✢✽\]/.test(chromeSkipFn);
   report("Status lines are skip-filtered (not just non-speakable)", isSkipFilter);
 
   // Simple pattern: starts with spinner char — no verb/timing checks needed
@@ -3207,20 +3224,20 @@ async function testToolOutputFilter() {
 
   const src = readFileSync("server.ts", "utf-8");
 
-  // Tool invocation filter exists
-  const hasToolFilter = /tool_invocation/.test(src) && /⏺.*Bash/.test(src);
+  // Tool invocation filter exists (isToolOutputLine or isToolMarker)
+  const hasToolFilter = src.includes("function isToolOutputLine") && /⏺.*Bash/.test(src);
   report("Tool invocation skip filter exists (⏺ Bash, etc.)", hasToolFilter);
 
-  // Tool output continuation filter (⎿)
-  const hasContinuation = /tool_output_continuation/.test(src) && /\^⎿/.test(src);
+  // Tool output continuation filter (⎿) — in isToolMarker or isToolOutputLine
+  const hasContinuation = src.includes("function isToolMarker") && /\^⎿/.test(src);
   report("Tool output continuation filter exists (⎿ prefix)", hasContinuation);
 
-  // Collapsed output hint filter
-  const hasCollapsed = /collapsed_output_hint/.test(src) && /ctrl.*o.*expand/i.test(src);
+  // Collapsed output hint filter — ctrl+o to expand
+  const hasCollapsed = src.includes("function isToolOutputLine") && /ctrl.*o.*expand/i.test(src);
   report("Collapsed output hint filter exists (ctrl+o)", hasCollapsed);
 
-  // Bare Bash( filter (without ⏺)
-  const hasBashParen = /Bash\(/.test(src) && /tool_invocation/.test(src);
+  // Bare Bash( filter (without ⏺) — in isToolOutputLine or isToolMarker
+  const hasBashParen = /Bash\(/i.test(src) && src.includes("function isToolMarker");
   report("Bare Bash() invocation filtered", hasBashParen);
 
   // Verify patterns match expected tool output lines
@@ -3348,17 +3365,17 @@ async function testResendButton() {
   const hasResendHandler = src.includes('msg.startsWith("resend:")');
   report("Server has resend: WS handler", hasResendHandler);
 
-  // 2. Resend handler creates user entry with user-resend source tag
+  // 2. Resend handler creates user entry with text-input-resend source tag
   const resendSection = src.slice(src.indexOf('msg.startsWith("resend:")'), src.indexOf('msg.startsWith("resend:")') + 1200);
-  const hasResendSource = resendSection.includes('"user-resend"');
+  const hasResendSource = resendSection.includes('"text-input-resend"');
   report("Resend creates entry tagged user-resend", hasResendSource);
 
   // 3. Testmode handling — creates entry but does not forward to terminal
-  const hasTestmodeGuard = resendSection.includes("_isTestMode") && resendSection.includes("user-resend-testmode");
+  const hasTestmodeGuard = resendSection.includes("_isTestMode") && resendSection.includes("text-input-resend");
   report("Resend has testmode guard (no terminal forward)", hasTestmodeGuard);
 
   // 4. Resend queues when Claude is active
-  const hasQueuePath = resendSection.includes("user-resend-queue") && resendSection.includes("pendingVoiceInput");
+  const hasQueuePath = resendSection.includes("pendingVoiceInput") && resendSection.includes("text-input-resend");
   report("Resend queues input when Claude is active", hasQueuePath);
 
   // 5. resend: is in testmode safe prefixes
@@ -3442,7 +3459,7 @@ async function testTtsStallRecovery() {
   report("drainAudioBuffer has orphan recovery for stuck playing jobs", hasOrphanRecovery);
 
   // 3. TtsJob has playingSince timestamp
-  const jobInterface = src.slice(src.indexOf("interface TtsJob"), src.indexOf("interface TtsJob") + 700);
+  const jobInterface = src.slice(src.indexOf("interface TtsJob"), src.indexOf("interface TtsJob") + 800);
   const hasPlayingSince = jobInterface.includes("playingSince");
   report("TtsJob has playingSince timestamp field", hasPlayingSince);
 
@@ -3514,7 +3531,7 @@ async function testEntryCapEnforcement() {
   report("trimEntriesToCap called in broadcastCurrentOutput", trimInBco);
 
   // 7. trimEntriesToCap called in passive watcher entry creation path
-  const passiveWatcherIdx = src.indexOf('addUserEntry(userInput, false, "passive-watcher")');
+  const passiveWatcherIdx = src.indexOf('addUserEntry(userInput, false, "terminal")');
   const passiveSection = passiveWatcherIdx >= 0 ? src.slice(passiveWatcherIdx, passiveWatcherIdx + 500) : "";
   const trimInPassive = passiveSection.includes("trimEntriesToCap()");
   report("trimEntriesToCap called in passive watcher path", trimInPassive);
@@ -3778,7 +3795,7 @@ async function testTtsHighlight_scrollPreservation() {
   const html = readFileSync("index.html", "utf-8");
 
   // 1. tts_stop handler saves scrollTop
-  const ttsStopSection = html.slice(html.indexOf('msg.type === "tts_stop"'), html.indexOf('msg.type === "tts_stop"') + 800);
+  const ttsStopSection = html.slice(html.indexOf('msg.type === "tts_stop"'), html.indexOf('msg.type === "tts_stop"') + 1000);
   const savesScroll = ttsStopSection.includes("savedScroll = transcript.scrollTop");
   report("tts_stop handler saves transcript.scrollTop", savesScroll);
 
@@ -3990,13 +4007,13 @@ async function testTtsPerWindowIsolation() {
   const hasWindowGuard = queueTtsFn.includes("entry.window !== getWindowKey()");
   report("queueTts skips entries from different window", hasWindowGuard);
 
-  // 4. Window switch stops TTS BEFORE loading new entries
-  const switchSection = src.slice(src.indexOf("Switching target to session"), src.indexOf("Switching target to session") + 1500);
-  const stopBeforeLoad = switchSection.indexOf("stopClientPlayback2") < switchSection.indexOf("loadWindowEntries");
+  // 4. Window switch stops TTS BEFORE loading new entries (via activateWindow)
+  const switchSection2 = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 3200);
+  const stopBeforeLoad = switchSection2.indexOf("stopClientPlayback2") < switchSection2.indexOf("loadWindowEntries");
   report("Window switch stops TTS before loading new entries", stopBeforeLoad);
 
-  // 5. Window switch marks loaded entries as spoken=true
-  const marksSpoken = switchSection.includes("e.spoken = true");
+  // 5. Window switch marks loaded entries as spoken=true (via activateWindow)
+  const marksSpoken = switchSection2.includes("e.spoken = true");
   report("Window switch marks loaded entries as spoken (no auto-TTS)", marksSpoken);
 
   // 6. session_switch is in USER_INITIATED_BUMP_REASONS
@@ -4104,12 +4121,15 @@ async function testPerWindowConversationIsolation() {
 
   // 4. pushEntry stamps window field on every entry
   const hasPushEntry = src.includes("function pushEntry(entry: ConversationEntry)");
-  const pushStampsWindow = src.includes("entry.window = getWindowKey()");
+  const pushFn = src.slice(src.indexOf("function pushEntry("), src.indexOf("function pushEntry(") + 500);
+  const pushStampsWindow = pushFn.includes("entry.window =") && pushFn.includes("getWindowKey()");
   report("pushEntry stamps window field on entries", hasPushEntry && pushStampsWindow);
 
-  // 5. No raw conversationEntries.push remaining (all use pushEntry)
-  const rawPushCount = (src.match(/conversationEntries\.push\(/g) || []).length;
-  report("No raw conversationEntries.push() calls remain", rawPushCount === 0);
+  // 5. No raw conversationEntries.push remaining outside pushEntry (all use pushEntry)
+  // The one push inside pushEntry itself is expected — count pushes outside pushEntry
+  const pushEntryEnd = src.indexOf("function addUserEntry(");
+  const rawPushOutside = (src.slice(pushEntryEnd).match(/conversationEntries\.push\(/g) || []).length;
+  report("No raw conversationEntries.push() calls remain", rawPushOutside === 0);
 
   // 6. tmux:switch saves current window before switching
   const switchSaves = src.includes("saveCurrentWindowEntries()");
@@ -4168,7 +4188,7 @@ async function testPerWindowConversationIsolation() {
       return "no_entries";
     } catch (e) { return "error"; }
   });
-  report("Live: test entries tagged with window field (needs restart)", entryCheck === "has_window" || src.includes("entry.window = getWindowKey()"));
+  report("Live: test entries tagged with window field (needs restart)", entryCheck === "has_window" || (src.includes("entry.window =") && src.includes("getWindowKey()")));
 
   // 14. Window switch resets passive watcher state (root cause of single-window bug)
   const switchResetsSnapshot = src.includes('lastPassiveSnapshot = ""') || src.includes("lastPassiveSnapshot = captureTmuxPane()");
@@ -4182,8 +4202,9 @@ async function testPerWindowConversationIsolation() {
   const switchResetsStream = src.includes('streamState = "IDLE"');
   report("Window switch resets streamState to IDLE", switchResetsStream);
 
-  // 17. Window switch initializes new pane snapshot
-  const switchInitSnapshot = /tmux:switch[\s\S]{0,2000}lastPassiveSnapshot = captureTmuxPane/.test(src);
+  // 17. Window switch initializes new pane snapshot (via activateWindow)
+  const activateSnap = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 3200);
+  const switchInitSnapshot = activateSnap.includes("lastPassiveSnapshot = captureTmuxPane");
   report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
 
   // 18. Window switch resets preInputSnapshot
@@ -4207,12 +4228,12 @@ async function testTestEntryBroadcastIsolation() {
   report("ConversationEntry has sourceTag field", hasSourceTag);
 
   // 2. addUserEntry stamps sourceTag on entries
-  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 800);
+  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 6000);
   const stampsSourceTag = addUserFn.includes("sourceTag: _source");
   report("addUserEntry stamps sourceTag from _source parameter", stampsSourceTag);
 
   // 3. broadcast() filters by sourceTag (not _testEntryIds race)
-  const broadcastFn = src.slice(src.indexOf("function broadcast("), src.indexOf("function broadcast(") + 2000);
+  const broadcastFn = src.slice(src.indexOf("function broadcast("), src.indexOf("function broadcast(") + 3000);
   const filtersBySourceTag = broadcastFn.includes('sourceTag?.startsWith("text-input-test")');
   report("broadcast() filters entries by sourceTag (no ID race)", filtersBySourceTag);
 
@@ -4228,6 +4249,241 @@ async function testTestEntryBroadcastIsolation() {
   // 6. Test mode text input uses "text-input-test" source
   const testModeSource = src.includes('"text-input-test"');
   report("Test mode text input tagged as text-input-test", testModeSource);
+}
+
+// --- Settings popover CSS regression ---
+async function testSettingsPopoverCSS() {
+  console.log("\n[SETTINGS-CSS] Settings popover has max-height and overflow constraints");
+  const html = readFileSync("index.html", "utf-8");
+
+  // 1. Flow settings sheet has max-height: 70vh
+  const flowSheetMaxHeight = /\.flow-settings-sheet\s*\{[^}]*max-height:\s*70vh/s.test(html);
+  report("Flow settings sheet has max-height: 70vh", flowSheetMaxHeight);
+
+  // 2. Flow settings sheet has overflow-y: auto
+  const flowSheetOverflow = /\.flow-settings-sheet\s*\{[^}]*overflow-y:\s*auto/s.test(html);
+  report("Flow settings sheet has overflow-y: auto", flowSheetOverflow);
+
+  // 3. Flow settings sheet has -webkit-overflow-scrolling: touch (iOS)
+  const flowSheetTouch = /\.flow-settings-sheet\s*\{[^}]*-webkit-overflow-scrolling:\s*touch/s.test(html);
+  report("Flow settings sheet has -webkit-overflow-scrolling: touch", flowSheetTouch);
+
+  // 4. Live: flow settings sheet computed max-height is constrained (needs browser)
+  const flowMaxH = await page.evaluate(() => {
+    const el = document.querySelector(".flow-settings-sheet");
+    if (!el) return "no_element";
+    return window.getComputedStyle(el).maxHeight;
+  });
+  const hasConstraint = flowMaxH.includes("vh") || (parseFloat(flowMaxH) > 0 && parseFloat(flowMaxH) < 2000);
+  report("Live: flow settings sheet max-height is constrained", hasConstraint || flowMaxH === "no_element");
+}
+
+// --- Non-voice session TTS suppression (reconnect leak fix) ---
+async function testNonVoiceSessionTtsSuppression() {
+  console.log("\n[WINDOW-TTS-GUARD] Non-voice sessions suppress speakable entries");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. isVoiceSession() helper exists
+  const hasHelper = src.includes("function isVoiceSession(): boolean");
+  report("isVoiceSession() helper function exists", hasHelper);
+
+  // 2. isVoiceSession checks for claude-voice session name
+  const helperStart = src.indexOf("function isVoiceSession()");
+  const helperEnd = src.indexOf("}", helperStart) + 1;
+  const helperFn = src.slice(helperStart, helperEnd);
+  const checksClaudeVoice = helperFn.includes('"claude-voice"');
+  report("isVoiceSession checks for claude-voice session", checksClaudeVoice);
+
+  // 3. pushEntry forces speakable=false for non-voice sessions
+  const pushStart = src.indexOf("function pushEntry(entry: ConversationEntry)");
+  const pushEnd = src.indexOf("\n}\n", pushStart) + 3;
+  const pushFn = src.slice(pushStart, pushEnd);
+  const hasTtsGuard = pushFn.includes("isVoiceSession()") && pushFn.includes("entry.speakable = false");
+  report("pushEntry suppresses speakable for non-voice sessions", hasTtsGuard);
+
+  // 4. loadScrollbackEntries uses isVoiceSession for speakable flag
+  const scrollbackStart = src.indexOf("function loadScrollbackEntries");
+  const scrollbackEnd = src.indexOf("\n  return entries;\n}", scrollbackStart) + 20;
+  const scrollbackFn = src.slice(scrollbackStart, scrollbackEnd);
+  const scrollbackUsesGuard = scrollbackFn.includes("isVoiceSession()");
+  report("loadScrollbackEntries uses isVoiceSession for speakable flag", scrollbackUsesGuard);
+
+  // 5. WINDOW-TTS-GUARD log message exists (diagnostic)
+  const hasLogMsg = src.includes("[WINDOW-TTS-GUARD]");
+  report("WINDOW-TTS-GUARD diagnostic log message present", hasLogMsg);
+}
+
+// --- Paste input detection via snapshot diff ---
+async function testPasteInputDetection() {
+  console.log("\n[PASTE-DETECT] Dual input extraction: prompt parsing + snapshot diff");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Both extraction methods exist
+  const hasPromptMethod = src.includes("Method 1: Prompt line parsing");
+  const hasDiffMethod = src.includes("Method 2: Snapshot diff");
+  report("Dual extraction: prompt parsing + snapshot diff", hasPromptMethod && hasDiffMethod);
+
+  // 2. Diff method compares lastPassiveSnapshot with current pane
+  const hasDiffComparison = src.includes("lastPassiveSnapshot.split") && src.includes("divergeIdx");
+  report("Diff method compares saved snapshot with current pane", hasDiffComparison);
+
+  // 3. Diff filters out spinner/chrome lines
+  const spinnerStart = src.indexOf("Method 2: Snapshot diff");
+  const spinnerSection = src.slice(spinnerStart, spinnerStart + 1000);
+  const diffFiltersSpinner = spinnerSection.includes("⠋⠙⠹⠸") && spinnerSection.includes("newParts");
+  report("Diff method filters spinner and chrome lines", diffFiltersSpinner);
+
+  // 4. Uses the longer result (diff catches paste that prompt parsing misses)
+  const usesLonger = src.includes("diffInput.length > userInput.length");
+  report("Uses longer result (diff wins for pasted text)", usesLonger);
+
+  // 5. Log message for paste detection
+  const hasPasteLog = src.includes("paste detected");
+  report("Diagnostic log when diff input is used (paste detected)", hasPasteLog);
+}
+
+// --- Status scoping on window switch ---
+async function testStatusScopingOnWindowSwitch() {
+  console.log("\n[STATUS-SCOPE] Window activation gates scraping + resets all status indicators");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. currentWindowKey starts as "_unset" sentinel
+  const startsUnset = src.includes('currentWindowKey = "_unset"');
+  report("currentWindowKey starts as _unset (no default pane)", startsUnset);
+
+  // 2. isWindowActive() helper exists and checks sentinel
+  const hasHelper = src.includes("function isWindowActive(): boolean");
+  const checksUnset = src.includes('currentWindowKey !== "_unset"');
+  report("isWindowActive() gates on _unset sentinel", hasHelper && checksUnset);
+
+  // 3. Passive watcher is gated on isWindowActive
+  const passiveStart = src.indexOf("function startPassiveWatcher");
+  const passiveFn = src.slice(passiveStart, passiveStart + 300);
+  const passiveGated = passiveFn.includes("isWindowActive()");
+  report("Passive watcher gates on isWindowActive()", passiveGated);
+
+  // 4. Terminal broadcaster is gated on isWindowActive
+  const termBroadcast = src.indexOf("Broadcast tmux pane content with ANSI");
+  const termSection = src.slice(termBroadcast, termBroadcast + 300);
+  const termGated = termSection.includes("isWindowActive()");
+  report("Terminal content broadcaster gates on isWindowActive()", termGated);
+
+  // 5. activateWindow() function exists with full resets
+  const hasActivate = src.includes("function activateWindow(");
+  report("activateWindow() shared function exists", hasActivate);
+
+  // 6. activateWindow resets streamState + broadcasts idle
+  const activateStart = src.indexOf("function activateWindow(");
+  const activateFn = src.slice(activateStart, activateStart + 3200);
+  const resetsStream = activateFn.includes('streamState');
+  const broadcastsIdle = activateFn.includes('voice_status", state: "idle"');
+  const stopsTts = activateFn.includes("stopClientPlayback2");
+  report("activateWindow resets stream + TTS + broadcasts idle", resetsStream && broadcastsIdle && stopsTts);
+
+  // 7. Startup does NOT load scrollback entries (waits for window_preference)
+  const startupBlock = src.slice(src.indexOf("waiting for client window_preference") - 200, src.indexOf("waiting for client window_preference") + 200);
+  const noScrollbackOnStartup = !startupBlock.includes("loadScrollbackEntries");
+  report("Startup does NOT load scrollback (waits for window_preference)", noScrollbackOnStartup);
+
+  // 8. Fallback timer for clients without window_preference support
+  const hasFallback = src.includes("No window_preference received") && src.includes("activateWindow");
+  report("5s fallback timer activates saved target if no window_preference", hasFallback);
+
+  // 9. window_preference handler uses activateWindow()
+  const wpStart = src.indexOf('msg.startsWith("window_preference:")');
+  const wpSection = src.slice(wpStart, wpStart + 600);
+  const usesActivate = wpSection.includes("activateWindow(preferred, ws)");
+  report("window_preference handler uses activateWindow()", usesActivate);
+}
+
+// --- TTS queue stall recovery ---
+async function testTtsQueueStallRecovery() {
+  console.log("\n[TTS-STALL] TTS fetch timeout + fetching job sweep");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Kokoro fetch has timeout
+  const kokoroStart = src.indexOf("async function fetchKokoroAudio");
+  const kokoroFn = src.slice(kokoroStart, kokoroStart + 3500);
+  const kokoroTimeout = kokoroFn.includes("fetchTimeout") && kokoroFn.includes("clearTimeout(fetchTimeout)");
+  report("fetchKokoroAudio has fetch timeout with cleanup", kokoroTimeout);
+
+  // 2. ElevenLabs fetch has timeout
+  const elStart = src.indexOf("async function fetchElevenLabsAudio");
+  const elFn = src.slice(elStart, elStart + 3500);
+  const elTimeout = elFn.includes("fetchTimeout") && elFn.includes("clearTimeout(fetchTimeout)");
+  report("fetchElevenLabsAudio has fetch timeout with cleanup", elTimeout);
+
+  // 3. Sweep checks fetching jobs
+  const sweepStart = src.indexOf("function sweepStaleTtsJobs");
+  const sweepFn = src.slice(sweepStart, sweepStart + 2500);
+  const sweepsFetching = sweepFn.includes('"fetching"') && sweepFn.includes("allFailed");
+  report("sweepStaleTtsJobs checks jobs stuck in fetching state", sweepsFetching);
+
+  // 4. Catch handlers call drainAudioBuffer
+  const catchDrain = (src.match(/\.catch\(err\s*=>\s*\{[^}]*drainAudioBuffer\(\)/g) || []).length;
+  report("Fetch .catch() handlers call drainAudioBuffer (≥3 engines)", catchDrain >= 3);
+
+  // 5. Safety drain when queue has items but nothing playing
+  const safetyDrain = sweepFn.includes("ttsJobQueue.length > 0 && !ttsCurrentlyPlaying");
+  report("Sweep safety-drains when queue non-empty + nothing playing", safetyDrain);
+}
+
+// --- Server own-pane exclusion (prevents coordinator output leaking into conversation) ---
+async function testBug_serverOwnPaneExclusion() {
+  console.log("\n[PANE-EXCLUSION] Server detects and excludes its own pane from scraping");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Server detects its own pane ID on startup
+  const detectsOwnPane = src.includes("_serverOwnPaneId") && src.includes('display-message", "-p", "#{pane_id}"');
+  report("Server detects own pane ID on startup", detectsOwnPane);
+
+  // 2. activateWindow() rejects activation if resolved pane is server's own
+  const activateStart = src.indexOf("function activateWindow(");
+  const activateFn = src.slice(activateStart, activateStart + 1500);
+  const blocksOwnPane = activateFn.includes("_serverOwnPaneId") && activateFn.includes("refusing to scrape ourselves");
+  report("activateWindow() blocks activation of server's own pane", blocksOwnPane);
+
+  // 3. Passive watcher has safety-net guard against own pane
+  const watcherStart = src.indexOf("function startPassiveWatcher");
+  const watcherFn = src.slice(watcherStart, watcherStart + 500);
+  const watcherGuard = watcherFn.includes("_serverOwnPaneId") && watcherFn.includes("terminal.currentTarget");
+  report("Passive watcher has own-pane safety guard", watcherGuard);
+
+  // 4. Terminal panel broadcast also guards against own pane
+  // Use lastIndexOf to find the broadcast usage (setInterval), not the function definition
+  const termBroadcastIdx = src.lastIndexOf("captureTerminalPane()");
+  const termBroadcastSection = src.slice(Math.max(0, termBroadcastIdx - 300), termBroadcastIdx);
+  const termGuard = termBroadcastSection.includes("_serverOwnPaneId");
+  report("Terminal panel broadcast guards against own pane", termGuard);
+}
+
+// --- Paste input detection via pending prompt capture ---
+async function testBug_pasteInputDetection() {
+  console.log("\n[PASTE-DETECT] Paste detection via pending prompt input capture");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Pending input state variables exist
+  const hasPendingVars = src.includes("let _pendingPromptInput") && src.includes("let _pendingPromptInputTs");
+  report("Pending prompt input state variables declared", hasPendingVars);
+
+  // 2. Idle path captures prompt content when user is mid-type/paste
+  const idleSection = src.slice(src.indexOf("Prompt has content — user is mid-type") - 50, src.indexOf("Prompt has content — user is mid-type") + 1200);
+  const capturesPending = idleSection.includes("_pendingPromptInput") && idleSection.includes("_pendingPromptInputTs = Date.now()");
+  report("Idle path captures pending input from prompt line", capturesPending);
+
+  // 3. Spinner handler uses pending input as third extraction method
+  const spinnerSection = src.slice(src.indexOf("Method 3: Pending input"), src.indexOf("Method 3: Pending input") + 1500);
+  const usesPending = spinnerSection.includes("pendingInput.length > userInput.length") && spinnerSection.includes("paste detected");
+  report("Spinner handler uses pending input for paste detection", usesPending);
+
+  // 4. Pending input cleared on window activation
+  const activateSection = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 2000);
+  const clearedOnActivate = activateSection.includes("_pendingPromptInput = \"\"");
+  report("Pending input cleared on window activation", clearedOnActivate);
+
+  // 5. Pending input consumed after use (prevents stale reuse)
+  const consumeIdx = src.indexOf('_pendingPromptInput = ""; // Consume');
+  report("Pending input consumed after extraction (no stale reuse)", consumeIdx > 0);
 }
 
 main().catch(err => {

@@ -43,6 +43,8 @@ export interface ConversationEntry {
   spoken: boolean;
   ts: number;
   turn: number;
+  window?: string;           // tmux window key (e.g. "%3") — isolates entries per window
+  sourceTag?: string;        // origin: "voice", "text-input", "terminal", "text-input-test"
   queued?: boolean;
   filler?: boolean;          // True for auto-filler phrases ("Got it, let me look into that")
   inputId?: string;          // Unique ID for this voice/text input (user entries)

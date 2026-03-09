@@ -609,6 +609,54 @@
       display: none;
     }
 
+    /* Flow mode: unhealthy service alerts — only visible in flow mode when services are down */
+    .flow-svc-alerts {
+      display: none; /* hidden in regular mode */
+    }
+
+    body.flow-mode .flow-svc-alerts {
+      display: none; /* default hidden even in flow mode — shown by JS when unhealthy */
+      position: fixed;
+      top: calc(env(safe-area-inset-top, 0px) + 8px);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 90;
+      gap: 12px;
+      align-items: center;
+      pointer-events: auto;
+    }
+
+    body.flow-mode .flow-svc-alerts.has-alerts {
+      display: flex;
+    }
+
+    .flow-svc-item {
+      display: none; /* each item hidden unless unhealthy */
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 500;
+      color: rgba(26, 26, 30, 0.5);
+      cursor: default;
+      transition: opacity 0.3s;
+    }
+
+    .flow-svc-item.unhealthy {
+      display: flex;
+    }
+
+    .flow-svc-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #e74c3c;
+      flex-shrink: 0;
+    }
+
+    .flow-svc-item.warn .flow-svc-dot {
+      background: #f39c12;
+    }
+
     body.flow-mode .conv-toolbar {
       display: none;
     }
@@ -681,8 +729,16 @@
     /* Flow mode: shrink-wrap user msg-wrap so align-self: flex-end actually right-justifies */
     body.flow-mode .msg-wrap:has(.msg.user) {
       width: fit-content;
+      min-width: 2.5em; /* prevent single-word messages from collapsing to char-width */
       max-width: 72%;
       margin-left: auto;
+    }
+
+    /* Ensure karaoke word spans stay inline in user bubbles */
+    body.flow-mode .msg.user .tts-word,
+    body.flow-mode .msg.user .tts-word-spoken,
+    body.flow-mode .msg.user .tts-word-dropped {
+      display: inline;
     }
 
     body.flow-mode .msg.assistant {
@@ -1808,6 +1864,11 @@
       cursor: pointer;
     }
 
+    .controls button.interrupt-btn svg {
+      display: block;
+      margin: auto;
+    }
+
     .controls button.interrupt-btn.active {
       border-color: #333338;
       color: #f39c12;
@@ -2786,11 +2847,18 @@
       <div class="svc-dot" id="svcWhisper" data-tip="Whisper STT"></div>
       <span class="svc-label">TTS</span>
       <div class="svc-dot" id="svcKokoro" data-tip="Kokoro TTS"></div>
-      <span class="svc-label">🔊</span>
+      <span class="svc-label">Audio</span>
       <div class="svc-dot" id="svcAudio" data-tip="Audio: this device"></div>
       <button class="svc-restart" id="restartBtn" data-tip="Restart Murmur server">⟳</button>
     </div>
     <button class="close-btn" id="closeBtn" data-tip="Close panel">✕</button>
+  </div>
+
+  <!-- Flow mode: unhealthy service alerts (hidden when all green) -->
+  <div class="flow-svc-alerts" id="flowSvcAlerts">
+    <span class="flow-svc-item" id="flowSvcStt" data-tip="STT: checking">STT <span class="flow-svc-dot"></span></span>
+    <span class="flow-svc-item" id="flowSvcTts" data-tip="TTS: checking">TTS <span class="flow-svc-dot"></span></span>
+    <span class="flow-svc-item" id="flowSvcAudio" data-tip="Audio: checking">Audio <span class="flow-svc-dot"></span></span>
   </div>
 
   <!-- Section 2: Mic meter -->
@@ -2935,7 +3003,7 @@
   <!-- Section 5: Controls + Input -->
   <div class="controls">
     <button class="stop" id="stopBtn" data-tip="Stop voice playback">■</button>
-    <button class="interrupt-btn" id="interruptBtn" data-tip="Interrupt Claude &amp; send queued voice">⚡</button>
+    <button class="interrupt-btn" id="interruptBtn" data-tip="Interrupt Claude &amp; send queued voice"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" stroke="none"><path d="M13 2L4.5 14H11l-1 8 8.5-12H12l1-8z"/></svg></button>
     <button class="mute-btn" id="muteBtn" data-tip="Mute microphone"><svg viewBox="0 0 24 24" width="14" height="14"
         fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
@@ -3293,9 +3361,9 @@
       zm_yunjian: "Yunjian (ZH)", zm_yunxi: "Yunxi (ZH)", zm_yunxia: "Yunxia (ZH)", zm_yunyang: "Yunyang (ZH)"
     };
     function friendlyVoice(raw) {
-      if (raw.startsWith("_local:")) return raw.slice(7) + " ⚡";
-      if (raw.startsWith("piper:")) return raw.slice(6) + " 🔧";
-      if (raw.startsWith("xi:")) return raw.slice(3) + " $";
+      if (raw.startsWith("_local:")) return raw.slice(7) + " [local]";
+      if (raw.startsWith("piper:")) return raw.slice(6) + " [piper]";
+      if (raw.startsWith("xi:")) return raw.slice(3) + " [xi]";
       return VOICE_NAMES[raw] || raw;
     }
 
@@ -3942,6 +4010,33 @@
     // =============================================
     // Status dot + text state management
     // =============================================
+    // Flow mode: track service health and show unhealthy indicators at top
+    const _flowSvcState = { stt: true, tts: true, audio: true };
+    function _updateFlowSvcAlerts(update) {
+      if (update.stt !== undefined) _flowSvcState.stt = !!update.stt;
+      if (update.tts !== undefined) _flowSvcState.tts = !!update.tts;
+      if (update.audio !== undefined) _flowSvcState.audio = !!update.audio;
+
+      const alerts = document.getElementById("flowSvcAlerts");
+      const sttEl = document.getElementById("flowSvcStt");
+      const ttsEl = document.getElementById("flowSvcTts");
+      const audioEl = document.getElementById("flowSvcAudio");
+      if (!alerts || !sttEl || !ttsEl || !audioEl) return;
+
+      // Update individual items
+      sttEl.classList.toggle("unhealthy", !_flowSvcState.stt);
+      sttEl.dataset.tip = _flowSvcState.stt ? "STT: Whisper running" : "STT: Whisper offline";
+      ttsEl.classList.toggle("unhealthy", !_flowSvcState.tts);
+      ttsEl.dataset.tip = _flowSvcState.tts ? "TTS: Kokoro running" : "TTS: Kokoro offline";
+      audioEl.classList.toggle("unhealthy", !_flowSvcState.audio);
+      audioEl.classList.toggle("warn", !_flowSvcState.audio); // amber not red for audio
+      audioEl.dataset.tip = _flowSvcState.audio ? "Audio: this device" : "Audio: other device";
+
+      // Show container only if any service is unhealthy
+      const anyUnhealthy = !_flowSvcState.stt || !_flowSvcState.tts || !_flowSvcState.audio;
+      alerts.classList.toggle("has-alerts", anyUnhealthy);
+    }
+
     function setHeaderState(state, text) {
       statusText.textContent = text;
       statusDot.className = "status-dot";
@@ -4380,6 +4475,10 @@
         _flowInitialRender = false; // Fresh connect: treat next renderEntries as initial history load
         // Sync clean/verbose mode so server queues TTS correctly
         ws.send("clean_mode:" + (voicedOnly ? "1" : "0"));
+        // Tell server which window this client was viewing — prevents wrong entries on reconnect
+        if (_currentTmuxTarget) {
+          ws.send("window_preference:" + _currentTmuxTarget);
+        }
         // Report available local voices so server knows what this client supports
         if (window.speechSynthesis) {
           const sendVoices = () => {
@@ -4573,6 +4672,8 @@
           svcKokoro.className = "svc-dot " + (msg.kokoro ? "up" : "down");
           svcWhisper.dataset.tip = msg.whisper ? "Whisper STT: running" : "Whisper STT: offline";
           svcKokoro.dataset.tip = msg.kokoro ? "Kokoro TTS: running" : "Kokoro TTS: offline";
+          // Update flow mode service alerts
+          _updateFlowSvcAlerts({ stt: msg.whisper, tts: msg.kokoro });
         }
 
         if (msg.type === "context_sent") {
@@ -4636,6 +4737,8 @@
             svcAudio.className = "svc-dot audio-off";
             svcAudio.dataset.tip = "Audio: other device — tap to claim";
           }
+          // Update flow mode service alerts
+          _updateFlowSvcAlerts({ audio: msg.hasControl });
         }
 
         if (msg.type === "signal") {
@@ -5264,21 +5367,17 @@
       const textEl = entryEl.querySelector(".entry-text");
       if (!textEl) return;
 
-      // Always ensure word spans exist and match speakableText
-      // Use speakableText as the canonical source — it matches the audio 1:1
+      // Ensure word spans exist. Only re-wrap text if there are NO spans at all.
+      // IMPORTANT: Do NOT re-wrap if spans exist but count differs — this happens when
+      // sentence-level TTS sends speakableText for just one sentence while the DOM has
+      // spans for the full entry. Re-wrapping would destroy already-spoken words.
       const existingSpans = textEl.querySelectorAll(".tts-word, .tts-word-spoken, .tts-word-dropped");
-      const expectedWords = speakableText ? speakableText.trim().split(/\s+/).filter(Boolean) : [];
-      const expectedCount = expectedWords.length;
-
-      // Re-wrap if: no spans, or span count doesn't match expected word count
-      if (existingSpans.length === 0 || existingSpans.length !== expectedCount) {
-        // Preserve already-spoken count before re-wrapping
-        const spokenCount = textEl.querySelectorAll(".tts-word-spoken").length;
-        textEl.innerHTML = expectedWords
-          .map((w, i) => {
-            const cls = i < spokenCount ? "tts-word-spoken" : "tts-word";
-            return '<span class="' + cls + '">' + escHtml(w) + '</span>';
-          })
+      if (existingSpans.length === 0) {
+        // No spans yet — wrap entire entry text into word spans
+        const entryText = textEl.textContent || "";
+        const entryWords = entryText.trim().split(/\s+/).filter(Boolean);
+        textEl.innerHTML = entryWords
+          .map(w => '<span class="tts-word">' + escHtml(w) + '</span>')
           .join(" ");
       }
 
@@ -7913,7 +8012,7 @@
       { target: "#flowModeBtn", title: "Flow Mode", text: "A distraction-free voice conversation view. Hides all chrome \u2014 just you, the mic, and Claude\u2019s prose. Responses use a serif font. Barge-in and auto-listen keep the conversation flowing naturally.", pos: "below" },
       { target: "#terminalHeader", title: "Terminal Panel", text: "Click to expand and watch Claude Code working in real-time with ANSI colors.", pos: "above" },
       { target: "#restartBtn", title: "Restart Server", text: "Restarts the Murmur server process. Use this if something gets stuck or services disconnect.", pos: "below" },
-      { target: ".svc-indicators", title: "Service Status", text: "STT and TTS dots show Whisper and Kokoro status. The 🔊 dot shows which device has audio output — tap it to claim audio on this device.", pos: "below" },
+      { target: ".svc-indicators", title: "Service Status", text: "STT and TTS dots show Whisper and Kokoro status. The Audio dot shows which device has audio output — tap it to claim audio on this device.", pos: "below" },
       { target: ".svc-indicators", title: "Remote & Mobile Access", text: "Use Murmur from your phone via Tailscale: install Tailscale on Mac and iPhone, get your Mac\u2019s Tailscale IP (\u2018tailscale ip\u2019 in Terminal), then open https://\u3008ip\u3009:3458 on your phone. Use a Kokoro voice (Heart, Sky, etc.) for audio on remote devices \u2014 device voices only play on the Mac.", pos: "below" },
     ];
 

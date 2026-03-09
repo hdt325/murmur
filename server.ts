@@ -1056,6 +1056,9 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
   const kokoroVoice = voice.startsWith("_local") ? "af_heart" : voice;
   const speed = settings.speed || 1;
 
+  // Timeout: abort fetch after 15s to prevent queue stall when Kokoro hangs
+  const fetchTimeout = setTimeout(() => chunk.abortController?.abort(), 15000);
+
   try {
     const resp = await fetch(`${KOKORO_URL}/v1/audio/speech`, {
       method: "POST",
@@ -1102,6 +1105,7 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
     job.state = "failed";
     logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
   } finally {
+    clearTimeout(fetchTimeout);
     _activeFetchCount--;
     chunk.abortController = null;
   }
@@ -1223,6 +1227,9 @@ async function fetchElevenLabsAudio(job: TtsJob, chunkIndex: number): Promise<vo
     return;
   }
 
+  // Timeout: abort fetch after 15s to prevent queue stall
+  const fetchTimeout = setTimeout(() => chunk.abortController?.abort(), 15000);
+
   try {
     const resp = await fetch(`${ELEVENLABS_API_URL}/${voiceId}`, {
       method: "POST",
@@ -1271,6 +1278,7 @@ async function fetchElevenLabsAudio(job: TtsJob, chunkIndex: number): Promise<vo
     job.state = "failed";
     logTtsFetch("elevenlabs", job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
   } finally {
+    clearTimeout(fetchTimeout);
     _activeFetchCount--;
     chunk.abortController = null;
   }
@@ -1345,19 +1353,19 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
           if (existing.mode === "kokoro") {
             for (const chunk of existing.chunks) {
               fetchKokoroAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-                console.error(`[tts2] drainAudioBuffer error after re-fetch: ${(err as Error).message}`);
+                drainAudioBuffer(); // Drain queue even on re-fetch failure
               });
             }
           } else if (existing.mode === "piper") {
             for (const chunk of existing.chunks) {
               fetchPiperAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-                console.error(`[tts2] drainAudioBuffer error after piper re-fetch: ${(err as Error).message}`);
+                drainAudioBuffer(); // Drain queue even on piper re-fetch failure
               });
             }
           } else if (existing.mode === "elevenlabs") {
             for (const chunk of existing.chunks) {
               fetchElevenLabsAudio(existing, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-                console.error(`[tts2] drainAudioBuffer error after elevenlabs re-fetch: ${(err as Error).message}`);
+                drainAudioBuffer(); // Drain queue even on elevenlabs re-fetch failure
               });
             }
           }
@@ -1474,31 +1482,30 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
         // Kokoro came back up — fire fetches
         for (const chunk of chunks) {
           fetchKokoroAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-            console.error(`[tts2] drainAudioBuffer error after fetch: ${(err as Error).message}`);
+            drainAudioBuffer(); // Drain queue even on kokoro fetch failure
           });
         }
       }).catch(err => {
-        console.error(`[tts2] checkService error: ${(err as Error).message}`);
         job.state = "failed";
         drainAudioBuffer();
       });
     } else {
       for (const chunk of chunks) {
         fetchKokoroAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-          console.error(`[tts2] drainAudioBuffer error after fetch: ${(err as Error).message}`);
+          drainAudioBuffer(); // Drain queue even on kokoro fetch failure
         });
       }
     }
   } else if (mode === "piper") {
     for (const chunk of chunks) {
       fetchPiperAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-        console.error(`[tts2] drainAudioBuffer error after piper fetch: ${(err as Error).message}`);
+        drainAudioBuffer(); // Drain queue even on piper fetch failure
       });
     }
   } else if (mode === "elevenlabs") {
     for (const chunk of chunks) {
       fetchElevenLabsAudio(job, chunk.chunkIndex).then(() => drainAudioBuffer()).catch(err => {
-        console.error(`[tts2] drainAudioBuffer error after elevenlabs fetch: ${(err as Error).message}`);
+        drainAudioBuffer(); // Drain queue even on elevenlabs fetch failure
       });
     }
   }
@@ -1966,7 +1973,29 @@ function sweepStaleTtsJobs(): void {
       recovered++;
     }
   }
-  if (recovered > 0) {
+
+  // Check for jobs stuck in "fetching" state — all chunks failed or timed out.
+  // This catches the scenario where Kokoro/Piper hung and the 15s fetch timeout fired,
+  // marking chunks as failed, but the job itself wasn't promoted to "failed".
+  for (const job of ttsJobQueue) {
+    if (job.state === "fetching") {
+      const allChunksDone = job.chunks.every(c => c.state === "ready" || c.state === "failed");
+      const allFailed = job.chunks.every(c => c.state === "failed");
+      if (allFailed) {
+        console.warn(`[tts2] Sweep: job=${job.jobId} entry=${job.entryId} all chunks failed — marking job failed`);
+        job.state = "failed";
+        recovered++;
+      } else if (allChunksDone && job.chunks[0]?.state === "ready") {
+        // Chunks ready but job stuck in fetching — promote to ready
+        console.log(`[tts2] Sweep: job=${job.jobId} entry=${job.entryId} chunks ready but job stuck in fetching — promoting`);
+        job.state = "ready";
+        recovered++;
+      }
+    }
+  }
+
+  // Safety: if queue has items, nothing is playing, and drain hasn't been called recently
+  if (recovered > 0 || (ttsJobQueue.length > 0 && !ttsCurrentlyPlaying)) {
     drainAudioBuffer();
   }
 }
@@ -2347,11 +2376,121 @@ let entryTtsCursor: Map<number, number> = new Map();
 // Each tmux window gets its own conversation entries array.
 // Prevents test entries and CLI output from leaking across windows.
 const windowEntries = new Map<string, ConversationEntry[]>();
-let currentWindowKey = ""; // Set on startup from terminal.currentTarget
+let currentWindowKey = "_unset"; // Sentinel: no window selected until client sends window_preference
+
+// --- Server's own pane exclusion ---
+// The server itself runs in a tmux pane. We MUST never scrape our own pane,
+// or coordinator/agent output leaks into the conversation view as entries/TTS.
+let _serverOwnPaneId: string | null = null;
+try {
+  const id = execFileSync("tmux", ["display-message", "-p", "#{pane_id}"], {
+    encoding: "utf-8", timeout: 3000
+  }).trim();
+  if (id && id.startsWith("%")) {
+    _serverOwnPaneId = id;
+    console.log(`[startup] Server's own pane: ${id} — will never scrape this pane`);
+  }
+} catch {
+  // Not running inside tmux — no exclusion needed
+}
 
 /** Get the window key for the currently active tmux pane */
 function getWindowKey(): string {
   return terminal?.currentTarget ?? currentWindowKey ?? "_default";
+}
+
+/** Check if the current target is a voice session (claude-voice).
+ *  Non-voice sessions (coordinator, agents) should never have speakable entries. */
+function isVoiceSession(): boolean {
+  const target = terminal?.displayTarget ?? terminal?.currentTarget ?? currentWindowKey ?? "";
+  const session = target.split(":")[0];
+  return session === "claude-voice" || session === "" || session === "_default";
+}
+
+/** Check if a client window has been selected (not still in _unset sentinel state).
+ *  Until a client sends window_preference, the server should not scrape/broadcast. */
+function isWindowActive(): boolean {
+  return currentWindowKey !== "_unset" && currentWindowKey !== "";
+}
+
+/** Activate a window — switch target, load entries, reset status.
+ *  Called from window_preference handler and fallback timer.
+ *  @param target - "session:windowIdx" format
+ *  @param ws - the requesting WebSocket client (entries sent to this client) */
+function activateWindow(target: string, ws: import("ws").WebSocket): void {
+  const lastColon = target.lastIndexOf(":");
+  if (lastColon === -1 || !terminal.switchTarget) return;
+  const session = target.slice(0, lastColon);
+  const windowIdx = parseInt(target.slice(lastColon + 1));
+  if (isNaN(windowIdx)) return;
+
+  const isFirst = !isWindowActive();
+  console.log(`[window] ${isFirst ? "First activation" : "Switching"} to: ${target}`);
+
+  // Save current window state (skip on first activation)
+  if (!isFirst) saveCurrentWindowEntries();
+  terminal.switchTarget(session, windowIdx);
+
+  // CRITICAL: Reject activation if the resolved pane is the server's own pane.
+  // This prevents coordinator/agent output from leaking into conversation view.
+  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) {
+    console.log(`[window] BLOCKED: ${target} resolves to server's own pane ${_serverOwnPaneId} — refusing to scrape ourselves`);
+    return;
+  }
+
+  saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
+  currentWindowKey = getWindowKey();
+
+  // Stop TTS + reset all state
+  stopClientPlayback2("session_switch");
+  lastPassiveSnapshot = "";
+  _lastPassiveUserInput = "";
+  _lastPassiveUserInputTs = 0;
+  _cooldownThinking = false;
+  lastStreamEndTime = 0;
+  preInputSnapshot = "";
+  _pendingPromptInput = "";
+  _pendingPromptInputTs = 0;
+  _scrollbackCache = { text: "", ts: 0 };
+  if (streamState !== "IDLE") streamState = "IDLE";
+  entryTtsCursor.clear();
+
+  // Load entries for this window
+  const cached = loadWindowEntries(currentWindowKey);
+  if (cached) {
+    setConversationEntries(cached.filter(e => !e.window || e.window === currentWindowKey));
+  } else {
+    const scrollback = loadScrollbackEntries();
+    setConversationEntries(scrollback);
+  }
+  for (const e of conversationEntries) e.spoken = true;
+  if (conversationEntries.length > 0) {
+    entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
+  }
+
+  // Send entries to requesting client
+  let recentEntries = [...conversationEntries];
+  if (recentEntries.length > 80) recentEntries = recentEntries.slice(-80);
+  if (!(ws as any)._isTestMode) {
+    recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+  }
+  ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: false }));
+
+  // Reset ALL status indicators — scoped to this window now
+  broadcast({ type: "voice_status", state: "idle" });
+  broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
+  broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
+
+  // Initialize passive watcher snapshot
+  try {
+    lastPassiveSnapshot = captureTmuxPane();
+    preInputSnapshot = lastPassiveSnapshot;
+  } catch {}
+
+  // On first activation, send Murmur context to voice session
+  if (isFirst) sendMurmurContext(3000);
+
+  console.log(`[window] Activated ${target}, sent ${recentEntries.length} entries + idle status`);
 }
 
 /** Update conversationEntries and sync to the per-window map */
@@ -2374,7 +2513,20 @@ function loadWindowEntries(windowKey: string): ConversationEntry[] | null {
 
 /** Push an entry into conversationEntries with window tag automatically set */
 function pushEntry(entry: ConversationEntry): void {
-  entry.window = getWindowKey();
+  const wk = getWindowKey();
+  entry.window = wk;
+  // Non-voice sessions (coordinator, agents): force speakable=false to prevent TTS leak
+  if (!isVoiceSession() && entry.speakable) {
+    entry.speakable = false;
+    console.log(`[WINDOW-TTS-GUARD] Suppressed speakable for entry ${entry.id} — non-voice session (window=${wk})`);
+  }
+  // Safety: if conversationEntries somehow has entries from a different window, log it
+  if (conversationEntries.length > 0) {
+    const lastEntry = conversationEntries[conversationEntries.length - 1];
+    if (lastEntry.window && wk && lastEntry.window !== wk && lastEntry.window !== "_default") {
+      console.warn(`[WINDOW-LEAK] Entry window mismatch! Last entry window=${lastEntry.window}, current window=${wk}. conversationEntries may have cross-window pollution.`);
+    }
+  }
   conversationEntries.push(entry);
 }
 
@@ -2854,7 +3006,7 @@ function loadScrollbackEntries(): ConversationEntry[] {
         id: ++entryIdCounter,
         role: "assistant",
         text,
-        speakable: true,
+        speakable: isVoiceSession(), // Only speakable if watching a voice session
         spoken: true, // silent — user replays on demand
         ts: Date.now() - (totalTurns - t) * 300000 + 1000,
         turn: turnNum,
@@ -3620,11 +3772,21 @@ let _lastPassiveUserInputTs = 0;
 let _cooldownThinking = false; // Track if we sent thinking state during cooldown
 let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
 const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
+// Pending input: captures prompt content while user is typing/pasting (pre-Enter).
+// When user pastes text (Cmd+V), it appears on the prompt line instantly but Enter
+// hasn't been pressed yet. The next poll may already show spinner, making extraction
+// harder. By saving the pending input during idle, we have a reliable third extraction
+// method when spinner appears.
+let _pendingPromptInput = "";
+let _pendingPromptInputTs = 0;
 
 function startPassiveWatcher() {
   if (passiveWatcher) return;
   passiveWatcher = setInterval(() => {
+    if (!isWindowActive()) return; // No window selected yet — don't scrape
     if (!terminal.isSessionAlive()) return;
+    // Safety net: never scrape our own pane (coordinator/server output)
+    if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return;
 
     const pane = captureTmuxPane();
     if (!pane) return;
@@ -3672,32 +3834,85 @@ function startPassiveWatcher() {
     if (hasSpinnerChars(pane)) {
       console.log("[passive] Spinner detected — native CLI input");
 
-      // Extract user input: find the LAST ❯ prompt line, then collect ALL subsequent
-      // lines until we hit spinner chars, a separator, or another ❯ prompt.
-      // This handles multi-line inputs that wrap at terminal width.
+      // Extract user input using TWO methods:
+      // 1. Prompt parsing: find ❯ line + continuation lines (works for typed input)
+      // 2. Snapshot diff: compare idle snapshot with current pane (handles paste, wrapped text)
+      // Use whichever produces more text — paste detection via prompt parsing often truncates
+      // because pasted text may contain blank lines, special chars, or overflow the visible pane.
+
+      // Method 1: Prompt line parsing
       const lines = pane.split("\n");
-      let userInput = "";
+      let promptInput = "";
       for (let i = lines.length - 1; i >= 0; i--) {
         const trimmed = lines[i].trim();
         if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
-          // Found the prompt line — collect it plus ALL continuation lines.
-          // Continuation lines are everything between the ❯ line and the spinner/end.
           const parts = [trimmed.slice(2).trim()];
           for (let j = i + 1; j < lines.length; j++) {
             const next = lines[j].trim();
-            // Stop at: spinner chars, separator lines, new prompt, or Claude output markers
             if (!next) break;
             if (next.startsWith("❯")) break;
             if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(next)) break;
             if (/^[─━═]{3,}/.test(next)) break;
             if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(next)) break;
-            // Claude Code UI status lines — not user input
             if (/^Press (up|down|esc|enter|tab)/i.test(next)) break;
             parts.push(next);
           }
-          userInput = parts.join(" ");
+          promptInput = parts.join(" ");
           break;
         }
+      }
+
+      // Method 2: Snapshot diff — compare saved idle snapshot with current pane.
+      // New lines between snapshots that aren't chrome/spinner = user's input (typed + pasted).
+      let diffInput = "";
+      if (lastPassiveSnapshot) {
+        const preLines = lastPassiveSnapshot.split("\n");
+        const curLines = pane.split("\n");
+        // Find where the two diverge
+        let divergeIdx = 0;
+        for (let i = 0; i < Math.min(preLines.length, curLines.length); i++) {
+          if (preLines[i] !== curLines[i]) { divergeIdx = i; break; }
+          divergeIdx = i + 1;
+        }
+        // Collect new lines from divergence point, filtering out chrome/spinner
+        const newParts: string[] = [];
+        for (let i = divergeIdx; i < curLines.length; i++) {
+          const t = curLines[i].trim();
+          if (!t) continue;
+          if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(t)) continue; // spinner
+          if (/^[─━═]{3,}/.test(t)) continue; // separator
+          if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(t)) continue;
+          if (/^Press (up|down|esc|enter|tab)/i.test(t)) continue;
+          // Strip ❯ prefix if present
+          const cleaned = t.startsWith("❯") ? t.slice(1).trim() : t;
+          if (cleaned) newParts.push(cleaned);
+        }
+        diffInput = newParts.join(" ").trim();
+      }
+
+      // Method 3: Pending input — text captured from prompt line while user was typing/pasting.
+      // If user pasted text (Cmd+V), the previous idle poll would have seen the prompt with
+      // content and saved it in _pendingPromptInput. This is the most reliable method for
+      // paste detection because it captures text BEFORE Enter was pressed.
+      let pendingInput = "";
+      if (_pendingPromptInput && Date.now() - _pendingPromptInputTs < 10000) {
+        pendingInput = _pendingPromptInput;
+        console.log(`[passive] Pending input available (${pendingInput.length} chars): "${pendingInput.slice(0, 80)}"`);
+      }
+      _pendingPromptInput = ""; // Consume — don't reuse on next poll
+
+      // Use the longest result — each method catches different cases:
+      // - promptInput: reliable for short typed text
+      // - diffInput: captures text missed by prompt parsing (wrapped lines)
+      // - pendingInput: captures pasted text seen before Enter was pressed
+      let userInput = promptInput;
+      if (diffInput.length > userInput.length + 10) {
+        console.log(`[passive] Diff input longer (${diffInput.length} vs ${userInput.length}) — using diff`);
+        userInput = diffInput;
+      }
+      if (pendingInput.length > userInput.length + 10) {
+        console.log(`[passive] Pending input longer (${pendingInput.length} vs ${userInput.length}) — using pending (paste detected)`);
+        userInput = pendingInput;
       }
 
       // Take pre-snapshot from saved state (before spinner appeared)
@@ -3813,13 +4028,38 @@ function startPassiveWatcher() {
       // gets mistakenly returned as Claude's response content.
       const paneLines = pane.split("\n");
       let lastPromptLine = "";
+      let lastPromptIdx = -1;
       for (let i = paneLines.length - 1; i >= 0; i--) {
         const t = paneLines[i].trim();
-        if (t.startsWith("❯")) { lastPromptLine = t; break; }
+        if (t.startsWith("❯")) { lastPromptLine = t; lastPromptIdx = i; break; }
       }
       // Empty prompt (just ❯ with optional whitespace) = user is idle, safe to save
       if (!lastPromptLine || /^❯\s*$/.test(lastPromptLine)) {
         lastPassiveSnapshot = pane;
+        // Clear pending input — user is idle
+        _pendingPromptInput = "";
+      } else {
+        // Prompt has content — user is mid-type or mid-paste.
+        // Capture pending input: text on prompt line + continuation lines below.
+        // This is critical for paste detection: pasted text appears instantly on the
+        // prompt but Enter hasn't been pressed. If spinner appears on next poll,
+        // this saved text provides reliable user input extraction.
+        const parts = [lastPromptLine.slice(lastPromptLine.indexOf("❯") + 1).trim()];
+        for (let j = lastPromptIdx + 1; j < paneLines.length; j++) {
+          const cont = paneLines[j].trim();
+          if (!cont) break;
+          if (cont.startsWith("❯")) break;
+          if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(cont)) break;
+          if (/^[─━═]{3,}/.test(cont)) break;
+          if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(cont)) break;
+          parts.push(cont);
+        }
+        const captured = parts.join(" ").trim();
+        if (captured.length > _pendingPromptInput.length) {
+          _pendingPromptInput = captured;
+          _pendingPromptInputTs = Date.now();
+          console.log(`[passive] Pending input captured (${captured.length} chars): "${captured.slice(0, 80)}"`);
+        }
       }
     }
   }, 2000);
@@ -4191,7 +4431,8 @@ function broadcast(msg: Record<string, unknown>) {
   }
   wslog("out", (msg.type as string) || "unknown", JSON.stringify(msg).length);
 
-  // For entry broadcasts: filter test entries out of the payload for non-test clients.
+  // For entry broadcasts: filter by current window AND test isolation.
+  // Window filtering prevents entries from other tmux windows leaking into the view.
   // Test entries (sourceTag starts with "text-input-test") should NOT appear in the
   // user's conversation view. Filter by sourceTag on the entry itself (not by ID set)
   // to avoid timing race where addUserEntry broadcasts before caller registers the ID.
@@ -4199,7 +4440,18 @@ function broadcast(msg: Record<string, unknown>) {
   let dataForTest: string | null = null;
   const isEntryMsg = msg.type === "entry" && Array.isArray(msg.entries);
   if (isEntryMsg) {
-    const entries = msg.entries as ConversationEntry[];
+    let entries = msg.entries as ConversationEntry[];
+    // Window-scope filter: only send entries belonging to the current window.
+    // Entries with no window tag (legacy) are allowed through.
+    const wk = getWindowKey();
+    if (wk && wk !== "_default") {
+      const before = entries.length;
+      entries = entries.filter(e => !e.window || e.window === wk);
+      if (entries.length < before) {
+        console.log(`[broadcast] Window filter: ${before} → ${entries.length} entries (kept window=${wk})`);
+      }
+      msg.entries = entries;
+    }
     const hasTestEntries = entries.some(e => e.sourceTag?.startsWith("text-input-test"));
     if (hasTestEntries) {
       const realEntries = entries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
@@ -4291,17 +4543,36 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
     });
   }
 
-  // Send conversation entries so reconnecting clients see the full history
-  // Cap to last 80 entries to avoid overwhelming mobile clients on reconnect
-  // Filter out test entries for non-test clients (by sourceTag, same as broadcast())
-  if (conversationEntries.length > 0) {
-    let recentEntries = conversationEntries.length > 80
-      ? conversationEntries.slice(-80)
-      : conversationEntries;
+  // Send conversation entries so reconnecting clients see the full history.
+  // If window is not yet active (_unset), entries will be sent when client sends window_preference.
+  if (isWindowActive() && conversationEntries.length > 0) {
+    let recentEntries = [...conversationEntries];
+    // Window-scope filter: only send entries for current window
+    const wk = getWindowKey();
+    if (wk && wk !== "_default") {
+      recentEntries = recentEntries.filter(e => !e.window || e.window === wk);
+    }
+    if (recentEntries.length > 80) {
+      recentEntries = recentEntries.slice(-80);
+    }
     if (!(ws as any)._isTestMode) {
       recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
     }
     ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: streamState === "RESPONDING" }));
+  }
+
+  // Fallback: if no window_preference received within 5s and window is still _unset,
+  // activate using saved settings (for clients without window_preference support).
+  if (!isWindowActive()) {
+    const fallbackTimer = setTimeout(() => {
+      if (!isWindowActive() && ws.readyState === WebSocket.OPEN) {
+        const saved = loadSettings();
+        const target = saved.tmuxTarget || "claude-voice:0";
+        console.log(`[ws] No window_preference received — falling back to saved target: ${target}`);
+        activateWindow(target, ws);
+      }
+    }, 5000);
+    ws.on("close", () => clearTimeout(fallbackTimer));
   }
 
   // Send current panel settings (prefer persistent file, fall back to signal files)
@@ -4533,7 +4804,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const safeTestPrefixes = [
         "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
         "mute:", "replay", "replay:", "text:",  // text: is handled separately with its own testmode check
-        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:",  // TTS control messages safe for testing
+        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:", "window_preference:",  // TTS control messages safe for testing
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
       if (!isSafe) {
@@ -4795,6 +5066,24 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
+    // Client-side window preference on reconnect — switch server to client's last-known window.
+    // Mirrors tmux:switch: handler — must reset ALL status indicators, not just entries.
+    // Client-side window preference — selects which tmux window to watch.
+    // This is the PRIMARY activation trigger: no scraping/broadcasting happens until
+    // a client sends this. Uses shared activateWindow() for all resets.
+    if (msg.startsWith("window_preference:")) {
+      const preferred = msg.slice(18).trim();
+      if (!preferred) return;
+      const currentTarget = terminal?.displayTarget ?? terminal?.currentTarget ?? "";
+      // If already on this window and window is active, nothing to do
+      if (isWindowActive() && (currentTarget === preferred || getWindowKey() === preferred)) {
+        console.log(`[ws] Window preference "${preferred}" already matches current target`);
+        return;
+      }
+      activateWindow(preferred, ws);
+      return;
+    }
+
     // ElevenLabs API key
     if (msg.startsWith("elevenlabs_key:")) {
       const key = msg.slice(15).trim();
@@ -5001,7 +5290,12 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         // Load entries for the new window: from cache if available, else from scrollback
         const cached = loadWindowEntries(currentWindowKey);
         if (cached) {
-          setConversationEntries(cached);
+          // Safety: filter out any entries from other windows that may have leaked in
+          const cleaned = cached.filter(e => !e.window || e.window === currentWindowKey);
+          if (cleaned.length < cached.length) {
+            console.log(`[tmux] Cleaned ${cached.length - cleaned.length} cross-window entries from cache`);
+          }
+          setConversationEntries(cleaned);
           console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
         } else {
           const scrollback = loadScrollbackEntries();
@@ -5664,20 +5958,12 @@ if (savedTarget && terminal.switchTarget) {
     }
   }
 }
-// Initialize per-window conversation tracking
-currentWindowKey = getWindowKey();
-console.log(`[startup] Window key: ${currentWindowKey}`);
-// Load historical entries from tmux scrollback so clients see prior context on connect
-const catchupEntries = loadScrollbackEntries();
-if (catchupEntries.length > 0) {
-  setConversationEntries(catchupEntries);
-  // currentTurn starts at 0; live turns will be positive, historical are negative
-  console.log(`[startup] Loaded ${catchupEntries.length} entries from scrollback for window ${currentWindowKey}`);
-} else {
-  setConversationEntries([]);
-}
-
-sendMurmurContext(5000);
+// Per-window conversation tracking — DON'T load entries or scrape until a client
+// sends window_preference. This prevents the server from defaulting to its own pane
+// (coordinator) and leaking coordinator output as conversation entries / TTS.
+currentWindowKey = "_unset";
+setConversationEntries([]);
+console.log(`[startup] Window key: _unset (waiting for client window_preference)`);
 initSignalFiles();
 
 // Clean up orphaned TTS temp files from previous/crashed sessions
@@ -5714,6 +6000,8 @@ setInterval(async () => {
 let lastTerminalText = "";
 setInterval(() => {
   if (clients.size === 0) return;
+  if (!isWindowActive()) return; // No window selected — don't broadcast stale pane content
+  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return; // Never broadcast own pane
   try {
     const text = captureTerminalPane();
     if (text && text !== lastTerminalText) {
@@ -5728,20 +6016,10 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Terminal backend: ${terminal.constructor.name}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);
   console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
-  // Initialize passive snapshot to current pane content BEFORE starting the watcher.
-  // Without this, lastPassiveSnapshot is "" on startup. If a spinner is detected on the
-  // first poll (Claude already working), the synthesized pre-snapshot may be incomplete,
-  // causing extractStructuredOutput to treat old scrollback content as "new" — flooding
-  // the conversation with duplicate entries from previous turns.
-  try {
-    const initialPane = captureTmuxPane();
-    if (initialPane) {
-      lastPassiveSnapshot = initialPane;
-      console.log(`  Passive snapshot initialized (${initialPane.split("\n").length} lines)`);
-    }
-  } catch {}
+  // Passive watcher starts immediately but gates on isWindowActive().
+  // Actual scraping/broadcasting begins only after a client sends window_preference.
   startPassiveWatcher();
-  console.log(`  Passive pane watcher: active (2s poll)`);
+  console.log(`  Passive pane watcher: started (gated on window_preference)`);
   setInterval(sweepStaleTtsJobs, 15000); // Periodic sweep for stuck TTS jobs
 });
 

@@ -17,6 +17,9 @@ export interface TmuxSessionInfo {
   windows: TmuxWindowInfo[];
 }
 
+/** Callback type for input line detection (when user presses Enter after typing) */
+export type InputLineCallback = (text: string) => void;
+
 export interface TerminalManager {
   /** Check if the Claude CLI session is alive */
   isSessionAlive(): boolean;
@@ -60,10 +63,16 @@ export interface TerminalManager {
   /** Human-readable session:window label (never a pane ID like %3) */
   readonly displayTarget?: string;
 
-  /** Record text that was just sent to terminal (for passive watcher dedup) */
+  /**
+   * Record that text was sent programmatically (via Murmur text box or STT).
+   * The passive watcher uses this to skip re-detecting the same input from the terminal.
+   */
   recordSentInput?(text: string): void;
 
-  /** Check if text was recently sent (within TTL) to avoid passive watcher re-detection */
+  /**
+   * Check if text was recently sent programmatically (within last 30s).
+   * Returns true if the passive watcher should skip this input (already captured by source #1/#2).
+   */
   wasRecentlySent?(text: string): boolean;
 }
 
