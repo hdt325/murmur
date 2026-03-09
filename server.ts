@@ -974,7 +974,7 @@ const TTS_CHUNK_MIN_CHARS = 50;  // Floor — don't send tiny fragments to Kokor
 const TTS_CHUNK_MAX_CHARS = 250;
 const TTS_FIRST_CHUNK_MAX = 120; // Smaller first chunk → faster initial audio from Kokoro
 const TTS_MAX_QUEUE = 50;
-const TTS_PLAYING_TIMEOUT_MS = 30000; // Max time a job can stay in "playing" without client ack
+const TTS_PLAYING_TIMEOUT_MS = 15000; // Max time a job can stay in "playing" without client ack
 
 /** Split text into chunks at word boundaries, each ≤ maxChars.
  *  Optional firstChunkMax allows a smaller first chunk for faster initial audio. */

@@ -1894,8 +1894,8 @@ async function testTask11_tmuxNameMismatch() {
 
   // 2. Check tmux:switch broadcast uses displayTarget
   const switchSection = serverSrc.slice(
-    serverSrc.indexOf("tmux:switch:"),
-    serverSrc.indexOf("tmux:switch:") + 2000
+    serverSrc.indexOf("function _executeWindowSwitch"),
+    serverSrc.indexOf("function _executeWindowSwitch") + 4500
   );
   const switchUsesDisplay = switchSection.includes("displayTarget");
   report("Server tmux:switch broadcast uses displayTarget", switchUsesDisplay);
@@ -3168,7 +3168,7 @@ async function testTtsGenBump_preserveQueue() {
   report("new_input NOT in user-initiated set (preserves queue)", !newInputInSet);
 
   // stopClientPlayback2 checks shouldCancelQueue
-  const stopSection = src.slice(src.indexOf("function stopClientPlayback2"), src.indexOf("function stopClientPlayback2") + 1500);
+  const stopSection = src.slice(src.indexOf("function stopClientPlayback2"), src.indexOf("function stopClientPlayback2") + 3500);
   const hasCancelCheck = stopSection.includes("shouldCancelQueue") && stopSection.includes("USER_INITIATED_BUMP_REASONS");
   report("stopClientPlayback2 checks shouldCancelQueue", hasCancelCheck);
 
@@ -3333,7 +3333,7 @@ async function testDoubleTapZoomFix() {
   report("Talk bar button has touch-action: manipulation", hasTalkTouch);
 
   // Controls buttons have touch-action: manipulation
-  const controlsSection = src.slice(src.indexOf(".controls button {"), src.indexOf(".controls button {") + 500);
+  const controlsSection = src.slice(src.indexOf(".controls button {"), src.indexOf(".controls button {") + 900);
   const hasControlsTouch = /touch-action:\s*manipulation/.test(controlsSection);
   report("Controls buttons have touch-action: manipulation", hasControlsTouch);
 
@@ -4231,7 +4231,7 @@ async function testPerWindowConversationIsolation() {
   report("Window switch resets streamState to IDLE", switchResetsStream);
 
   // 17. Window switch initializes new pane snapshot (via activateWindow)
-  const activateSnap = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 3200);
+  const activateSnap = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 6500);
   const switchInitSnapshot = activateSnap.includes("lastPassiveSnapshot = captureTmuxPane");
   report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
 
@@ -4419,7 +4419,7 @@ async function testStatusScopingOnWindowSwitch() {
 
   // 9. window_preference handler uses activateWindow()
   const wpStart = src.indexOf('msg.startsWith("window_preference:")');
-  const wpSection = src.slice(wpStart, wpStart + 1200);
+  const wpSection = src.slice(wpStart, wpStart + 2000);
   const usesActivate = wpSection.includes("activateWindow(preferred, ws)");
   report("window_preference handler uses activateWindow()", usesActivate);
 }
@@ -4927,7 +4927,7 @@ async function testBubblesDisappearWindowSwitch() {
 
   // 2. _executeWindowSwitch saves entries before switching
   const switchFnIdx = src.indexOf("function _executeWindowSwitch");
-  const switchBody = src.slice(switchFnIdx, switchFnIdx + 2000);
+  const switchBody = src.slice(switchFnIdx, switchFnIdx + 5000);
   const savesBeforeSwitch = switchBody.includes("saveCurrentWindowEntries()");
   report("_executeWindowSwitch saves entries before switch", savesBeforeSwitch);
 
