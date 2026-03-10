@@ -48,6 +48,13 @@ export interface TerminalManager {
   /** Stop streaming pane output */
   stopPipeStream(): void;
 
+  /**
+   * Push-based output: register a callback that receives raw terminal output
+   * as it arrives. The backend manages pipe-pane (tmux) or onData (pty) internally.
+   * Call once — the pipe runs continuously until destroy().
+   */
+  onOutput?(callback: (data: string) => void): void;
+
   /** Clean up resources */
   destroy(): void;
 
@@ -62,6 +69,9 @@ export interface TerminalManager {
 
   /** Human-readable session:window label (never a pane ID like %3) */
   readonly displayTarget?: string;
+
+  /** The pinned pane ID (e.g. "%3") or null if pin failed */
+  readonly pinnedPaneId?: string | null;
 
   /**
    * Record that text was sent programmatically (via Murmur text box or STT).

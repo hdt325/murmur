@@ -2355,6 +2355,33 @@ async function main() {
   await testWindowSwitchEntryLoading();
   await testKokoroReconnectDrain();
 
+  // Round 19: Tasks #35-#38
+  await testTask35_staleTtsCancellation();
+  await testTask36_toolOutputFiltering();
+  await testTask37_genBumpRefinement();
+  await testTask38_resendButton();
+
+  // Round 20: Urgent bugs U1-U4
+  await testBugU3_toolOutputAsUserEntry();
+  await testBugU1_duplicateAssistantEntries();
+  await testBugU2_ttsAutoPlayOnReconnect();
+  await testBugU4_testEntryIsolation();
+
+  // Round 21: Urgent bugs U5-U6
+  await testBugU5_staleSnapshotTTL();
+  await testBugU6_scrollJackingPrevention();
+
+  // Round 22: Parser double-fire, filler clobber, stale dedup
+  await testParserDoubleFire();
+  await testFillerClobberGuard();
+  await testStaleDedupTierOne();
+
+  // Round 23: Push-based architecture
+  await testPushArchitecture();
+
+  // Round 24: Monitor dashboard debug endpoints
+  await testMonitorDashboardEndpoints();
+
   await teardown();
 }
 
@@ -6696,6 +6723,478 @@ async function testKokoroReconnectDrain() {
   // Startup service check
   const hasStartupCheck = src.includes("checkAllServices()");
   report("Services checked on startup", hasStartupCheck);
+}
+
+async function testTask35_staleTtsCancellation() {
+  console.log("\n[Task 35] Stale TTS cancellation on new assistant content");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // cancelOldTurnJobs() should be called BEFORE the paragraph matching loop,
+  // right after change detection confirms new content. Previously it was only
+  // called inside the new-entry creation block, missing cases where paragraphs
+  // matched existing entries.
+  const broadcastFn = src.slice(src.indexOf("function broadcastCurrentOutput()"));
+  const changeDetectIdx = broadcastFn.indexOf("lastBroadcastText = normalized;");
+  const matchLoopIdx = broadcastFn.indexOf("Match paragraphs to existing entries");
+  const cancelCallIdx = broadcastFn.indexOf("cancelOldTurnJobs()", changeDetectIdx);
+
+  // cancelOldTurnJobs() appears between change detection and matching loop
+  const cancelBeforeLoop = cancelCallIdx > changeDetectIdx && cancelCallIdx < matchLoopIdx;
+  report("cancelOldTurnJobs() called before paragraph matching loop", cancelBeforeLoop);
+
+  // The old call site inside if(!isDup) should be removed or commented out
+  const newEntryBlock = broadcastFn.slice(broadcastFn.indexOf("if (!isDup)"));
+  const oldCallInNewEntry = newEntryBlock.slice(0, 200).includes("cancelOldTurnJobs()");
+  report("Old cancelOldTurnJobs() removed from new-entry block", !oldCallInNewEntry);
+}
+
+async function testTask36_toolOutputFiltering() {
+  console.log("\n[Task 36] Tool output filtering — Bash(), ⏺, ⎿ markers");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // isToolOutputLine should catch common tool markers
+  const fnBody = src.slice(src.indexOf("function isToolOutputLine("), src.indexOf("function isToolOutputLine(") + 1500);
+
+  report("Filters ⏺ Bash/Read/Write/Edit markers", /⏺.*Bash/i.test(fnBody));
+  report("Filters Bash() calls", /Bash\(/i.test(fnBody));
+  report("Filters ⎿ continuation lines", /⎿/.test(fnBody));
+  report("Filters background command notifications", /Background command/i.test(fnBody) || src.includes("bg_task_notification"));
+
+  // isChromeSkip should filter "Background command" notifications
+  const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip("));
+  report("isChromeSkip filters Background command", /Background command/i.test(chromeSkipFn));
+
+  // isToolOutputLine should also filter tool summary lines
+  report("Filters 'Ran X' tool summaries", /Ran\s/i.test(fnBody));
+  report("Filters 'Read N files' summaries", /Read\s+\\d/i.test(fnBody));
+}
+
+async function testTask37_genBumpRefinement() {
+  console.log("\n[Task 37] Generation bump refinement — passive_redetect preserves TTS");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // passive_redetect should NOT be in USER_INITIATED_BUMP_REASONS
+  const userInitiated = src.slice(src.indexOf("USER_INITIATED_BUMP_REASONS"), src.indexOf("USER_INITIATED_BUMP_REASONS") + 300);
+  report("passive_redetect NOT in USER_INITIATED_BUMP_REASONS", !userInitiated.includes("passive_redetect"));
+
+  // new_input should NOT be in USER_INITIATED_BUMP_REASONS
+  report("new_input NOT in USER_INITIATED_BUMP_REASONS", !userInitiated.includes("new_input"));
+
+  // passive_redetect should be a valid GenerationEvent reason
+  report("passive_redetect is valid GenerationEvent reason", src.includes('"passive_redetect"'));
+
+  // stopClientPlayback2 with passive_redetect should preserve queue (not cancel)
+  const stopFn = src.slice(src.indexOf("function stopClientPlayback2("));
+  const shouldCancel = stopFn.slice(0, 300);
+  report("shouldCancelQueue uses USER_INITIATED_BUMP_REASONS", shouldCancel.includes("USER_INITIATED_BUMP_REASONS"));
+}
+
+async function testTask38_resendButton() {
+  console.log("\n[Task 38] Resend button on user bubbles");
+  const html = readFileSync("index.html", "utf-8");
+
+  // Resend button should exist in entry rendering
+  report("Resend button (msg-resend) created for user entries", html.includes("msg-resend"));
+
+  // Click handler should send resend: message via WS
+  report("Resend sends WS message with resend: prefix", /ws\.send\(["']resend:/.test(html));
+
+  // Server should handle resend: messages
+  const src = readFileSync("server.ts", "utf-8");
+  report("Server handles resend: messages", src.includes('"resend:"') || src.includes("'resend:'") || /startsWith\(["']resend:/.test(src));
+
+  // Server resend handler tags source as text-input-resend
+  report("Resend tagged as text-input-resend source", src.includes("text-input-resend"));
+
+  // Flow mode: resend button should NOT be display:none (Task #38 fix)
+  // It should only be opacity:0 (visible on hover/tap)
+  const flowHiddenBlock = html.slice(html.indexOf("body.flow-mode .msg .role"), html.indexOf("body.flow-mode .msg .role") + 300);
+  report("Flow mode does NOT hide resend button via display:none", !flowHiddenBlock.includes("msg-resend"));
+
+  // Flow mode opacity styling for resend
+  report("Flow mode shows resend on hover", html.includes("body.flow-mode .msg-wrap:hover .msg-resend"));
+}
+
+async function testBugU3_toolOutputAsUserEntry() {
+  console.log("\n[Bug U3] Tool output filtered from user entries");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // addUserEntry should call isToolOutputLine to filter tool markers
+  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 3000);
+  report("addUserEntry checks isToolOutputLine", addUserFn.includes("isToolOutputLine(text)"));
+
+  // Passive watcher should also filter tool output before entry creation
+  const passiveSection = src.slice(src.indexOf("isAgentInfraCommand(userInput)"));
+  const toolFilterInPassive = passiveSection.slice(0, 500).includes("isToolOutputLine(userInput)");
+  report("Passive watcher filters tool output", toolFilterInPassive);
+}
+
+async function testBugU1_duplicateAssistantEntries() {
+  console.log("\n[Bug U1] Intra-loop dedup in broadcastCurrentOutput");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // broadcastCurrentOutput should track created texts within loop
+  const broadcastFn = src.slice(src.indexOf("function broadcastCurrentOutput()"));
+  report("createdNorms Set for intra-loop dedup", broadcastFn.includes("createdNorms"));
+  report("Checks createdNorms before creating entry", broadcastFn.includes("!createdNorms.has(paraNorm)"));
+
+  // handleStreamDone dedup should use wider window (30 entries, no turn restriction)
+  const handleDoneFn = src.slice(src.indexOf("function handleStreamDone()") || src.indexOf("// Final extraction into entry model"));
+  report("handleStreamDone uses slice(-30) for dedup", handleDoneFn.includes("slice(-30)"));
+}
+
+async function testBugU2_ttsAutoPlayOnReconnect() {
+  console.log("\n[Bug U2] TTS auto-play on client reconnect");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // setAudioClient should drain TTS queue when new client connects with pending jobs
+  const setAudioFn = src.slice(src.indexOf("function setAudioClient("), src.indexOf("function setAudioClient(") + 1000);
+  report("setAudioClient calls drainAudioBuffer on new client", setAudioFn.includes("drainAudioBuffer()"));
+  report("Only drains when jobs pending and not playing", setAudioFn.includes("ttsJobQueue.length > 0") && setAudioFn.includes("!ttsCurrentlyPlaying"));
+
+  // sendToAudioClient should return boolean success
+  report("sendToAudioClient returns boolean", /function sendToAudioClient.*:\s*boolean/.test(src));
+  report("sendToAudioClient logs warning when no client", src.includes("No audio client available"));
+}
+
+async function testBugU4_testEntryIsolation() {
+  console.log("\n[Bug U4] Test entry broadcast isolation — ALL send paths");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // All test:entries-* handlers should set sourceTag
+  report("test:entries sets sourceTag", src.includes('sourceTag: "test-entries"'));
+  report("test:entries-full sets sourceTag", src.includes('sourceTag: "test-entries-full"'));
+  report("test:entries-mixed sets sourceTag", src.includes('sourceTag: "test-entries-mixed"'));
+  report("test:entries-tts sets sourceTag", src.includes('sourceTag: "test-entries-tts"'));
+
+  // The STANDALONE isTestEntry function must check BOTH prefixes (used by direct sends + persistence)
+  const standaloneFn = src.slice(src.indexOf("function isTestEntry("), src.indexOf("function isTestEntry(") + 400);
+  report("Standalone isTestEntry checks test- prefix", standaloneFn.includes('startsWith("test-")'));
+  report("Standalone isTestEntry checks text-input-test prefix", standaloneFn.includes('startsWith("text-input-test")'));
+
+  // Broadcast filter should catch both "test-" and "text-input-test" prefixes
+  const broadcastFn = src.slice(src.indexOf("function broadcast("));
+  report("Broadcast filters test- prefix", broadcastFn.includes('startsWith("test-")'));
+  report("Broadcast filters text-input-test prefix", broadcastFn.includes('startsWith("text-input-test")'));
+
+  // CRITICAL: Direct ws.send paths (bypassing broadcast) must ALSO filter test entries
+  // There are exactly 2 direct sends: window activation (opts.sendToWs) and WS reconnect
+  // Both should use isTestEntry() — NOT just sourceTag.startsWith("text-input-test")
+  const directSendPaths = src.match(/\.send\(JSON\.stringify\(\{ type: "entry".*\n/g) || [];
+  report(`Found ${directSendPaths.length} direct entry sends (expect 2)`, directSendPaths.length === 2);
+
+  // Both direct send paths should use isTestEntry() for filtering
+  // Find the two direct send locations and check the filter above each
+  const windowActivation = src.slice(src.indexOf("opts.sendToWs.send(JSON.stringify") - 300, src.indexOf("opts.sendToWs.send(JSON.stringify"));
+  report("Window activation uses isTestEntry()", windowActivation.includes("isTestEntry(e)"));
+
+  const reconnectSend = src.slice(src.indexOf("ws.send(JSON.stringify({ type: \"entry\", entries: recentEntries, partial: streamState") - 300, src.indexOf("ws.send(JSON.stringify({ type: \"entry\", entries: recentEntries, partial: streamState"));
+  report("Reconnect send uses isTestEntry()", reconnectSend.includes("isTestEntry(e)"));
+}
+
+async function testBugU5_staleSnapshotTTL() {
+  console.log("\n[Bug U5] Stale passive snapshot TTL guard");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // lastPassiveSnapshot should have a timestamp tracker
+  report("_lastPassiveSnapshotTs declared", src.includes("_lastPassiveSnapshotTs"));
+
+  // TTL constant should exist (5 minutes)
+  report("PASSIVE_SNAPSHOT_TTL_MS defined", src.includes("PASSIVE_SNAPSHOT_TTL_MS"));
+  const ttlMatch = src.match(/PASSIVE_SNAPSHOT_TTL_MS\s*=\s*(\d+)/);
+  const ttlMs = ttlMatch ? parseInt(ttlMatch[1]) : 0;
+  report("TTL is 5 minutes (300000ms)", ttlMs === 300000 || src.includes("5 * 60 * 1000"));
+
+  // Snapshot usage should check TTL before using
+  const passiveSection = src.slice(src.indexOf("Take pre-snapshot from saved state"));
+  report("Checks snapshot age before using", passiveSection.slice(0, 500).includes("PASSIVE_SNAPSHOT_TTL_MS"));
+
+  // Snapshot diff (Method 2) should also check TTL
+  report("Snapshot diff checks TTL", src.includes("Bug U5: Skip snapshot diff if snapshot is stale"));
+
+  // Timestamp updated when snapshot is saved
+  const snapshotSave = src.slice(src.indexOf("lastPassiveSnapshot = pane;"));
+  report("Timestamp updated on snapshot save", snapshotSave.slice(0, 200).includes("_lastPassiveSnapshotTs = Date.now()"));
+}
+
+async function testBugU6_scrollJackingPrevention() {
+  console.log("\n[Bug U6] Scroll jacking prevention — user can read history");
+  const html = readFileSync("index.html", "utf-8");
+
+  // _transcriptAutoScroll flag should exist
+  report("_transcriptAutoScroll flag declared", html.includes("_transcriptAutoScroll"));
+
+  // Scroll event listener on transcript
+  report("Scroll listener on transcript", html.includes('transcript.addEventListener("scroll"'));
+
+  // scrollTranscript should check _transcriptAutoScroll
+  const scrollFn = html.slice(html.indexOf("function scrollTranscript("));
+  report("scrollTranscript checks _transcriptAutoScroll", scrollFn.slice(0, 300).includes("_transcriptAutoScroll"));
+
+  // SCROLL_THRESHOLD constant
+  report("SCROLL_THRESHOLD defined", html.includes("SCROLL_THRESHOLD"));
+
+  // User actions should force scroll (resume auto-scroll)
+  report("Text send resets _transcriptAutoScroll", html.includes("_transcriptAutoScroll = true") && html.includes("scrollTranscript(true)"));
+
+  // _scrollSetByCode guard to distinguish programmatic vs user scrolls
+  report("_scrollSetByCode guard for programmatic scrolls", html.includes("_scrollSetByCode"));
+
+  // Force scroll on thinking bubble (user just sent input)
+  const thinkingSection = html.slice(html.indexOf("thinkingBubble"));
+  report("Thinking bubble forces scroll", thinkingSection.includes("scrollTranscript(true)"));
+}
+
+// --- Round 23: Push-based architecture ---
+
+async function testPushArchitecture() {
+  console.log("\n[Push Architecture] Poll/scrape replaced with push-based parsing");
+  const src = readFileSync("server.ts", "utf-8");
+  const iface = readFileSync("terminal/interface.ts", "utf-8");
+  const tmux = readFileSync("terminal/tmux-backend.ts", "utf-8");
+  const pty = readFileSync("terminal/pty-backend.ts", "utf-8");
+
+  // Interface has onOutput method
+  report("TerminalManager has onOutput method", iface.includes("onOutput?(callback: (data: string) => void): void"));
+
+  // TmuxBackend implements onOutput with always-on pipe
+  report("TmuxBackend implements onOutput", tmux.includes("onOutput(callback:"));
+  report("TmuxBackend has always-on pipe (_startAlwaysPipe)", tmux.includes("_startAlwaysPipe"));
+  report("TmuxBackend uses fs.watch for push detection", tmux.includes("fsWatch(filePath"));
+  report("TmuxBackend has fallback poll (250ms)", tmux.includes("250"));
+  report("TmuxBackend restarts pipe on switchTarget", tmux.includes("this.restartPipe()"));
+
+  // PtyBackend implements onOutput
+  report("PtyBackend implements onOutput", pty.includes("onOutput(callback:"));
+  report("PtyBackend pushes via _outputCallbacks", pty.includes("_outputCallbacks"));
+
+  // Server has push-based handler
+  report("handlePipeOutput function exists", src.includes("function handlePipeOutput"));
+  report("performPaneCheck function exists", src.includes("function performPaneCheck"));
+  report("schedulePaneCheck function exists", src.includes("function schedulePaneCheck"));
+  report("resetQuietTimer function exists", src.includes("function resetQuietTimer"));
+  report("handleNativeInputDetected function exists", src.includes("function handleNativeInputDetected"));
+  report("reEngageFromPush function exists", src.includes("function reEngageFromPush"));
+
+  // Polling infrastructure removed
+  report("No streamWatcher interval", !src.includes("streamWatcher") || src.includes("// removed"));
+  report("No promptCheckInterval", !src.includes("promptCheckInterval") || src.includes("// removed"));
+  report("No contentCheckTimer", !src.includes("contentCheckTimer") || src.includes("// removed"));
+  report("No reEngageWatcher interval", !src.includes("reEngageWatcher") || src.includes("// removed"));
+  report("No STREAM_FILE constant", !src.includes("STREAM_FILE"));
+  report("No streamFileOffset", !src.includes("streamFileOffset"));
+
+  // Passive watcher removed
+  report("No passiveWatcher interval variable", !src.includes("let passiveWatcher:"));
+  report("No lastPassiveSnapshot variable", !src.includes("let lastPassiveSnapshot"));
+  report("No PASSIVE_SNAPSHOT_TTL_MS", !src.includes("PASSIVE_SNAPSHOT_TTL_MS"));
+  report("No _lastPassiveSnapshotTs", !src.includes("let _lastPassiveSnapshotTs"));
+
+  // Dedup band-aids removed
+  report("No BROADCAST_DEDUP_MS", !src.includes("BROADCAST_DEDUP_MS"));
+  report("No _lastBroadcastHash", !src.includes("_lastBroadcastHash"));
+
+  // Key push infrastructure present
+  report("PARSE_DEBOUNCE_MS defined", src.includes("PARSE_DEBOUNCE_MS"));
+  report("IDLE_CHECK_DEBOUNCE_MS defined", src.includes("IDLE_CHECK_DEBOUNCE_MS"));
+  report("Spinner detection in push handler", src.includes("SPINNER_CHARS_RE.test(_chunk)"));
+
+  // startTmuxStreaming simplified (no pipe management)
+  const startFn = src.slice(src.indexOf("function startTmuxStreaming("), src.indexOf("function startTmuxStreaming(") + 800);
+  report("startTmuxStreaming has no pipe management", !startFn.includes("startPipeStream") && !startFn.includes("STREAM_FILE"));
+  report("startTmuxStreaming has no 50ms poll", !startFn.includes("setInterval"));
+
+  // stopTmuxStreaming simplified (no pipe stop)
+  const stopFn = src.slice(src.indexOf("function stopTmuxStreaming()"), src.indexOf("function stopTmuxStreaming()") + 600);
+  report("stopTmuxStreaming has no pipe stop", !stopFn.includes("stopPipeStream"));
+  report("stopTmuxStreaming cleans up push timers", stopFn.includes("_parseTimer") && stopFn.includes("_quietTimer"));
+
+  // Interrupt detection preserved
+  report("checkForInterruptPrompt function exists", src.includes("function checkForInterruptPrompt"));
+
+  // /debug/pipe-input endpoint for traceability
+  report("_pipeInputLog ring buffer exists", src.includes("_pipeInputLog"));
+  report("PIPE_INPUT_LOG_CAP = 200", src.includes("PIPE_INPUT_LOG_CAP = 200"));
+  report("/debug/pipe-input endpoint registered", src.includes('"/debug/pipe-input"'));
+  report("Pipe log captures timestamp + state", src.includes("state: streamState"));
+
+  // Verify the debug API responds (if server is running)
+  try {
+    const resp = await page.evaluate(() => fetch("/debug/pipe-input").then(r => r.json()).catch(() => null));
+    if (resp) {
+      report("/debug/pipe-input returns JSON with entries array", Array.isArray(resp.entries));
+      report("/debug/pipe-input has cap field", resp.cap === 200);
+    } else {
+      console.log("    (skipped live endpoint check — server not reachable from test page)");
+    }
+  } catch {
+    console.log("    (skipped live endpoint check)");
+  }
+}
+
+// --- Round 22: Parser double-fire, filler clobber, stale dedup ---
+
+async function testParserDoubleFire() {
+  console.log("\n[Parser Double-Fire] broadcastCurrentOutput dedup guard");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // _lastBroadcastHash and _lastBroadcastTs should exist
+  report("_lastBroadcastHash declared", src.includes("_lastBroadcastHash"));
+  report("_lastBroadcastTs declared", src.includes("_lastBroadcastTs"));
+
+  // BROADCAST_DEDUP_MS constant
+  report("BROADCAST_DEDUP_MS defined", src.includes("BROADCAST_DEDUP_MS"));
+
+  // broadcastCurrentOutput should check the hash before proceeding
+  const bcoFn = src.slice(src.indexOf("function broadcastCurrentOutput()"), src.indexOf("function broadcastCurrentOutput()") + 800);
+  report("Checks paneHash === _lastBroadcastHash", bcoFn.includes("paneHash === _lastBroadcastHash"));
+  report("Returns early on duplicate pane content", bcoFn.includes("return;") && bcoFn.includes("_lastBroadcastTs"));
+}
+
+async function testFillerClobberGuard() {
+  console.log("\n[Filler Clobber] Filler entries protected from overwrite");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // The matching section should check sourceTag !== "filler" before overwriting
+  const matchSection = src.slice(src.indexOf("matchedEntryIds.add(matched.id)"));
+  report("Checks sourceTag !== 'filler' before text overwrite",
+    matchSection.slice(0, 400).includes('sourceTag !== "filler"'));
+
+  // Filler entries should have sourceTag set
+  report("Filler entries get sourceTag='filler'",
+    src.includes('sourceTag: "filler"') || src.includes("sourceTag: 'filler'"));
+}
+
+async function testStaleDedupTierOne() {
+  console.log("\n[Stale Dedup] Tier 1 exact-text dedup ignores turn/time");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // isDuplicateEntry should have two-tier comment
+  const dedupFn = src.slice(src.indexOf("function isDuplicateEntry"), src.indexOf("function isDuplicateEntry") + 1000);
+  report("Two-tier dedup documented", dedupFn.includes("two-tier dedup") || dedupFn.includes("Tier 1"));
+
+  // Tier 1: exact text match without turn restriction
+  report("Tier 1: exact text match before turn check",
+    dedupFn.includes("e.text === entry.text") && dedupFn.indexOf("e.text === entry.text") < dedupFn.indexOf("Math.abs"));
+
+  // The exact match should be BEFORE the cutoff/turn checks (no time restriction)
+  const exactMatchIdx = dedupFn.indexOf("e.text === entry.text");
+  const cutoffIdx = dedupFn.indexOf("e.ts < cutoff");
+  report("Exact match check precedes time cutoff", exactMatchIdx > 0 && cutoffIdx > 0 && exactMatchIdx < cutoffIdx);
+}
+
+// --- Round 24: Monitor dashboard debug endpoints ---
+
+async function testMonitorDashboardEndpoints() {
+  console.log("\n[Monitor Dashboard] 11 debug endpoints for Monitor agent");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. Ring buffer declarations exist
+  report("_entryMutationLog ring buffer", src.includes("const _entryMutationLog: EntryMutationLog[]"));
+  report("_dedupLog ring buffer", src.includes("const _dedupLog: DedupLogEntry[]"));
+  report("_windowLog ring buffer", src.includes("const _windowLog: WindowLogEntry[]"));
+  report("_clientLog ring buffer", src.includes("const _clientLog: ClientLogEntry[]"));
+  report("_queueHistory ring buffer", src.includes("const _queueHistory: QueueHistoryEntry[]"));
+  report("_renderLog ring buffer", src.includes("const _renderLog: RenderLogEntry[]"));
+
+  // 2. All ring buffers have ts field (high-resolution timestamps)
+  report("EntryMutationLog has ts", src.includes("interface EntryMutationLog") && /EntryMutationLog[\s\S]*?ts:\s*number/.test(src));
+  report("DedupLogEntry has ts", src.includes("interface DedupLogEntry") && /DedupLogEntry[\s\S]*?ts:\s*number/.test(src));
+  report("WindowLogEntry has ts", src.includes("interface WindowLogEntry") && /WindowLogEntry[\s\S]*?ts:\s*number/.test(src));
+  report("ClientLogEntry has ts", src.includes("interface ClientLogEntry") && /ClientLogEntry[\s\S]*?ts:\s*number/.test(src));
+  report("QueueHistoryEntry has ts", src.includes("interface QueueHistoryEntry") && /QueueHistoryEntry[\s\S]*?ts:\s*number/.test(src));
+  report("RenderLogEntry has ts", src.includes("interface RenderLogEntry") && /RenderLogEntry[\s\S]*?ts:\s*number/.test(src));
+
+  // 3. Ring buffer endpoints registered
+  report("/debug/stt-log endpoint", src.includes('"/debug/stt-log"'));
+  report("/debug/entry-mutations endpoint", src.includes('"/debug/entry-mutations"'));
+  report("/debug/dedup-log endpoint", src.includes('"/debug/dedup-log"'));
+  report("/debug/window-log endpoint", src.includes('"/debug/window-log"'));
+  report("/debug/client-log endpoint", src.includes('"/debug/client-log"'));
+  report("/debug/queue-history endpoint", src.includes('"/debug/queue-history"'));
+  report("/debug/render-log endpoint", src.includes('"/debug/render-log"'));
+
+  // 4. Cross-reference endpoints
+  report("/debug/trace/:entryId endpoint", src.includes('"/debug/trace/:entryId"'));
+  report("/debug/health endpoint", src.includes('"/debug/health"'));
+  report("/debug/trace/recent endpoint", src.includes('"/debug/trace/recent"'));
+
+  // 5. Instrumentation: mutation logging with mlog()
+  report("mlog() in broadcastCurrentOutput", src.includes('mlog(matched.id, "text"'));
+  report("mlog() in pushEntry windowTtsGuard", src.includes('mlog(entry.id, "spoken", false, true, "pushEntry:windowTtsGuard"'));
+  report("mlog() in handleTtsDone2", src.includes('mlog(entry.id, "spoken", false, true, "handleTtsDone2"'));
+
+  // 6. Dedup logging in isDuplicateEntry
+  report("Dedup log tier 1", src.includes("_dedupLog.push") && src.includes("tier: 1"));
+  report("Dedup log tier 2", src.includes("tier: 2"));
+
+  // 7. Window switch logging
+  report("Window switch logged to _windowLog", src.includes("_windowLog.push"));
+
+  // 8. Client connect/disconnect logging
+  report("Client connect logged", src.includes('_clientLog.push') && src.includes('"connect"'));
+  report("Client disconnect logged", src.includes('"disconnect"'));
+
+  // 9. Queue history logging
+  report("Queue enqueue logged", src.includes('"enqueue"'));
+  report("Queue drain_start logged", src.includes('"drain_start"'));
+  report("Queue drain_done logged", src.includes('"drain_done"'));
+
+  // 10. Render timing WS handler
+  report("render_timing WS handler", src.includes('msg.startsWith("render_timing:")'));
+
+  // 11. Whisper log expanded to 200
+  report("Whisper log cap = RING_CAP (200)", src.includes("_whisperLog.length > RING_CAP"));
+
+  // 12. WsLogEntry has clientId field
+  report("WsLogEntry has clientId", src.includes("clientId?: number") && /interface WsLogEntry[\s\S]*?clientId/.test(src));
+
+  // 13. Health endpoint has anomaly detection
+  report("/debug/health has anomalies array", src.includes("anomalies.push") && src.includes("speakable entries without TTS"));
+
+  // 14. Trace endpoint cross-references all buffers
+  const traceSection = src.slice(src.indexOf('"/debug/trace/:entryId"'), src.indexOf('"/debug/trace/:entryId"') + 3000);
+  report("Trace cross-refs pipe input", traceSection.includes("_pipeInputLog"));
+  report("Trace cross-refs parse log", traceSection.includes("_parseParagraphs"));
+  report("Trace cross-refs entry log", traceSection.includes("_entryLog"));
+  report("Trace cross-refs TTS history", traceSection.includes("_ttsHistory"));
+  report("Trace cross-refs highlight log", traceSection.includes("_highlightLog"));
+  report("Trace cross-refs mutations", traceSection.includes("_entryMutationLog"));
+  report("Trace cross-refs dedup log", traceSection.includes("_dedupLog"));
+  report("Trace cross-refs queue history", traceSection.includes("_queueHistory"));
+  report("Trace cross-refs render log", traceSection.includes("_renderLog"));
+
+  // 15. Live endpoint check (if server is running)
+  try {
+    const healthRes = await fetch("http://localhost:3457/debug/health");
+    if (healthRes.ok) {
+      const health = await healthRes.json() as Record<string, unknown>;
+      report("/debug/health returns ts", typeof health.ts === "number");
+      report("/debug/health returns entries", typeof health.entries === "object");
+      report("/debug/health returns tts", typeof health.tts === "object");
+      report("/debug/health returns anomalies", Array.isArray(health.anomalies));
+    }
+
+    const traceRes = await fetch("http://localhost:3457/debug/trace/recent?count=5");
+    if (traceRes.ok) {
+      const traces = await traceRes.json() as Record<string, unknown>;
+      report("/debug/trace/recent returns traces", Array.isArray((traces as any).traces));
+    }
+
+    const mutRes = await fetch("http://localhost:3457/debug/entry-mutations");
+    if (mutRes.ok) {
+      const muts = await mutRes.json() as Record<string, unknown>;
+      report("/debug/entry-mutations returns entries", Array.isArray((muts as any).entries));
+    }
+
+    const dedupRes = await fetch("http://localhost:3457/debug/dedup-log");
+    if (dedupRes.ok) {
+      const dedups = await dedupRes.json() as Record<string, unknown>;
+      report("/debug/dedup-log returns entries", Array.isArray((dedups as any).entries));
+    }
+  } catch {
+    console.log("  (server not running — skipped live endpoint checks)");
+  }
 }
 
 main().catch(err => {

@@ -199,6 +199,7 @@ let activeAudioClient: WebSocket | null = null;
 
 function setAudioClient(ws: WebSocket | null, reason: string) {
   if (activeAudioClient === ws) return;
+  const hadClient = activeAudioClient !== null;
   activeAudioClient = ws;
   console.log(`[audio] Audio control → ${ws ? "new client" : "none"} (${reason})`);
   // Notify all clients of their new audio control state
@@ -207,11 +208,18 @@ function setAudioClient(ws: WebSocket | null, reason: string) {
       try { client.send(JSON.stringify({ type: "audio_control", hasControl: client === ws })); } catch {}
     }
   }
+  // Bug U2: When a new audio client connects and jobs are queued, drain immediately.
+  // Previously, jobs queued while no client was connected sat idle until the next event.
+  if (ws && !hadClient && ttsJobQueue.length > 0 && !ttsCurrentlyPlaying) {
+    console.log(`[audio] New audio client connected with ${ttsJobQueue.length} pending TTS jobs — draining`);
+    drainAudioBuffer();
+  }
 }
 
 // Send audio (binary or JSON) only to the active audio client.
 // Falls back to first available client if no active client is set (single-client mode).
-function sendToAudioClient(data: Buffer | object) {
+// Bug U2: Returns false if no client was available (caller can handle retry/skip).
+function sendToAudioClient(data: Buffer | object): boolean {
   let target = activeAudioClient && activeAudioClient.readyState === WebSocket.OPEN
     ? activeAudioClient : null;
   if (!target) {
@@ -220,7 +228,10 @@ function sendToAudioClient(data: Buffer | object) {
       if (c.readyState === WebSocket.OPEN && !(c as any)._isTestClient) { target = c; break; }
     }
   }
-  if (!target) return;
+  if (!target) {
+    console.warn(`[audio] No audio client available — dropping ${Buffer.isBuffer(data) ? data.length + "B audio" : "JSON message"}`);
+    return false;
+  }
   try {
     if (Buffer.isBuffer(data)) {
       target.send(data);
@@ -230,7 +241,8 @@ function sendToAudioClient(data: Buffer | object) {
       // Log JSON messages for debugging (tts_play, local_tts, etc.)
       wslog("out", (data as Record<string, unknown>).type as string || "audio_json", json.length);
     }
-  } catch { clients.delete(target); if (activeAudioClient === target) activeAudioClient = null; }
+    return true;
+  } catch { clients.delete(target); if (activeAudioClient === target) activeAudioClient = null; return false; }
 }
 
 // --- Pipeline Instrumentation ---
@@ -291,12 +303,13 @@ interface WsLogEntry {
   dir: "in" | "out";
   type: string;
   size?: number;
+  clientId?: number;
 }
 
 const _serverWsLog: WsLogEntry[] = [];
 
-function wslog(dir: "in" | "out", type: string, size?: number) {
-  _serverWsLog.push({ ts: Date.now(), dir, type, size });
+function wslog(dir: "in" | "out", type: string, size?: number, clientId?: number) {
+  _serverWsLog.push({ ts: Date.now(), dir, type, size, clientId });
   if (_serverWsLog.length > 200) _serverWsLog.shift();
 }
 
@@ -397,6 +410,78 @@ function hlog(entryId: number, chunkIndex: number, event: string, wordIndex: num
   _highlightLog.push({ ts: Date.now(), entryId, chunkIndex, event, wordIndex, totalWords, flowWordPos, spanCount });
   if (_highlightLog.length > 100) _highlightLog.shift();
 }
+
+// ── Additional ring buffers for Monitor dashboard ──
+const RING_CAP = 200;
+
+// Entry mutations: text/speakable/spoken changes AFTER creation
+interface EntryMutationLog {
+  ts: number;
+  entryId: number;
+  field: "text" | "speakable" | "spoken";
+  from: unknown;
+  to: unknown;
+  source: string; // caller function name
+}
+const _entryMutationLog: EntryMutationLog[] = [];
+function mlog(entryId: number, field: "text" | "speakable" | "spoken", from: unknown, to: unknown, source: string) {
+  _entryMutationLog.push({ ts: Date.now(), entryId, field, from, to, source });
+  if (_entryMutationLog.length > RING_CAP) _entryMutationLog.shift();
+}
+
+// Dedup rejections: every isDuplicateEntry() rejection
+interface DedupLogEntry {
+  ts: number;
+  rejectedText: string;
+  rejectedRole: string;
+  matchedEntryId: number;
+  tier: 1 | 2; // Tier 1 = exact text, Tier 2 = normalized + window
+}
+const _dedupLog: DedupLogEntry[] = [];
+
+// Window switches
+interface WindowLogEntry {
+  ts: number;
+  fromWindow: string;
+  toWindow: string;
+  entriesLoaded: number;
+  entriesUnloaded: number;
+  snapshotReset: boolean;
+}
+const _windowLog: WindowLogEntry[] = [];
+
+// Client connections/disconnections
+interface ClientLogEntry {
+  ts: number;
+  event: "connect" | "disconnect" | "audio_claim" | "reconnect";
+  clientCount: number;
+  isTestMode: boolean;
+  payloadBytes?: number;
+  note?: string;
+}
+const _clientLog: ClientLogEntry[] = [];
+let _clientConnectCount = 0; // total connections since start
+
+// TTS queue depth samples (sampled on queueTts/drainAudioBuffer)
+interface QueueHistoryEntry {
+  ts: number;
+  event: "enqueue" | "drain_start" | "drain_done" | "cancel";
+  queueDepth: number;
+  jobId?: number;
+  entryId?: number | null;
+}
+const _queueHistory: QueueHistoryEntry[] = [];
+
+// Client-reported render timing (accepted via WS render_timing message)
+interface RenderLogEntry {
+  ts: number; // server receive ts
+  clientTs: number; // client-reported ts
+  entryId: number;
+  renderMs: number;
+  entryCount: number;
+  viewportHeight?: number;
+}
+const _renderLog: RenderLogEntry[] = [];
 
 // VoiceMode log paths
 const VM_LOGS = join(HOME, ".voicemode", "logs");
@@ -632,7 +717,7 @@ interface WhisperLogEntry {
   wasFiltered: boolean;
   status: "success" | "failed" | "filtered";
 }
-const _whisperLog: WhisperLogEntry[] = []; // ring buffer, last 30
+const _whisperLog: WhisperLogEntry[] = []; // ring buffer, last 200
 
 async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<string> {
   if (!serviceStatus.whisper) {
@@ -659,7 +744,7 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
       _whisperLog.push({ ts: endTs, inputId, transcriptionStartTs: sttStartTs, transcriptionEndTs: endTs,
         durationMs: endTs - sttStartTs, audioSizeBytes: audioData.length, transcribedText: "",
         noSpeechProb, isRetry: false, wasFiltered: true, status: "filtered" });
-      if (_whisperLog.length > 30) _whisperLog.shift();
+      if (_whisperLog.length > RING_CAP) _whisperLog.shift();
       return "";
     }
     const text = json.text?.trim() || "";
@@ -668,7 +753,7 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
     _whisperLog.push({ ts: endTs, inputId, transcriptionStartTs: sttStartTs, transcriptionEndTs: endTs,
       durationMs: endTs - sttStartTs, audioSizeBytes: audioData.length, transcribedText: text.slice(0, 80),
       noSpeechProb, isRetry: false, wasFiltered: false, status: "success" });
-    if (_whisperLog.length > 30) _whisperLog.shift();
+    if (_whisperLog.length > RING_CAP) _whisperLog.shift();
     return text;
   } catch (err) {
     console.warn("[stt] First attempt failed, retrying:", (err as Error).message);
@@ -682,7 +767,7 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
         _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
           durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: "",
           noSpeechProb: retryNoSpeech, isRetry: true, wasFiltered: true, status: "filtered" });
-        if (_whisperLog.length > 30) _whisperLog.shift();
+        if (_whisperLog.length > RING_CAP) _whisperLog.shift();
         return "";
       }
       const text = retryJson.text?.trim() || "";
@@ -690,7 +775,7 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
       _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
         durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: text.slice(0, 80),
         noSpeechProb: retryNoSpeech, isRetry: true, wasFiltered: false, status: "success" });
-      if (_whisperLog.length > 30) _whisperLog.shift();
+      if (_whisperLog.length > RING_CAP) _whisperLog.shift();
       return text;
     } catch (retryErr) {
       const retryEndTs = Date.now();
@@ -702,7 +787,7 @@ async function transcribeAudio(audioData: Buffer, inputId?: string): Promise<str
       _whisperLog.push({ ts: retryEndTs, inputId, transcriptionStartTs: retryStartTs, transcriptionEndTs: retryEndTs,
         durationMs: retryEndTs - retryStartTs, audioSizeBytes: audioData.length, transcribedText: "",
         noSpeechProb: 0, isRetry: true, wasFiltered: false, status: "failed" });
-      if (_whisperLog.length > 30) _whisperLog.shift();
+      if (_whisperLog.length > RING_CAP) _whisperLog.shift();
       return "";
     }
   }
@@ -1365,6 +1450,7 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     if (entryId != null) {
       const entry = conversationEntries.find(e => e.id === entryId);
       if (entry && !entry.spoken) {
+        mlog(entry.id, "spoken", false, true, "queueTts:alreadyQueued");
         entry.spoken = true;
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
       }
@@ -1532,6 +1618,8 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
   };
 
   ttsJobQueue.push(job);
+  _queueHistory.push({ ts: Date.now(), event: "enqueue", queueDepth: ttsJobQueue.length, jobId: job.jobId, entryId });
+  if (_queueHistory.length > RING_CAP) _queueHistory.shift();
   // Track which entries got TTS in input log
   if (entryId != null) {
     const entry = conversationEntries.find(e => e.id === entryId);
@@ -1556,7 +1644,7 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
           job.state = "failed";
           if (entryId != null) {
             const entry = conversationEntries.find(e => e.id === entryId);
-            if (entry && !entry.spoken) entry.spoken = true;
+            if (entry && !entry.spoken) { mlog(entry.id, "spoken", false, true, "fetchKokoroAudio:noService"); entry.spoken = true; }
           }
           drainAudioBuffer();
           return;
@@ -1844,6 +1932,8 @@ function drainAudioBuffer(): void {
   job.playingSince = Date.now();
   job.currentChunkIndex = 0;
   ttsCurrentlyPlaying = job;
+  _queueHistory.push({ ts: Date.now(), event: "drain_start", queueDepth: ttsJobQueue.length, jobId: job.jobId, entryId: job.entryId });
+  if (_queueHistory.length > RING_CAP) _queueHistory.shift();
 
   console.log(`[tts2] Playing job=${job.jobId} entry=${job.entryId} mode=${job.mode} chunks=${job.chunks.length}`);
   plog("tts2_play", `job=${job.jobId} entry=${job.entryId} ${job.speakableText.slice(0, 80)}`);
@@ -2014,6 +2104,8 @@ function handleTtsDone2(entryId: number | null): void {
       ttsCurrentlyPlaying = null;
     }
     console.log(`[tts2] Done job=${job.jobId} entry=${entryId}`);
+    _queueHistory.push({ ts: Date.now(), event: "drain_done", queueDepth: ttsJobQueue.length, jobId: job.jobId, entryId: job.entryId });
+    if (_queueHistory.length > RING_CAP) _queueHistory.shift();
   } else {
     // No matching job — stale tts_done. Do NOT null ttsCurrentlyPlaying,
     // as the real playing job may still be active with a different entryId.
@@ -2024,6 +2116,7 @@ function handleTtsDone2(entryId: number | null): void {
   if (entryId != null) {
     const entry = conversationEntries.find(e => e.id === entryId);
     if (entry && !entry.spoken) {
+      mlog(entry.id, "spoken", false, true, "handleTtsDone2");
       entry.spoken = true;
       console.log(`[tts2] Marked entry ${entryId} as spoken`);
       broadcast({ type: "entry", entries: conversationEntries, partial: false });
@@ -2126,6 +2219,15 @@ function sweepStaleTtsJobs(): void {
  * Generation is bumped via bumpGeneration() with a tagged reason.
  */
 function stopClientPlayback2(reason: GenerationEvent["reason"] = "user_stop", entryId?: number): void {
+  // Task #37: passive_redetect should NOT bump generation — it's the passive watcher
+  // re-detecting an idle prompt, not actual new input. Bumping gen causes dedup drift.
+  if (reason === "passive_redetect") {
+    console.log(`[tts2] Passive redetect — skipping gen bump, preserving ${ttsJobQueue.length} queued jobs`);
+    ttsGenerationLog.push({ gen: ttsGeneration, reason, ts: Date.now(), entryId });
+    if (ttsGenerationLog.length > 20) ttsGenerationLog.shift();
+    return; // No TTS disruption at all for passive redetects
+  }
+
   bumpGeneration(reason, entryId);
 
   // For user-initiated interruptions, cancel everything.
@@ -2195,22 +2297,27 @@ function broadcastIdleIfSafe() {
     broadcast({ type: "voice_status", state: "idle" });
   }
 }
-let streamWatcher: ReturnType<typeof setInterval> | null = null;
+// ── Push-based streaming architecture ──
+// The always-on pipe (tmux pipe-pane / pty onData) pushes output chunks to handlePipeOutput().
+// No more polling intervals — state detection is push-triggered.
 let streamTimeout: ReturnType<typeof setTimeout> | null = null;
-let contentCheckTimer: ReturnType<typeof setTimeout> | null = null;
-let promptCheckInterval: ReturnType<typeof setInterval> | null = null; // Independent prompt-ready checker
-let streamFileOffset = 0;
+let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
+let _parseTimer: ReturnType<typeof setTimeout> | null = null; // Debounced parse/update
+let _quietTimer: ReturnType<typeof setTimeout> | null = null; // Quiet detection (no output → done?)
+let _idleCheckTimer: ReturnType<typeof setTimeout> | null = null; // Debounced idle activity check
 let lastStreamActivity = 0;
 let lastBroadcastText = "";
-let doneCheckTimer: ReturnType<typeof setTimeout> | null = null;
-let reEngageWatcher: ReturnType<typeof setInterval> | null = null;
-const STREAM_FILE = join(TEMP_DIR, `claude-voice-stream-${process.pid}.raw`);
 const DONE_QUIET_MS = 600; // 600ms quiet + prompt visible = done
-const CONTENT_CHECK_MS = 200; // check pane content at most every 200ms
+const PARSE_DEBOUNCE_MS = 200; // Debounce pane capture + parse
+const IDLE_CHECK_DEBOUNCE_MS = 500; // Debounce idle activity check
 const STREAM_TIMEOUT_MS = 300000; // 5 minutes max
 let preInputSnapshot: string = "";
 let pendingVoiceInput: Array<{ text: string; entryId: number; target: string }> = []; // Queued voice while Claude is active
 let _voiceQueueDraining = false; // Drain lock — prevents concurrent drains
+let sawActivity = false;
+let lastStreamEndTime = 0; // Cooldown: don't re-trigger right after streaming ends
+const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
+let _cooldownThinking = false; // Track if we sent thinking state during cooldown
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -2565,6 +2672,8 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
 }): void {
   if (!terminal.switchTarget) return;
   const target = `${session}:${windowIdx}`;
+  const prevWindow = currentWindowKey || "_unset";
+  const prevEntryCount = conversationEntries.length;
   console.log(`[window] ${opts.isFirst ? "First activation" : "Switching"} to: ${target}`);
 
   // Save current window state (skip on first activation)
@@ -2577,13 +2686,9 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
 
   // Stop TTS + reset all state
   stopClientPlayback2("session_switch");
-  lastPassiveSnapshot = "";
-  _recentPassiveInputs = [];
   _cooldownThinking = false;
   lastStreamEndTime = 0;
   preInputSnapshot = "";
-  _pendingPromptInput = "";
-  _pendingPromptInputTs = 0;
   _scrollbackCache = { text: "", ts: 0 };
   lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
   _lastWindowSwitchTs = Date.now();
@@ -2620,7 +2725,8 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
   if (recentEntries.length > 80) recentEntries = recentEntries.slice(-80);
   if (opts.sendToWs) {
     if (!(opts.sendToWs as any)._isTestMode) {
-      recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+      // Bug U4 fix: filter ALL test entries, not just text-input-test
+      recentEntries = recentEntries.filter(e => !isTestEntry(e));
     }
     opts.sendToWs.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: false }));
   } else {
@@ -2632,10 +2738,9 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
   broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
   broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
 
-  // Initialize passive watcher snapshot
+  // Initialize pre-input snapshot for new window
   try {
-    lastPassiveSnapshot = captureTmuxPane();
-    preInputSnapshot = lastPassiveSnapshot;
+    preInputSnapshot = captureTmuxPane();
   } catch {}
   // Immediately broadcast terminal panel content from the new window
   try {
@@ -2648,6 +2753,14 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
 
   // On first activation, send Murmur context to voice session
   if (opts.isFirst) sendMurmurContext(3000);
+
+  // Log window switch for Monitor dashboard
+  _windowLog.push({
+    ts: Date.now(), fromWindow: prevWindow, toWindow: target,
+    entriesLoaded: conversationEntries.length, entriesUnloaded: prevEntryCount,
+    snapshotReset: true,
+  });
+  if (_windowLog.length > RING_CAP) _windowLog.shift();
 
   console.log(`[window] Activated ${target}, ${recentEntries.length} entries + idle status`);
 }
@@ -2717,10 +2830,13 @@ function _executeWindowSwitch(session: string, windowIdx: number, _ws: import("w
   _activateWindowCore(session, windowIdx, { stopStreaming: true });
 }
 
-/** Returns true if entry looks like test injection garbage that should not be persisted or cached */
+/** Returns true if entry looks like test injection garbage that should not be persisted or cached.
+ *  Bug U4 fix: checks BOTH "text-input-test" (addUserEntry) AND "test-" (test:entries-*) prefixes. */
 function isTestEntry(e: ConversationEntry): boolean {
   const t = e.text;
-  return /^dedup-test-|^test-paste-|^reply to dedup-test-/.test(t) || e.sourceTag?.startsWith("text-input-test") === true;
+  return /^dedup-test-|^test-paste-|^reply to dedup-test-/.test(t)
+    || e.sourceTag?.startsWith("text-input-test") === true
+    || e.sourceTag?.startsWith("test-") === true;
 }
 
 /** Central dedup check: returns true if an entry with same role + normalized text
@@ -2735,21 +2851,39 @@ function isDuplicateEntry(entry: ConversationEntry): boolean {
 
   if (entry.role === "user") {
     // User entries: check within last 60s by normalized text
-    return conversationEntries.some(e => {
+    const match = conversationEntries.find(e => {
       if (e.role !== "user" || e.ts < cutoff) return false;
       const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
       if (eNorm === norm) return true;
-      // Fuzzy: strip all spaces (handles tmux wrap boundary mismatches)
       return eNorm.replace(/\s/g, "") === normNoSpaces;
     });
+    if (match) {
+      _dedupLog.push({ ts: Date.now(), rejectedText: entry.text.slice(0, 120), rejectedRole: "user", matchedEntryId: match.id, tier: 2 });
+      if (_dedupLog.length > RING_CAP) _dedupLog.shift();
+      return true;
+    }
+    return false;
   } else {
-    // Assistant entries: check within same turn or ±3 turns, AND within 60s
-    return conversationEntries.some(e => {
-      if (e.role !== "assistant" || e.ts < cutoff) return false;
-      if (Math.abs((e.turn ?? 0) - (entry.turn ?? 0)) > 3) return false;
+    // Assistant entries: two-tier dedup
+    for (const e of conversationEntries) {
+      if (e.role !== "assistant") continue;
+      // Tier 1: exact text match — stale content resurfacing from scrollback reparse
+      if (e.text === entry.text) {
+        _dedupLog.push({ ts: Date.now(), rejectedText: entry.text.slice(0, 120), rejectedRole: "assistant", matchedEntryId: e.id, tier: 1 });
+        if (_dedupLog.length > RING_CAP) _dedupLog.shift();
+        return true;
+      }
+      // Tier 2: normalized match with turn+time window
+      if (e.ts < cutoff) continue;
+      if (Math.abs((e.turn ?? 0) - (entry.turn ?? 0)) > 3) continue;
       const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
-      return eNorm === norm;
-    });
+      if (eNorm === norm) {
+        _dedupLog.push({ ts: Date.now(), rejectedText: entry.text.slice(0, 120), rejectedRole: "assistant", matchedEntryId: e.id, tier: 2 });
+        if (_dedupLog.length > RING_CAP) _dedupLog.shift();
+        return true;
+      }
+    }
+    return false;
   }
 }
 
@@ -2767,11 +2901,13 @@ function pushEntry(entry: ConversationEntry): boolean {
   // so clean mode still shows the entry. speakable = "this is prose content" (display flag),
   // spoken = "TTS completed or skipped" (audio flag).
   if (!isVoiceSession() && entry.speakable) {
+    mlog(entry.id, "spoken", false, true, "pushEntry:windowTtsGuard");
     entry.spoken = true; // Skip TTS — mark as already spoken so TTS queue ignores it
     console.log(`[WINDOW-TTS-GUARD] Suppressed TTS for entry ${entry.id} — non-voice session (window=${wk}), speakable preserved`);
   }
   // Non-speakable entries should be marked spoken immediately to prevent false "dropped TTS" alerts
   if (!entry.speakable && !entry.spoken) {
+    mlog(entry.id, "spoken", false, true, "pushEntry:nonSpeakable");
     entry.spoken = true;
   }
   // Safety: if conversationEntries somehow has entries from a different window, log it
@@ -2803,6 +2939,12 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   // Filter agent infrastructure commands (tmux send-keys, test runners, etc.)
   if (isAgentInfraCommand(text)) {
     console.log(`[addUserEntry] Filtered agent command from="${_source}": "${text.slice(0, 80)}"`);
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
+  // Bug U3: Filter tool output markers that passive watcher scrapes from agent panes
+  // (⎿, Read(...), Bash(...), ⏺ Bash, Running…, ctrl+o to expand, etc.)
+  if (isToolOutputLine(text)) {
+    console.log(`[addUserEntry] Filtered tool output from="${_source}": "${text.slice(0, 80)}"`);
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
   // Filter status line text that passive watcher may scrape near the prompt
@@ -2917,6 +3059,8 @@ function isToolOutputLine(text: string): boolean {
   if (/^Searched for \d+/i.test(t)) return true;
   if (/^Wrote \d+/i.test(t)) return true;
   if (/^Edited \d+/i.test(t)) return true;
+  if (/^Background command/i.test(t)) return true; // Task #36: background task notifications
+  if (/^\d+\s+background\s+task/i.test(t)) return true; // Task #36: "2 background tasks"
   return false;
 }
 
@@ -3025,6 +3169,8 @@ function isToolMarker(trimmed: string): boolean {
   if (/^⏺\s+\w+$/.test(trimmed)) return true;     // ⏺ Read (standalone)
   if (/^⎿/.test(trimmed)) return true;              // ⎿ output continuation
   if (/^(Bash|Read|Edit|Write|Grep|Glob|Agent|WebFetch|WebSearch|NotebookEdit)\s*\(/i.test(trimmed)) return true;
+  // Tool summary lines: ⏺ Searched for N, ⏺ Ran X, ⏺ Read N files, ⏺ Edited N, ⏺ Wrote N (Task #36)
+  if (/^⏺\s+(Searched|Ran |Read \d|Edited|Wrote|Running)/i.test(trimmed)) return true;
   return false;
 }
 
@@ -3192,7 +3338,6 @@ function extractStructuredOutput(preSnapshot: string, postSnapshot: string, user
 let lastUserInput = "";
 let _currentInputId: string | undefined; // Input ID for current turn (links assistant entries)
 let pollStartTime = 0;
-let sawActivity = false;
 let lastSpokenText = "";  // Track what we've already spoken to avoid repeats
 
 // Strip tmux/Claude Code chrome from visible pane lines
@@ -3452,9 +3597,279 @@ function normalizeSpinners(text: string): string {
 // Entry-based TTS: delay before speaking a new completed entry
 const ENTRY_TTS_DELAY_MS = 200;
 
+// ── Push-based output handler ──
+// Called by the always-on pipe (tmux pipe-pane / pty onData) for each new chunk.
+// Replaces ALL polling intervals: passive watcher, stream watcher, prompt checker.
+const SPINNER_CHARS_RE = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶]/;
+
+// Ring buffer: raw pipe-pane output for /debug/pipe-input traceability
+const _pipeInputLog: Array<{ ts: number; len: number; text: string; state: string }> = [];
+const PIPE_INPUT_LOG_CAP = 200;
+
+function handlePipeOutput(_chunk: string) {
+  const now = Date.now();
+  lastStreamActivity = now;
+
+  // Log raw chunk to ring buffer (truncate long chunks for readability)
+  _pipeInputLog.push({
+    ts: now,
+    len: _chunk.length,
+    text: _chunk.length > 500 ? _chunk.slice(0, 500) + `…[${_chunk.length - 500} more]` : _chunk,
+    state: streamState,
+  });
+  if (_pipeInputLog.length > PIPE_INPUT_LOG_CAP) _pipeInputLog.shift();
+
+  if (streamState === "IDLE" || streamState === "DONE") {
+    // Activity while idle/done — check if Claude is working (spinner in output)
+    if (SPINNER_CHARS_RE.test(_chunk)) {
+      // Cooldown check: don't re-trigger right after streaming ends
+      if (now - lastStreamEndTime < PASSIVE_COOLDOWN_MS) {
+        if (!_cooldownThinking) {
+          _cooldownThinking = true;
+          broadcast({ type: "voice_status", state: "thinking" });
+        }
+        return;
+      }
+      // Re-engage: spinner while DONE → Claude doing follow-up work
+      if (streamState === "DONE") {
+        console.log("[push] Re-engaging — spinner detected after done");
+        reEngageFromPush();
+        return;
+      }
+      // Spinner while IDLE → native CLI input detected
+      scheduleIdleActivityCheck();
+    } else if (_cooldownThinking) {
+      // During cooldown, non-spinner output → system task finished
+      _cooldownThinking = false;
+      broadcast({ type: "voice_status", state: "idle" });
+      broadcast({ type: "tool_status", text: "" });
+    }
+    return;
+  }
+
+  // During streaming: activity signal
+  sawActivity = true;
+
+  // Cancel done check — new output means not done
+  cancelDoneCheck();
+
+  // State transitions from raw output
+  if (streamState === "WAITING" || streamState === "THINKING") {
+    if (SPINNER_CHARS_RE.test(_chunk)) {
+      if (streamState !== "THINKING") {
+        streamState = "THINKING";
+        broadcast({ type: "voice_status", state: "thinking" });
+      }
+    }
+  }
+
+  // Schedule debounced pane check (state detection + content parsing)
+  schedulePaneCheck();
+
+  // Reset quiet timer — will fire when output stops
+  resetQuietTimer();
+}
+
+/** Schedule a debounced pane capture + parse + state detection */
+function schedulePaneCheck() {
+  if (_parseTimer) return;
+  _parseTimer = setTimeout(() => {
+    _parseTimer = null;
+    performPaneCheck();
+  }, PARSE_DEBOUNCE_MS);
+}
+
+/** Capture pane, detect state transitions, update entries */
+function performPaneCheck() {
+  if (streamState === "IDLE") return;
+
+  const pane = captureTmuxPane();
+  if (!pane) return;
+
+  // Check for interrupt prompt (may set streamState to IDLE)
+  checkForInterruptPrompt(pane);
+  if ((streamState as string) === "IDLE") return;
+
+  // Auto-accept interactive prompts
+  if (detectInteractivePrompt(pane)) return;
+
+  const spinner = hasSpinnerChars(pane);
+  const response = hasResponseMarkers(pane);
+  const prompt = hasPromptReady(pane);
+
+  // State transitions
+  if (streamState === "WAITING" || streamState === "THINKING") {
+    if (spinner && streamState !== "THINKING") {
+      streamState = "THINKING";
+      broadcast({ type: "voice_status", state: "thinking" });
+    }
+    if (response) {
+      streamState = "RESPONDING";
+      broadcast({ type: "voice_status", state: "responding" });
+    }
+  }
+
+  // Broadcast content when responding
+  if (streamState === "RESPONDING" || response) {
+    broadcastCurrentOutput();
+  }
+
+  // Done check when prompt visible + no spinner + had activity
+  if (prompt && !spinner && sawActivity) {
+    scheduleDoneCheck();
+  }
+}
+
+/** Reset quiet timer — fires when output stops for DONE_QUIET_MS */
+function resetQuietTimer() {
+  if (_quietTimer) { clearTimeout(_quietTimer); _quietTimer = null; }
+  _quietTimer = setTimeout(() => {
+    _quietTimer = null;
+    if (streamState === "IDLE" || streamState === "DONE") return;
+    // No output for DONE_QUIET_MS — check if done
+    scheduleDoneCheck();
+  }, DONE_QUIET_MS);
+}
+
+/** Debounced check for native CLI input (spinner detected while idle) */
+function scheduleIdleActivityCheck() {
+  if (_idleCheckTimer) return;
+  _idleCheckTimer = setTimeout(() => {
+    _idleCheckTimer = null;
+    handleNativeInputDetected();
+  }, IDLE_CHECK_DEBOUNCE_MS);
+}
+
+/** Handle native CLI input: extract user text, start streaming */
+function handleNativeInputDetected() {
+  if (streamState !== "IDLE" && streamState !== "DONE") return;
+
+  const pane = captureTmuxPane();
+  if (!pane) return;
+
+  // Confirm spinner is still present
+  if (!hasSpinnerChars(pane)) return;
+
+  console.log("[push] Spinner detected — native CLI input");
+
+  // Detect interactive prompts first
+  if (detectInteractivePrompt(pane)) return;
+
+  // Extract user input from prompt line (Method 1: prompt parsing)
+  const lines = pane.split("\n");
+  let userInput = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
+      const parts = [trimmed.slice(2).trim()];
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j].trim();
+        if (!next) break;
+        if (next.startsWith("❯")) break;
+        if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(next)) break;
+        if (/^[─━═]{3,}/.test(next)) break;
+        if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(next)) break;
+        if (/^Press (up|down|esc|enter|tab)/i.test(next)) break;
+        parts.push(next);
+      }
+      userInput = parts.join(" ");
+      break;
+    }
+  }
+
+  // Filter agent infrastructure commands
+  if (userInput && isAgentInfraCommand(userInput)) {
+    console.log(`[push] Filtered agent infrastructure command: "${userInput.slice(0, 80)}"`);
+    userInput = "";
+  }
+  // Filter tool output markers
+  if (userInput && isToolOutputLine(userInput)) {
+    console.log(`[push] Filtered tool output as user input: "${userInput.slice(0, 80)}"`);
+    userInput = "";
+  }
+
+  // Skip if this text was sent programmatically
+  if (userInput && terminal.wasRecentlySent?.(userInput)) {
+    console.log(`[push] Skipping programmatically-sent input: "${userInput.slice(0, 60)}"`);
+    // Still start streaming — spinner is active, Claude is processing
+  }
+
+  // Start streaming
+  if (streamState === "DONE" || streamState === "IDLE") {
+    currentTurn++;
+    if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
+    lastBroadcastText = "";
+
+    // Only create user entry if NOT already sent programmatically
+    if (userInput && !_isSystemContext && !terminal.wasRecentlySent?.(userInput)) {
+      const normalizedNew = userInput.trim().toLowerCase().replace(/\s+/g, "");
+      const alreadyExists = conversationEntries.some(
+        e => e.role === "user" && e.text.trim().toLowerCase().replace(/\s+/g, "") === normalizedNew
+      );
+      if (!alreadyExists) {
+        addUserEntry(userInput, false, "terminal");
+      }
+    }
+    trimEntriesToCap();
+
+    preInputSnapshot = pane; // Use current pane as pre-snapshot (spinner just appeared)
+    lastUserInput = userInput || "(native input)";
+    pollStartTime = Date.now();
+    lastStreamActivity = Date.now();
+    sawActivity = true;
+    stopClientPlayback2("new_input");
+
+    streamState = "THINKING";
+    broadcast({ type: "voice_status", state: "thinking" });
+
+    // Set stream timeout
+    streamTimeout = setTimeout(() => {
+      const p = captureTmuxPane();
+      const paragraphs = extractStructuredOutput(preInputSnapshot, p, lastUserInput);
+      if (paragraphs.length > 0) {
+        handleStreamDone();
+      } else {
+        stopTmuxStreaming();
+        broadcast({ type: "voice_status", state: "idle" });
+      }
+    }, STREAM_TIMEOUT_MS);
+
+    console.log(`[push] Started streaming for native CLI input: "${userInput.slice(0, 60)}"`);
+  }
+}
+
+/** Re-engage streaming when spinner detected after DONE (Claude doing follow-up) */
+function reEngageFromPush() {
+  if (streamState !== "DONE") return;
+
+  preInputSnapshot = preInputSnapshot; // Keep existing snapshot for continuation
+  pollStartTime = Date.now();
+  lastStreamActivity = Date.now();
+  sawActivity = true;
+  lastBroadcastText = "";
+
+  streamState = "THINKING";
+  broadcast({ type: "voice_status", state: "thinking" });
+
+  streamTimeout = setTimeout(() => {
+    console.log(`[stream] Re-engage timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
+    const pane = captureTmuxPane();
+    const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
+    if (paragraphs.length > 0) {
+      handleStreamDone();
+    } else {
+      stopTmuxStreaming();
+      broadcast({ type: "voice_status", state: "idle" });
+    }
+  }, STREAM_TIMEOUT_MS);
+
+  console.log("[push] Re-engaged streaming for continuation");
+}
+
 // Broadcast current response content to app via entry model.
 // Diffs extractStructuredOutput() against conversationEntries, creates/updates entries,
 // broadcasts { type: "entry" }, and triggers TTS for completed speakable entries.
+// In push architecture: called ONLY from performPaneCheck() via debounced timer — single parse path.
 function broadcastCurrentOutput() {
   if (_isSystemContext) return; // Suppress UI during system context
   const pane = captureTmuxPane();
@@ -3472,11 +3887,17 @@ function broadcastCurrentOutput() {
   if (normalized === lastBroadcastText) return;
   lastBroadcastText = normalized;
 
+  // Cancel old-turn TTS as soon as we detect new content (idempotent per-turn).
+  // Previously this was only called when creating NEW entries, which missed the case
+  // where all paragraphs matched existing entries — old TTS kept playing. (Task #35)
+  cancelOldTurnJobs();
+
   // Match paragraphs to existing entries by TEXT SIMILARITY, not positional index.
   // This prevents gen bumps (which re-parse tmux content with shifted positions)
   // from overwriting entries with wrong text.
   const assistantEntries = conversationEntries.filter(e => e.role === "assistant" && e.turn === currentTurn);
   const matchedEntryIds = new Set<number>(); // Track which entries were matched this cycle
+  const createdNorms = new Set<string>(); // Bug U1: track texts created THIS cycle to prevent intra-loop dupes
 
   for (let i = 0; i < paragraphs.length; i++) {
     const para = paragraphs[i];
@@ -3509,14 +3930,19 @@ function broadcastCurrentOutput() {
 
     if (matched) {
       matchedEntryIds.add(matched.id);
-      if (matched.text !== para.text) {
+      // Filler clobber guard: never overwrite filler entries with parsed output.
+      // Fillers have their own text ("One moment...", "Let me think...") that should
+      // be preserved until naturally replaced by the next filler or cleared on done.
+      if (matched.text !== para.text && matched.sourceTag !== "filler") {
+        if (matched.text !== para.text) mlog(matched.id, "text", matched.text.slice(0, 80), para.text.slice(0, 80), "broadcastCurrentOutput");
+        if (matched.speakable !== para.speakable) mlog(matched.id, "speakable", matched.speakable, para.speakable, "broadcastCurrentOutput");
         matched.text = para.text;
         matched.speakable = para.speakable;
       }
     } else {
-      // During RESPONDING, skip transient tool output — these lines flash for ~2s then vanish
-      // when the tool finishes. Creating entries for them causes visible flash in conversation view.
-      if (streamState === "RESPONDING" && isToolOutputLine(para.text)) {
+      // During RESPONDING/FINALIZING, skip transient tool output — these lines flash briefly
+      // then vanish when the tool finishes. Creating entries for them causes visible flash. (Task #36)
+      if ((streamState === "RESPONDING" || streamState === "FINALIZING") && isToolOutputLine(para.text)) {
         console.log(`[stream] Skipping transient tool output entry: "${para.text.slice(0, 80)}"`);
         continue;
       }
@@ -3535,9 +3961,9 @@ function broadcastCurrentOutput() {
         const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
         return eNorm === paraNorm;
       });
-      if (!isDup) {
-        // First new assistant content in this turn — cancel old-turn TTS so new response plays
-        cancelOldTurnJobs();
+      if (!isDup && !createdNorms.has(paraNorm)) {
+        createdNorms.add(paraNorm); // Bug U1: prevent same text creating multiple entries in one cycle
+        // cancelOldTurnJobs() already called above (Task #35 — fires on any new content, not just new entries)
         const entry: ConversationEntry = {
           id: ++entryIdCounter,
           role: "assistant",
@@ -3688,73 +4114,7 @@ function broadcastCurrentOutput() {
   trimEntriesToCap();
 }
 
-// Called when new pipe-pane bytes arrive — schedules a capture-pane content check.
-// The pipe data is used purely as an activity signal; actual content detection
-// uses captureTmuxPane() for clean, reliable output.
-function onStreamActivity() {
-  lastStreamActivity = Date.now();
-  sawActivity = true;
-
-  // Cancel any pending done-check — new output means not done yet
-  cancelDoneCheck();
-
-  // Schedule a content check (throttled to every CONTENT_CHECK_MS)
-  if (!contentCheckTimer) {
-    contentCheckTimer = setTimeout(() => {
-      contentCheckTimer = null;
-      checkPaneState();
-    }, CONTENT_CHECK_MS);
-  }
-}
-
-// Check the tmux pane for state transitions and content updates.
-function checkPaneState() {
-  if (streamState === "IDLE" || streamState === "DONE") return;
-
-  const pane = captureTmuxPane();
-  if (!pane) return;
-
-  // Auto-accept interactive prompts (plan approval, permission dialogs)
-  if (detectInteractivePrompt(pane)) return;
-
-  const elapsed = Date.now() - pollStartTime;
-  const spinner = hasSpinnerChars(pane);
-  const response = hasResponseMarkers(pane);
-  const prompt = hasPromptReady(pane);
-
-  // State transitions
-  if (streamState === "WAITING") {
-    if (spinner) {
-      slog("stream", "state", { from: "WAITING", to: "THINKING", elapsedMs: elapsed });
-      streamState = "THINKING";
-      console.log(`[stream] → THINKING (${(elapsed/1000).toFixed(1)}s)`);
-      broadcast({ type: "voice_status", state: "thinking" });
-    }
-    if (response) {
-      slog("stream", "state", { from: "WAITING", to: "RESPONDING", elapsedMs: elapsed });
-      streamState = "RESPONDING";
-      console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
-      broadcast({ type: "voice_status", state: "responding" });
-    }
-  } else if (streamState === "THINKING") {
-    if (response) {
-      slog("stream", "state", { from: "THINKING", to: "RESPONDING", elapsedMs: elapsed });
-      streamState = "RESPONDING";
-      console.log(`[stream] → RESPONDING (${(elapsed/1000).toFixed(1)}s)`);
-      broadcast({ type: "voice_status", state: "responding" });
-    }
-  }
-
-  // Broadcast content when we have response markers
-  if (streamState === "RESPONDING" || response) {
-    broadcastCurrentOutput();
-  }
-
-  // Schedule done check when prompt appears without spinner and we've seen activity
-  if (prompt && !spinner && sawActivity) {
-    scheduleDoneCheck();
-  }
-}
+// onStreamActivity and checkPaneState removed — replaced by push-based handlePipeOutput + performPaneCheck
 
 function cancelDoneCheck() {
   if (doneCheckTimer) {
@@ -3825,12 +4185,10 @@ function startTmuxStreaming(userInput: string, inputId?: string) {
   lastStreamActivity = Date.now();
   sawActivity = false;
   lastBroadcastText = "";
-  // Reset sentence cursor for new turn (after stopClientPlayback drains stale TTS)
   // Start a new conversation turn — keep old entries for history
   currentTurn++;
   trimEntriesToCap();
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
-  streamFileOffset = 0;
   stopClientPlayback2("new_input"); // Stop any current TTS before new input
   entryTtsCursor.clear(); // Reset sentence cursor AFTER TTS stop to avoid re-speaking tail
 
@@ -3838,47 +4196,13 @@ function startTmuxStreaming(userInput: string, inputId?: string) {
   preInputSnapshot = captureTmuxPane();
   console.log(`[stream] Pre-snapshot: ${(preInputSnapshot.match(/^❯/gm) || []).length} prompts`);
 
-  // Truncate stream file and set up pipe streaming
-  try { writeFileSync(STREAM_FILE, ""); } catch {}
-  terminal.startPipeStream(STREAM_FILE);
+  // Push architecture: no pipe management needed — always-on pipe handles activity detection.
+  // No polling timers — handlePipeOutput triggers state detection + parsing.
 
   streamState = "WAITING";
   broadcast({ type: "voice_status", state: "thinking" });
 
-  // 50ms file watcher — detects new pipe output as activity signal
-  streamWatcher = setInterval(() => {
-    try {
-      const stat = statSync(STREAM_FILE);
-      if (stat.size > streamFileOffset) {
-        streamFileOffset = stat.size;
-        onStreamActivity();
-      } else {
-        // No new data — if quiet long enough after activity, schedule done check
-        const quietMs = Date.now() - lastStreamActivity;
-        if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
-          scheduleDoneCheck();
-        }
-      }
-    } catch {}
-  }, 50);
-
-  // Independent checker — runs every 1s to:
-  // 1. Catch completion when pipe activity keeps canceling the done-check timer
-  // 2. Trigger incremental TTS for text that appeared between tool calls
-  promptCheckInterval = setInterval(() => {
-    if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
-    if (!sawActivity) return;
-    const pane = captureTmuxPane();
-    if (hasPromptReady(pane) && !hasSpinnerChars(pane)) {
-      console.log("[stream] Prompt-ready detected by independent checker");
-      handleStreamDone();
-    } else if (streamState === "RESPONDING") {
-      // Not done yet — but broadcast content and trigger incremental TTS
-      broadcastCurrentOutput();
-    }
-  }, 1000);
-
-  // Overall timeout
+  // Overall timeout (safety net)
   streamTimeout = setTimeout(() => {
     console.log(`[stream] Timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
     const pane = captureTmuxPane();
@@ -3891,7 +4215,7 @@ function startTmuxStreaming(userInput: string, inputId?: string) {
     }
   }, STREAM_TIMEOUT_MS);
 
-  console.log(`[stream] Started pipe-pane → ${STREAM_FILE}`);
+  console.log("[stream] Started streaming (push-based)");
 }
 
 function handleStreamDone() {
@@ -3936,12 +4260,12 @@ function handleStreamDone() {
       assistantEntries[i].speakable = para.speakable;
     } else {
       // Skip if identical text exists in recent entries (cross-turn dedup for gen bumps)
-      // Use normalized comparison to catch whitespace-only differences
-      const recentEntries = conversationEntries.slice(-20);
+      // Bug U1: widened from slice(-20)/±2turns to slice(-30)/no turn restriction — matches broadcastCurrentOutput
+      const recentEntries = conversationEntries.slice(-30);
       const paraNorm = para.text.trim().toLowerCase().replace(/\s+/g, " ");
       const isDup = recentEntries.some(e => {
         if (e.role !== "assistant") return false;
-        if (e.turn !== currentTurn && currentTurn - (e.turn ?? 0) > 2) return false;
+        if (e.text === para.text) return true; // Exact match — no turn restriction
         const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
         return eNorm === paraNorm;
       });
@@ -4028,119 +4352,27 @@ function handleStreamDone() {
   streamState = "DONE";
   slog("stream", "state", { from: "FINALIZING", to: "DONE" });
 
-  // Re-engagement: watch for Claude starting new work (tool calls, follow-ups)
-  startReEngageWatcher();
+  // Push architecture: re-engagement handled by handlePipeOutput detecting spinner during DONE state
+  // No polling watcher needed — the always-on pipe will trigger reEngageFromPush() automatically
 }
 
-function startReEngageWatcher() {
-  if (reEngageWatcher) { clearInterval(reEngageWatcher); reEngageWatcher = null; }
-  const savedSnapshot = preInputSnapshot;
-  const savedInput = lastUserInput;
-  let checks = 0;
-  reEngageWatcher = setInterval(() => {
-    checks++;
-    if (checks > 20) { // 10 seconds (20 * 500ms)
-      clearInterval(reEngageWatcher!);
-      reEngageWatcher = null;
-      return;
-    }
-    const pane = captureTmuxPane();
-    if (!pane) return;
-    if (hasSpinnerChars(pane)) {
-      console.log(`[stream] Re-engaging — spinner detected after done (check #${checks})`);
-      clearInterval(reEngageWatcher!);
-      reEngageWatcher = null;
-      // Re-start streaming with same context so incremental TTS continues
-      reEngageStreaming(savedSnapshot, savedInput);
-    }
-  }, 500);
-}
-
-function reEngageStreaming(savedSnapshot: string, savedInput: string) {
-  if (streamState !== "IDLE" && streamState !== "DONE") return;
-
-  preInputSnapshot = savedSnapshot;
-  lastUserInput = savedInput;
-  pollStartTime = Date.now();
-  lastStreamActivity = Date.now();
-  sawActivity = true; // We know there's activity (spinner)
-  lastBroadcastText = "";
-  // Don't reset conversationEntries — we want to continue from where we left off for entry-based TTS
-  streamFileOffset = 0;
-
-  try { writeFileSync(STREAM_FILE, ""); } catch {}
-  terminal.startPipeStream(STREAM_FILE);
-
-  streamState = "THINKING";
-  broadcast({ type: "voice_status", state: "thinking" });
-
-  // Same watchers as startTmuxStreaming
-  streamWatcher = setInterval(() => {
-    try {
-      const stat = statSync(STREAM_FILE);
-      if (stat.size > streamFileOffset) {
-        streamFileOffset = stat.size;
-        onStreamActivity();
-      } else {
-        const quietMs = Date.now() - lastStreamActivity;
-        if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
-          scheduleDoneCheck();
-        }
-      }
-    } catch {}
-  }, 50);
-
-  promptCheckInterval = setInterval(() => {
-    if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
-    if (!sawActivity) return;
-    const pane = captureTmuxPane();
-    if (hasPromptReady(pane) && !hasSpinnerChars(pane)) {
-      console.log("[stream] Prompt-ready detected by re-engage checker");
-      handleStreamDone();
-    } else if (streamState === "RESPONDING") {
-      broadcastCurrentOutput();
-    }
-  }, 1000);
-
-  streamTimeout = setTimeout(() => {
-    console.log(`[stream] Re-engage timeout after ${STREAM_TIMEOUT_MS / 1000}s`);
-    const pane = captureTmuxPane();
-    const paragraphs = extractStructuredOutput(preInputSnapshot, pane, lastUserInput);
-    if (paragraphs.length > 0) {
-      handleStreamDone();
-    } else {
-      stopTmuxStreaming();
-      broadcast({ type: "voice_status", state: "idle" });
-    }
-  }, STREAM_TIMEOUT_MS);
-
-  console.log("[stream] Re-engaged streaming for continuation");
-}
+// startReEngageWatcher and reEngageStreaming removed — replaced by push-based reEngageFromPush()
 
 function stopTmuxStreaming() {
-  terminal.stopPipeStream();
+  // Push architecture: don't stop the always-on pipe — it runs continuously.
+  // Only cancel timers and reset state.
 
-  if (streamWatcher) {
-    clearInterval(streamWatcher);
-    streamWatcher = null;
-  }
   if (streamTimeout) {
     clearTimeout(streamTimeout);
     streamTimeout = null;
   }
-  if (contentCheckTimer) {
-    clearTimeout(contentCheckTimer);
-    contentCheckTimer = null;
-  }
   cancelDoneCheck();
   if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
-  if (promptCheckInterval) { clearInterval(promptCheckInterval); promptCheckInterval = null; }
-  if (reEngageWatcher) { clearInterval(reEngageWatcher); reEngageWatcher = null; }
+  if (_parseTimer) { clearTimeout(_parseTimer); _parseTimer = null; }
+  if (_quietTimer) { clearTimeout(_quietTimer); _quietTimer = null; }
+  if (_idleCheckTimer) { clearTimeout(_idleCheckTimer); _idleCheckTimer = null; }
   streamState = "IDLE";
   lastStreamEndTime = Date.now();
-
-  // Clean up stream file
-  try { unlinkSync(STREAM_FILE); } catch {}
 
   // Drain pending queued voice input (lock prevents concurrent drains)
   if (pendingVoiceInput.length > 0 && !_voiceQueueDraining) {
@@ -4176,320 +4408,40 @@ function stopTmuxStreaming() {
   }
 }
 
-// --- Passive Pane Watcher ---
-// Detects when user types directly into the CLI (not through Murmur).
-// Polls tmux pane every 2s while IDLE. If spinner detected, starts streaming.
-let passiveWatcher: ReturnType<typeof setInterval> | null = null;
-let lastPassiveSnapshot: string = "";
-// Track recent passive inputs to prevent duplicates (ring buffer of last 10)
-let _recentPassiveInputs: Array<{ normalized: string; ts: number }> = [];
-let _cooldownThinking = false; // Track if we sent thinking state during cooldown
-let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
-const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
-// Pending input: captures prompt content while user is typing/pasting (pre-Enter).
-// When user pastes text (Cmd+V), it appears on the prompt line instantly but Enter
-// hasn't been pressed yet. The next poll may already show spinner, making extraction
-// harder. By saving the pending input during idle, we have a reliable third extraction
-// method when spinner appears.
-let _pendingPromptInput = "";
-let _pendingPromptInputTs = 0;
-
-const PASSIVE_POLL_MS = parseInt(process.env.MURMUR_PASSIVE_POLL_MS || "2000", 10); // BUG-043: configurable
+// --- Passive watcher removed — replaced by push-based handlePipeOutput() ---
+// Native CLI input detection now handled by always-on pipe + handleNativeInputDetected().
+// Passive watcher variables removed — replaced by push-based architecture
+// startPassiveWatcher removed — push-based architecture.
+// Keeping stub functions for call sites that haven't been updated yet.
 function startPassiveWatcher() {
-  if (passiveWatcher) return;
-  passiveWatcher = setInterval(() => {
-    if (!isWindowActive()) return; // No window selected yet — don't scrape
-    if (!terminal.isSessionAlive()) return;
-    const pane = captureTmuxPane();
-    if (!pane) return;
-
-    // Detect "Interrupted" prompt — runs in ANY state since interrupts happen mid-stream
-    if (/Interrupted\s*.{0,3}\s*What should Claude do/i.test(pane)) {
-      console.log("[passive] Detected interrupt prompt in pane");
-      // Don't show "Interrupted" status — fires spuriously from tmux pane content matching
-      // Also end the stream if still active
-      if (streamState !== "IDLE" && streamState !== "DONE") {
-        console.log("[passive] Interrupted prompt detected — ending stream");
-        streamState = "IDLE";
-        lastStreamEndTime = Date.now();
-        stopClientPlayback2("passive_redetect");
-        broadcast({ type: "voice_status", state: "idle" });
-      }
-    }
-
-    // Check for interactive prompts during idle (e.g. "How is Claude?" feedback)
-    // This runs even during cooldown — auto-dismiss doesn't re-trigger streaming
-    if (detectInteractivePrompt(pane)) return;
-
-    if (streamState !== "IDLE" && streamState !== "DONE") return;
-
-    // Cooldown: don't trigger streaming if it just ended (prevents re-triggering on same session)
-    if (Date.now() - lastStreamEndTime < PASSIVE_COOLDOWN_MS) {
-      // Even during cooldown, show amber glow + activity status for system tasks
-      // (e.g. "Compacting conversation", "Updating memory") so the UI isn't stuck on idle
-      if (hasSpinnerChars(pane)) {
-        _cooldownThinking = true;
-        broadcast({ type: "voice_status", state: "thinking" });
-        const activityMatch = pane.match(/(Compacting conversation|Updating memory|Checking for updates|Searching|Indexing)[….]*/i);
-        if (activityMatch) {
-          broadcast({ type: "tool_status", text: activityMatch[1] + "…" });
-        }
-      } else if (_cooldownThinking) {
-        // Spinner gone — system task finished, return to idle
-        _cooldownThinking = false;
-        broadcast({ type: "voice_status", state: "idle" });
-        broadcast({ type: "tool_status", text: "" });
-      }
-      return;
-    }
-
-    if (hasSpinnerChars(pane)) {
-      console.log("[passive] Spinner detected — native CLI input");
-
-      // Extract user input using TWO methods:
-      // 1. Prompt parsing: find ❯ line + continuation lines (works for typed input)
-      // 2. Snapshot diff: compare idle snapshot with current pane (handles paste, wrapped text)
-      // Use whichever produces more text — paste detection via prompt parsing often truncates
-      // because pasted text may contain blank lines, special chars, or overflow the visible pane.
-
-      // Method 1: Prompt line parsing
-      const lines = pane.split("\n");
-      let promptInput = "";
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const trimmed = lines[i].trim();
-        if (trimmed.startsWith("❯ ") && trimmed.length > 3) {
-          const parts = [trimmed.slice(2).trim()];
-          for (let j = i + 1; j < lines.length; j++) {
-            const next = lines[j].trim();
-            if (!next) break;
-            if (next.startsWith("❯")) break;
-            if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(next)) break;
-            if (/^[─━═]{3,}/.test(next)) break;
-            if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(next)) break;
-            if (/^Press (up|down|esc|enter|tab)/i.test(next)) break;
-            parts.push(next);
-          }
-          promptInput = parts.join(" ");
-          break;
-        }
-      }
-
-      // Method 2: Snapshot diff — compare saved idle snapshot with current pane.
-      // New lines between snapshots that aren't chrome/spinner = user's input (typed + pasted).
-      let diffInput = "";
-      if (lastPassiveSnapshot) {
-        const preLines = lastPassiveSnapshot.split("\n");
-        const curLines = pane.split("\n");
-        // Find where the two diverge
-        let divergeIdx = 0;
-        for (let i = 0; i < Math.min(preLines.length, curLines.length); i++) {
-          if (preLines[i] !== curLines[i]) { divergeIdx = i; break; }
-          divergeIdx = i + 1;
-        }
-        // Collect new lines from divergence point, filtering out chrome/spinner
-        const newParts: string[] = [];
-        for (let i = divergeIdx; i < curLines.length; i++) {
-          const t = curLines[i].trim();
-          if (!t) continue;
-          if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(t)) continue; // spinner
-          if (/^[─━═]{3,}/.test(t)) continue; // separator
-          if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(t)) continue;
-          if (/^Press (up|down|esc|enter|tab)/i.test(t)) continue;
-          // Strip ❯ prefix if present
-          const cleaned = t.startsWith("❯") ? t.slice(1).trim() : t;
-          if (cleaned) newParts.push(cleaned);
-        }
-        diffInput = newParts.join(" ").trim();
-      }
-
-      // Method 3: Pending input — text captured from prompt line while user was typing/pasting.
-      // If user pasted text (Cmd+V), the previous idle poll would have seen the prompt with
-      // content and saved it in _pendingPromptInput. This is the most reliable method for
-      // paste detection because it captures text BEFORE Enter was pressed.
-      let pendingInput = "";
-      if (_pendingPromptInput && Date.now() - _pendingPromptInputTs < 10000) {
-        pendingInput = _pendingPromptInput;
-        console.log(`[passive] Pending input available (${pendingInput.length} chars): "${pendingInput.slice(0, 80)}"`);
-      }
-      _pendingPromptInput = ""; // Consume — don't reuse on next poll
-
-      // Use the longest result — each method catches different cases:
-      // - promptInput: reliable for short typed text
-      // - diffInput: captures text missed by prompt parsing (wrapped lines)
-      // - pendingInput: captures pasted text seen before Enter was pressed
-      let userInput = promptInput;
-      if (diffInput.length > userInput.length + 10) {
-        console.log(`[passive] Diff input longer (${diffInput.length} vs ${userInput.length}) — using diff`);
-        userInput = diffInput;
-      }
-      if (pendingInput.length > userInput.length + 10) {
-        console.log(`[passive] Pending input longer (${pendingInput.length} vs ${userInput.length}) — using pending (paste detected)`);
-        userInput = pendingInput;
-      }
-
-      // Filter agent infrastructure commands — these are agent-to-agent commands
-      // (e.g. UX-Expert running tmux send-keys), not real user conversation input
-      if (userInput && isAgentInfraCommand(userInput)) {
-        console.log(`[passive] Filtered agent infrastructure command: "${userInput.slice(0, 80)}"`);
-        userInput = "";
-      }
-
-      // Take pre-snapshot from saved state (before spinner appeared)
-      // If no saved snapshot, strip user input + spinner from current pane to synthesize a clean pre-state
-      let snapshot = lastPassiveSnapshot;
-      if (!snapshot) {
-        const paneLines = pane.split("\n");
-        const promptIdx = paneLines.findIndex(l => l.trim().startsWith("❯ ") && l.trim().length > 3);
-        snapshot = promptIdx >= 0 ? paneLines.slice(0, promptIdx).join("\n") : pane;
-      }
-
-      // Guard: skip if we already processed this same user input recently
-      // (prevents triplicates when tmux shows same ❯ text across multiple poll cycles)
-      if (userInput) {
-        const normalizedPassive = userInput.trim().toLowerCase().replace(/\s+/g, "");
-        const cutoff = Date.now() - 60000;
-        _recentPassiveInputs = _recentPassiveInputs.filter(e => e.ts >= cutoff); // prune old
-        if (_recentPassiveInputs.some(e => e.normalized === normalizedPassive)) {
-          console.log(`[passive] Skipping already-processed input: "${userInput.slice(0, 60)}"`);
-          return;
-        }
-        _recentPassiveInputs.push({ normalized: normalizedPassive, ts: Date.now() });
-        if (_recentPassiveInputs.length > 10) _recentPassiveInputs.shift(); // cap at 10
-      }
-
-      // Guard: skip if this text was sent programmatically via Murmur text box or STT.
-      // Those sources already created the user entry — don't re-detect from terminal scraping.
-      if (userInput && terminal.wasRecentlySent?.(userInput)) {
-        console.log(`[passive] Skipping programmatically-sent input: "${userInput.slice(0, 60)}"`);
-        // Still start streaming — spinner is active, Claude is processing
-      }
-
-      // Start streaming just like a Murmur-initiated input
-      if (streamState === "DONE" || streamState === "IDLE") {
-        // New conversation turn — keep old entries for history
-        currentTurn++;
-        if (entryTtsTimer) { clearTimeout(entryTtsTimer); entryTtsTimer = null; }
-        lastBroadcastText = "";
-
-        // Only create user entry if NOT already sent programmatically
-        // Also check if this exact text already exists as a user entry (prevents duplicates
-        // when tmux pane shows same ❯ prompt across multiple passive watcher cycles)
-        if (userInput && !_isSystemContext && !terminal.wasRecentlySent?.(userInput)) {
-          const normalizedNew = userInput.trim().toLowerCase().replace(/\s+/g, "");
-          const alreadyExists = conversationEntries.some(
-            e => e.role === "user" && e.text.trim().toLowerCase().replace(/\s+/g, "") === normalizedNew
-          );
-          if (!alreadyExists) {
-            addUserEntry(userInput, false, "terminal");
-          } else {
-            console.log(`[passive] Skipping duplicate user entry: "${userInput.slice(0, 60)}"`);
-          }
-        }
-        trimEntriesToCap();
-
-        preInputSnapshot = snapshot;
-        lastUserInput = userInput || "(native input)";
-        pollStartTime = Date.now();
-        lastStreamActivity = Date.now();
-        sawActivity = true;
-        streamFileOffset = 0;
-        stopClientPlayback2("new_input");
-
-        try { writeFileSync(STREAM_FILE, ""); } catch {}
-        terminal.startPipeStream(STREAM_FILE);
-
-        streamState = "THINKING";
-        broadcast({ type: "voice_status", state: "thinking" });
-
-        // Set up watchers (same as startTmuxStreaming)
-        streamWatcher = setInterval(() => {
-          try {
-            const stat = statSync(STREAM_FILE);
-            if (stat.size > streamFileOffset) {
-              streamFileOffset = stat.size;
-              onStreamActivity();
-            } else {
-              const quietMs = Date.now() - lastStreamActivity;
-              if (quietMs >= DONE_QUIET_MS && sawActivity && streamState !== "WAITING" && !doneCheckTimer) {
-                scheduleDoneCheck();
-              }
-            }
-          } catch {}
-        }, 50);
-
-        promptCheckInterval = setInterval(() => {
-          if (streamState !== "RESPONDING" && streamState !== "THINKING") return;
-          if (!sawActivity) return;
-          const p = captureTmuxPane();
-          if (hasPromptReady(p) && !hasSpinnerChars(p)) {
-            handleStreamDone();
-          } else if (streamState === "RESPONDING") {
-            broadcastCurrentOutput();
-          }
-        }, 1000);
-
-        streamTimeout = setTimeout(() => {
-          const p = captureTmuxPane();
-          const paragraphs = extractStructuredOutput(preInputSnapshot, p, lastUserInput);
-          if (paragraphs.length > 0) {
-            handleStreamDone();
-          } else {
-            stopTmuxStreaming();
-            broadcast({ type: "voice_status", state: "idle" });
-          }
-        }, STREAM_TIMEOUT_MS);
-
-        console.log(`[passive] Started streaming for native CLI input: "${userInput.slice(0, 60)}"`);
-      }
-    } else {
-      // Only save snapshot when the ❯ input prompt is empty (user is idle, not mid-typing).
-      // If we save a mid-typing snapshot and the spinner fires on the next poll,
-      // preInputSnapshot will contain a partial message, causing the diff approach in
-      // getLinesAfterInput to start from line 2+ of the user's message — which then
-      // gets mistakenly returned as Claude's response content.
-      const paneLines = pane.split("\n");
-      let lastPromptLine = "";
-      let lastPromptIdx = -1;
-      for (let i = paneLines.length - 1; i >= 0; i--) {
-        const t = paneLines[i].trim();
-        if (t.startsWith("❯")) { lastPromptLine = t; lastPromptIdx = i; break; }
-      }
-      // Empty prompt (just ❯ with optional whitespace) = user is idle, safe to save
-      if (!lastPromptLine || /^❯\s*$/.test(lastPromptLine)) {
-        lastPassiveSnapshot = pane;
-        // Clear pending input — user is idle
-        _pendingPromptInput = "";
-      } else {
-        // Prompt has content — user is mid-type or mid-paste.
-        // Capture pending input: text on prompt line + continuation lines below.
-        // This is critical for paste detection: pasted text appears instantly on the
-        // prompt but Enter hasn't been pressed. If spinner appears on next poll,
-        // this saved text provides reliable user input extraction.
-        const parts = [lastPromptLine.slice(lastPromptLine.indexOf("❯") + 1).trim()];
-        for (let j = lastPromptIdx + 1; j < paneLines.length; j++) {
-          const cont = paneLines[j].trim();
-          if (!cont) break;
-          if (cont.startsWith("❯")) break;
-          if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✻✶⏺]/.test(cont)) break;
-          if (/^[─━═]{3,}/.test(cont)) break;
-          if (/^(Tokens?:|Session:|esc to|ctrl\+)/i.test(cont)) break;
-          parts.push(cont);
-        }
-        const captured = parts.join(" ").trim();
-        if (captured.length > _pendingPromptInput.length) {
-          _pendingPromptInput = captured;
-          _pendingPromptInputTs = Date.now();
-          console.log(`[passive] Pending input captured (${captured.length} chars): "${captured.slice(0, 80)}"`);
-        }
-      }
-    }
-  }, PASSIVE_POLL_MS);
+  // Push architecture: the always-on pipe handles idle detection.
+  // Set up the pipe output callback if not already done.
+  if (terminal.onOutput) {
+    terminal.onOutput(handlePipeOutput);
+    console.log("[push] Always-on pipe output handler registered");
+  } else {
+    console.warn("[push] Terminal backend does not support onOutput — falling back to stub");
+  }
 }
 
+// Original passive watcher body removed (was ~300 lines of polling/scraping).
+// REPLACED BY: handlePipeOutput(), handleNativeInputDetected(), reEngageFromPush()
+
 function stopPassiveWatcher() {
-  if (passiveWatcher) {
-    clearInterval(passiveWatcher);
-    passiveWatcher = null;
+  // Push architecture: no-op — the always-on pipe runs continuously
+}
+
+/** Check for interrupt prompt in pane content */
+function checkForInterruptPrompt(pane: string): void {
+  if (/Interrupted\s*.{0,3}\s*What should Claude do/i.test(pane)) {
+    console.log("[push] Detected interrupt prompt in pane");
+    if (streamState !== "IDLE" && streamState !== "DONE") {
+      console.log("[push] Interrupted prompt detected — ending stream");
+      streamState = "IDLE";
+      lastStreamEndTime = Date.now();
+      stopClientPlayback2("passive_redetect");
+      broadcast({ type: "voice_status", state: "idle" });
+    }
   }
 }
 
@@ -4873,9 +4825,11 @@ function broadcast(msg: Record<string, unknown>) {
       }
       msg.entries = entries;
     }
-    const hasTestEntries = entries.some(e => e.sourceTag?.startsWith("text-input-test"));
+    // Bug U4: Filter ALL test entries — both "text-input-test" (from addUserEntry) and "test-*" (from test:entries-*)
+    const isTestEntry = (e: ConversationEntry) => e.sourceTag?.startsWith("test-") || e.sourceTag?.startsWith("text-input-test");
+    const hasTestEntries = entries.some(isTestEntry);
     if (hasTestEntries) {
-      const realEntries = entries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+      const realEntries = entries.filter(e => !isTestEntry(e));
       dataForReal = JSON.stringify({ ...msg, entries: realEntries });
       dataForTest = JSON.stringify(msg); // test clients see all entries
     }
@@ -4935,10 +4889,14 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   if (isTestMode) (ws as any)._isTestMode = true;
   const wasEmpty = clients.size === 0;
   clients.add(ws);
+  _clientConnectCount++;
   // BUG-046: Track pong timestamps for stale connection detection
   (ws as any)._lastPong = Date.now();
+  (ws as any)._clientId = _clientConnectCount;
   ws.on("pong", () => { (ws as any)._lastPong = Date.now(); });
   slog("ws", "connect", { clients: clients.size });
+  _clientLog.push({ ts: Date.now(), event: wasEmpty ? "reconnect" : "connect", clientCount: clients.size, isTestMode, note: `clientId=${_clientConnectCount}` });
+  if (_clientLog.length > RING_CAP) _clientLog.shift();
 
   // Cancel pending exit — a client reconnected
   if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
@@ -4995,7 +4953,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       recentEntries = recentEntries.slice(-80);
     }
     if (!(ws as any)._isTestMode) {
-      recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+      // Bug U4 fix: filter ALL test entries, not just text-input-test
+      recentEntries = recentEntries.filter(e => !isTestEntry(e));
     }
     ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: streamState === "RESPONDING" }));
   }
@@ -5419,6 +5378,20 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const chunkIndex = parseInt(parts[1], 10);
       if (!isNaN(chunkEntryId) && !isNaN(chunkIndex)) {
         handleChunkDone(chunkEntryId, chunkIndex);
+      }
+      return;
+    }
+
+    // Client-reported render timing: "render_timing:ENTRY_ID:RENDER_MS:ENTRY_COUNT[:VIEWPORT_HEIGHT]"
+    if (msg.startsWith("render_timing:")) {
+      const parts = msg.slice(14).split(":");
+      const rtEntryId = parseInt(parts[0], 10);
+      const renderMs = parseFloat(parts[1]);
+      const entryCount = parseInt(parts[2], 10);
+      const viewportHeight = parts[3] ? parseInt(parts[3], 10) : undefined;
+      if (!isNaN(rtEntryId) && !isNaN(renderMs)) {
+        _renderLog.push({ ts: Date.now(), clientTs: Date.now(), entryId: rtEntryId, renderMs, entryCount: entryCount || 0, viewportHeight });
+        if (_renderLog.length > RING_CAP) _renderLog.shift();
       }
       return;
     }
@@ -5874,6 +5847,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
             spoken: false,
             ts: Date.now(),
             turn: currentTurn,
+            sourceTag: "test-entries", // Bug U4: tag for broadcast filter isolation
           };
           pushEntry(entry);
           (ws as any)._testEntryIds?.add(entry.id);
@@ -5905,6 +5879,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           spoken: item.spoken === true,
           ts: Date.now(),
           turn: currentTurn,
+          sourceTag: "test-entries-full", // Bug U4: tag for broadcast filter isolation
         };
         pushEntry(entry);
         (ws as any)._testEntryIds?.add(entry.id);
@@ -5930,6 +5905,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           spoken: item.spoken === true,         // default false
           ts: Date.now(),
           turn: currentTurn,
+          sourceTag: "test-entries-mixed", // Bug U4: tag for broadcast filter isolation
         };
         pushEntry(entry);
         (ws as any)._testEntryIds?.add(entry.id);
@@ -5962,6 +5938,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
             spoken: false,
             ts: Date.now(),
             turn: currentTurn,
+            sourceTag: "test-entries-tts", // Bug U4: tag for broadcast filter isolation
           };
           pushEntry(entry);
           (ws as any)._testEntryIds?.add(entry.id);
@@ -6071,6 +6048,8 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   ws.on("close", () => {
     clients.delete(ws);
     slog("ws", "disconnect", { clients: clients.size });
+    _clientLog.push({ ts: Date.now(), event: "disconnect", clientCount: clients.size, isTestMode: !!(ws as any)._isTestMode, note: `clientId=${(ws as any)._clientId}` });
+    if (_clientLog.length > RING_CAP) _clientLog.shift();
 
     // Transfer audio control if the active client disconnected
     if (activeAudioClient === ws) {
@@ -6213,7 +6192,7 @@ app.get("/api/state", (_req, res) => {
     windows: Array.from(windowEntries.keys()),
     lastEntries,
     pendingVoiceCount: pendingVoiceInput.length,
-    lastPassiveSnapshotLength: lastPassiveSnapshot ? lastPassiveSnapshot.length : 0,
+    pushArchitecture: true,
     contextSent,
     services: serviceStatus,
     cleanMode: _cleanMode,
@@ -6267,8 +6246,227 @@ app.get("/debug/parse-log", (_req, res) => {
   });
 });
 
+// Raw pipe-pane output — first hop in the traceability chain:
+// /debug/pipe-input (raw terminal text) → /debug/parse-log (parser decisions)
+// → /debug/entry-log (entries created) → /debug/tts-history (audio played)
+app.get("/debug/pipe-input", (_req, res) => {
+  res.json({
+    count: _pipeInputLog.length,
+    cap: PIPE_INPUT_LOG_CAP,
+    entries: _pipeInputLog,
+  });
+});
+
 app.get("/debug/kokoro-log", (_req, res) => {
   res.json(_kokoroLog);
+});
+
+// ── Monitor Dashboard Endpoints ──
+
+app.get("/debug/stt-log", (_req, res) => {
+  res.json({ count: _whisperLog.length, cap: RING_CAP, entries: _whisperLog });
+});
+
+app.get("/debug/entry-mutations", (_req, res) => {
+  res.json({ count: _entryMutationLog.length, cap: RING_CAP, entries: _entryMutationLog });
+});
+
+app.get("/debug/dedup-log", (_req, res) => {
+  res.json({ count: _dedupLog.length, cap: RING_CAP, entries: _dedupLog });
+});
+
+app.get("/debug/window-log", (_req, res) => {
+  res.json({ count: _windowLog.length, cap: RING_CAP, entries: _windowLog });
+});
+
+app.get("/debug/client-log", (_req, res) => {
+  res.json({ count: _clientLog.length, cap: RING_CAP, totalConnections: _clientConnectCount, entries: _clientLog });
+});
+
+app.get("/debug/queue-history", (_req, res) => {
+  res.json({ count: _queueHistory.length, cap: RING_CAP, entries: _queueHistory });
+});
+
+app.get("/debug/render-log", (_req, res) => {
+  res.json({ count: _renderLog.length, cap: RING_CAP, entries: _renderLog });
+});
+
+// ── Cross-reference endpoints for Monitor ──
+
+/** /debug/trace/:entryId — full lifecycle trace across ALL ring buffers */
+app.get("/debug/trace/:entryId", (req, res) => {
+  const entryId = parseInt(req.params.entryId, 10);
+  if (isNaN(entryId)) { res.status(400).json({ error: "Invalid entryId" }); return; }
+
+  const entry = conversationEntries.find(e => e.id === entryId);
+  const anomalies: string[] = [];
+
+  // Pipe input: find chunks that led to this entry (by timestamp proximity)
+  const entryTs = entry?.ts ?? 0;
+  const pipeChunks = entryTs ? _pipeInputLog.filter(p => Math.abs(p.ts - entryTs) < 5000) : [];
+
+  // Parse decisions around entry creation time
+  const parseKept = _parseParagraphs.filter(p => entryTs && Math.abs(p.ts - entryTs) < 3000);
+  const parseDiscarded = _parseDiscards.filter(p => entryTs && Math.abs(p.ts - entryTs) < 3000);
+
+  // Entry creation log
+  const creation = _entryLog.find(e => e.id === entryId);
+
+  // Mutations
+  const mutations = _entryMutationLog.filter(m => m.entryId === entryId);
+
+  // Dedup checks that matched this entry
+  const dedupChecks = _dedupLog.filter(d => d.matchedEntryId === entryId);
+
+  // TTS history for this entry
+  const ttsEntries = _ttsHistory.filter(t => t.entryId === entryId);
+
+  // TTS fetch log
+  const ttsFetches = _ttsFetchLog.filter(t => t.entryId === entryId);
+
+  // Highlight events
+  const highlights = _highlightLog.filter(h => h.entryId === entryId);
+
+  // Queue events
+  const queueEvents = _queueHistory.filter(q => q.entryId === entryId);
+
+  // WS broadcasts around entry time (±2s)
+  const wsBroadcasts = entryTs ? _serverWsLog.filter(w => w.dir === "out" && w.type === "entry" && Math.abs(w.ts - entryTs) < 2000) : [];
+
+  // Render timing
+  const renders = _renderLog.filter(r => r.entryId === entryId);
+
+  // Anomaly detection
+  if (entry && !entry.spoken && ttsEntries.length === 0 && entry.speakable) {
+    anomalies.push("speakable entry never queued for TTS");
+  }
+  if (dedupChecks.length > 0) {
+    anomalies.push(`text was rejected ${dedupChecks.length} time(s) as duplicate of this entry`);
+  }
+  if (mutations.filter(m => m.field === "text").length > 3) {
+    anomalies.push(`text mutated ${mutations.filter(m => m.field === "text").length} times (excessive updates)`);
+  }
+
+  res.json({
+    entryId,
+    entry: entry ? { id: entry.id, role: entry.role, text: entry.text.slice(0, 200), speakable: entry.speakable, spoken: entry.spoken, ts: entry.ts, turn: entry.turn, window: entry.window, sourceTag: entry.sourceTag } : null,
+    lifecycle: {
+      pipe_input: pipeChunks.length > 0 ? { count: pipeChunks.length, first_ts: pipeChunks[0]?.ts, last_ts: pipeChunks[pipeChunks.length - 1]?.ts } : null,
+      parse: { kept: parseKept.length, discarded: parseDiscarded.length, kept_entries: parseKept },
+      creation: creation ?? null,
+      mutations,
+      dedup_checks: dedupChecks,
+      tts: { queued: ttsEntries, fetches: ttsFetches, highlights, queue_events: queueEvents },
+      ws_broadcast: { count: wsBroadcasts.length, entries: wsBroadcasts },
+      render: renders,
+    },
+    anomalies,
+  });
+});
+
+/** /debug/health — quick summary with anomaly detection for Monitor polling */
+app.get("/debug/health", (_req, res) => {
+  const now = Date.now();
+  const window60s = now - 60000;
+
+  // Entry stats
+  const recentMutations = _entryMutationLog.filter(m => m.ts > window60s);
+  const recentDedups = _dedupLog.filter(d => d.ts > window60s);
+
+  // TTS stats
+  const recentTtsFetches = _ttsFetchLog.filter(t => t.ts > window60s);
+  const ttsFailed = recentTtsFetches.filter(t => t.status === "failed");
+  const ttsAvgLatency = recentTtsFetches.length > 0
+    ? Math.round(recentTtsFetches.reduce((s, t) => s + t.durationMs, 0) / recentTtsFetches.length) : 0;
+
+  // WS stats
+  const recentWs = _serverWsLog.filter(w => w.ts > window60s);
+  const wsErrors = recentWs.filter(w => w.type === "error" || w.type === "rate-limited");
+
+  // STT stats
+  const recentStt = _whisperLog.filter(w => w.ts > window60s);
+  const sttFailed = recentStt.filter(w => w.status === "failed");
+  const sttAvgLatency = recentStt.length > 0
+    ? Math.round(recentStt.reduce((s, w) => s + w.durationMs, 0) / recentStt.length) : 0;
+
+  // Parser stats
+  const recentParseKept = _parseParagraphs.filter(p => p.ts > window60s);
+  const recentParseDiscarded = _parseDiscards.filter(p => p.ts > window60s);
+
+  // Pipe stats
+  const recentPipe = _pipeInputLog.filter(p => p.ts > window60s);
+  const pipeBytes = recentPipe.reduce((s, p) => s + p.len, 0);
+
+  // Window stats
+  const recentWindowSwitches = _windowLog.filter(w => w.ts > window60s);
+
+  // Anomaly detection
+  const anomalies: string[] = [];
+  // Speakable entries without TTS
+  const unspoken = conversationEntries.filter(e => e.speakable && !e.spoken && (now - e.ts) > 10000);
+  if (unspoken.length > 0) anomalies.push(`${unspoken.length} speakable entries without TTS (oldest: ${Math.round((now - Math.min(...unspoken.map(e => e.ts))) / 1000)}s ago)`);
+  // High dedup rate
+  if (recentDedups.length > 10) anomalies.push(`${recentDedups.length} dedup rejections in last 60s`);
+  // TTS failures
+  if (ttsFailed.length > 0) anomalies.push(`${ttsFailed.length} TTS fetch failures in last 60s`);
+  // STT failures
+  if (sttFailed.length > 0) anomalies.push(`${sttFailed.length} STT failures in last 60s`);
+  // Excessive mutations
+  const textMutations = recentMutations.filter(m => m.field === "text");
+  if (textMutations.length > 20) anomalies.push(`${textMutations.length} text mutations in last 60s (possible parse churn)`);
+
+  res.json({
+    ts: now,
+    entries: { count: conversationEntries.length, dupes_blocked: recentDedups.length, mutations: recentMutations.length, stale_blocked: recentDedups.filter(d => d.tier === 1).length },
+    tts: { queue_depth: ttsJobQueue.length, jobs_active: ttsCurrentlyPlaying ? 1 : 0, jobs_failed: ttsFailed.length, avg_latency_ms: ttsAvgLatency },
+    ws: { clients: clients.size, messages_in_last_60s: recentWs.length, errors: wsErrors.length },
+    stt: { calls_last_60s: recentStt.length, avg_latency_ms: sttAvgLatency, failures: sttFailed.length },
+    parser: { lines_in_last_60s: recentPipe.length, kept: recentParseKept.length, discarded: recentParseDiscarded.length },
+    pipe: { bytes_last_60s: pipeBytes, lines_last_60s: recentPipe.length },
+    windows: { current: currentWindowKey, switches_last_60s: recentWindowSwitches.length },
+    stream: { state: streamState, lastActivity: lastStreamActivity },
+    anomalies,
+  });
+});
+
+/** /debug/trace/recent?count=N — bulk lifecycle traces for last N entries */
+app.get("/debug/trace/recent", (req, res) => {
+  const count = Math.min(safeInt(req.query.count as string, 20), 50);
+  const recentEntries = conversationEntries.slice(-count);
+  const traces = recentEntries.map(entry => {
+    const entryId = entry.id;
+    const mutations = _entryMutationLog.filter(m => m.entryId === entryId);
+    const dedupChecks = _dedupLog.filter(d => d.matchedEntryId === entryId);
+    const ttsEntries = _ttsHistory.filter(t => t.entryId === entryId);
+    const ttsFetches = _ttsFetchLog.filter(t => t.entryId === entryId);
+    const highlights = _highlightLog.filter(h => h.entryId === entryId);
+    const queueEvents = _queueHistory.filter(q => q.entryId === entryId);
+    const renders = _renderLog.filter(r => r.entryId === entryId);
+    const creation = _entryLog.find(e => e.id === entryId);
+
+    const anomalies: string[] = [];
+    if (entry.speakable && !entry.spoken && ttsEntries.length === 0) anomalies.push("no TTS");
+    if (mutations.filter(m => m.field === "text").length > 3) anomalies.push("excessive text mutations");
+
+    return {
+      entryId,
+      role: entry.role,
+      text: entry.text.slice(0, 120),
+      speakable: entry.speakable,
+      spoken: entry.spoken,
+      ts: entry.ts,
+      creation_ts: creation?.ts ?? null,
+      mutation_count: mutations.length,
+      tts_count: ttsEntries.length,
+      fetch_count: ttsFetches.length,
+      highlight_count: highlights.length,
+      render_count: renders.length,
+      dedup_matches: dedupChecks.length,
+      queue_events: queueEvents.length,
+      anomalies,
+    };
+  });
+  res.json({ count: traces.length, requested: count, traces });
 });
 
 // Diagnostic: test loadScrollbackEntries against a specific target without modifying state
@@ -6425,12 +6623,11 @@ app.get("/debug/state", (_req, res) => {
     currentWindowKey,
     displayTarget: terminal?.displayTarget ?? null,
     currentTarget: terminal?.currentTarget ?? null,
-    pinnedPaneId: (terminal as any)?.pinnedPaneId ?? null,
+    pinnedPaneId: terminal?.pinnedPaneId ?? null,
     streamState,
     isWindowActive: isWindowActive(),
-    passiveWatcherRunning: !!passiveWatcher,
+    pushArchitecture: true,
     lastTerminalTextLength: lastTerminalText.length,
-    lastPassiveSnapshotLength: lastPassiveSnapshot.length,
     preInputSnapshotLength: preInputSnapshot.length,
     conversationEntryCount: conversationEntries.length,
     windowEntriesKeys: Object.fromEntries(
@@ -6584,10 +6781,10 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Terminal backend: ${terminal.constructor.name}`);
   console.log(`  Watching: ${VM_EVENTS_DIR}`);
   console.log(`  Watching: ${VM_EXCHANGES_DIR}`);
-  // Passive watcher starts immediately but gates on isWindowActive().
-  // Actual scraping/broadcasting begins only after a client sends window_preference.
-  startPassiveWatcher();
-  console.log(`  Passive pane watcher: started (gated on window_preference)`);
+  // Push-based output handler replaces the passive watcher.
+  // Registers once — the always-on pipe detects all terminal activity.
+  startPassiveWatcher(); // Now just registers the onOutput callback
+  console.log(`  Push-based output handler: registered`);
   setInterval(sweepStaleTtsJobs, 10000); // Periodic sweep for stuck TTS jobs (10s)
 });
 

@@ -35,6 +35,7 @@ export class PtyBackend implements TerminalManager {
   private alive = false;
   private pipeListener: ((data: string) => void) | null = null;
   private pipeFilePath: string | null = null;
+  private _outputCallbacks: Array<(data: string) => void> = [];
 
   isSessionAlive(): boolean {
     return this.alive && this.proc !== null;
@@ -81,6 +82,11 @@ export class PtyBackend implements TerminalManager {
         try {
           appendFileSync(this.pipeFilePath, data);
         } catch {}
+      }
+
+      // Push-based output callbacks
+      for (const cb of this._outputCallbacks) {
+        try { cb(data); } catch {}
       }
     });
 
@@ -150,6 +156,11 @@ export class PtyBackend implements TerminalManager {
 
   stopPipeStream(): void {
     this.pipeFilePath = null;
+  }
+
+  /** Push-based output: register callback for raw terminal data */
+  onOutput(callback: (data: string) => void): void {
+    this._outputCallbacks.push(callback);
   }
 
   destroy(): void {

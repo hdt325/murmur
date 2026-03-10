@@ -5,6 +5,7 @@
  */
 
 import { execSync, execFileSync } from "child_process";
+import { statSync, openSync, readSync, closeSync, writeFileSync, watch as fsWatch } from "fs";
 import type { TerminalManager, TerminalKey, TmuxSessionInfo, TmuxWindowInfo } from "./interface.js";
 
 const DEFAULT_SESSION = "claude-voice";
@@ -123,6 +124,8 @@ export class TmuxBackend implements TerminalManager {
         }
       }, 500);
     }
+    // Restart always-on pipe for new target
+    this.restartPipe();
   }
 
   /** List all tmux sessions and their windows. */
@@ -384,6 +387,78 @@ export class TmuxBackend implements TerminalManager {
     } catch {}
   }
 
+  // ── Push-based output stream ──
+  private _outputCallback: ((data: string) => void) | null = null;
+  private _pipeWatcher: ReturnType<typeof fsWatch> | null = null;
+  private _pipeOffset = 0;
+  private _alwaysPipeFile: string | null = null;
+  private _pipeFallbackTimer: ReturnType<typeof setInterval> | null = null;
+  private _pipeMaxSize = 10 * 1024 * 1024; // 10MB — truncate when exceeded
+
+  /** Register push-based output callback. Starts always-on pipe-pane. */
+  onOutput(callback: (data: string) => void): void {
+    this._outputCallback = callback;
+    this._startAlwaysPipe();
+  }
+
+  private _startAlwaysPipe(): void {
+    const filePath = `/tmp/murmur-pipe-${process.pid}.raw`;
+    this._alwaysPipeFile = filePath;
+    try { writeFileSync(filePath, ""); } catch {}
+    this._pipeOffset = 0;
+
+    // Start tmux pipe-pane to this file
+    this.startPipeStream(filePath);
+
+    // Watch for changes via fs.watch (kqueue on macOS)
+    try {
+      this._pipeWatcher = fsWatch(filePath, () => this._readNewPipeData());
+    } catch (err) {
+      console.warn("[tmux] fs.watch failed, relying on fallback poll:", (err as Error).message);
+    }
+
+    // Fallback poll (250ms) in case fs.watch misses events
+    this._pipeFallbackTimer = setInterval(() => this._readNewPipeData(), 250);
+  }
+
+  /** Stop always-on pipe and clean up watchers */
+  private _stopAlwaysPipe(): void {
+    if (this._pipeWatcher) { this._pipeWatcher.close(); this._pipeWatcher = null; }
+    if (this._pipeFallbackTimer) { clearInterval(this._pipeFallbackTimer); this._pipeFallbackTimer = null; }
+    this.stopPipeStream();
+    this._alwaysPipeFile = null;
+  }
+
+  /** Restart always-on pipe for a new target (e.g. window switch) */
+  restartPipe(): void {
+    if (!this._outputCallback) return;
+    this._stopAlwaysPipe();
+    this._startAlwaysPipe();
+  }
+
+  private _readNewPipeData(): void {
+    if (!this._alwaysPipeFile || !this._outputCallback) return;
+    try {
+      const stat = statSync(this._alwaysPipeFile);
+      if (stat.size <= this._pipeOffset) return;
+      // Truncate if file too large (prevents disk fill from long sessions)
+      if (stat.size > this._pipeMaxSize) {
+        try { writeFileSync(this._alwaysPipeFile, ""); } catch {}
+        this._pipeOffset = 0;
+        return;
+      }
+      const fd = openSync(this._alwaysPipeFile, "r");
+      try {
+        const buf = Buffer.alloc(stat.size - this._pipeOffset);
+        readSync(fd, buf, 0, buf.length, this._pipeOffset);
+        this._pipeOffset = stat.size;
+        this._outputCallback(buf.toString("utf-8"));
+      } finally {
+        closeSync(fd);
+      }
+    } catch {}
+  }
+
   /** Record that text was sent programmatically (via Murmur text box or STT) */
   recordSentInput(text: string): void {
     const normalized = text.trim().toLowerCase().replace(/\s+/g, "");
@@ -401,7 +476,7 @@ export class TmuxBackend implements TerminalManager {
   }
 
   destroy(): void {
-    this.stopPipeStream();
+    this._stopAlwaysPipe();
     // Kill only the targeted window — not the entire session (other windows may be in use)
     try {
       const target = this._window >= 0 ? `${this._session}:${this._window}` : this._session;
