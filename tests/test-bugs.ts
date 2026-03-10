@@ -2308,6 +2308,7 @@ async function main() {
   await testAuditBug_isAgentInfraWordCount();
   await testAuditBug_ptyPathSanitization();
   await testAuditBug_switchTargetRetryCancel();
+  await testAuditBug_destroyKillsWindow();
   await testAuditBug_electronCSP();
   await testAuditBug_scriptProcessorDisconnect();
   await testAuditBug_talkBtnClassList();
@@ -5955,6 +5956,24 @@ async function testAuditBug_switchTargetRetryCancel() {
 
   const nullsAfterClear = fnBody.includes("this._retryTimeout = null");
   report("Sets _retryTimeout to null after clear and inside callback", nullsAfterClear);
+}
+
+async function testAuditBug_destroyKillsWindow() {
+  console.log("\n[AUDIT-TMUX] destroy() kills window, not entire session");
+
+  const src = readFileSync("terminal/tmux-backend.ts", "utf-8");
+
+  const fnStart = src.indexOf("destroy()");
+  const fnBody = src.slice(fnStart, src.indexOf("\n  }", fnStart) + 4);
+
+  const usesKillWindow = fnBody.includes("kill-window");
+  report("destroy() uses kill-window (not kill-session)", usesKillWindow);
+
+  const noKillSession = !fnBody.includes("kill-session");
+  report("destroy() does NOT use kill-session", noKillSession);
+
+  const stopsStream = fnBody.includes("stopPipeStream");
+  report("destroy() stops pipe stream before killing", stopsStream);
 }
 
 async function testAuditBug_electronCSP() {

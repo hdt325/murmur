@@ -401,9 +401,10 @@ export class TmuxBackend implements TerminalManager {
 
   destroy(): void {
     this.stopPipeStream();
-    // Kill the tmux session to prevent leaking
+    // Kill only the targeted window — not the entire session (other windows may be in use)
     try {
-      execFileSync("tmux", ["kill-session", "-t", this._session], {
+      const target = this._window >= 0 ? `${this._session}:${this._window}` : this._session;
+      execFileSync("tmux", ["kill-window", "-t", target], {
         stdio: "ignore",
         timeout: 5000,
       });
