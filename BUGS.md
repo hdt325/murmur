@@ -1405,12 +1405,20 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-123: TTS stall — recurring stuck playing state (3+ occurrences)
 
-**Status**: Partially fixed (stall recovery added, root cause open)
+**Status**: Fixed (layered recovery: per-chunk timeouts + periodic sweep + age-based cleanup)
 **Severity**: Critical
 **Found**: 2026-03-09 (Monitor, 3 confirmed occurrences)
 **Symptom**: TTS job stuck in `state=playing` with `playing=null` and `currentEntryId=null`. Client never sends `tts_done`. Job blocks all queued items. Observed on entries 80, 99, 36 — pattern is consistent. One instance stuck for 394s before recovery.
 **Root cause**: Server sets `job.state=playing` when chunks sent, but client never acknowledges. Generation bumps (new_input) do NOT cancel playing-state jobs. No timeout on playing state.
-**Fix (partial)**: Stall recovery with orphan detection + sweep + timeout added (8/9 tests pass). `playingSince` timestamp field name may differ from test expectation.
+**Fix** (`server.ts`): 4-layer recovery system:
+1. **Per-chunk timeouts** (L1897): 5s safety timeout after all chunks played; 15s timeout while waiting for chunk fetch. Guards: object identity (`ttsCurrentlyPlaying === job`) + chunk index match.
+2. **new_input stuck detection** (L2097-2105): On generation bump with `new_input` reason, force-clears currently-playing job if stuck >10s. Prevents stale playing jobs from blocking new content.
+3. **Periodic sweep** (`sweepStaleTtsJobs`, L1981-2061, every 10s): Catches orphaned playing jobs (in queue but not `ttsCurrentlyPlaying`), stuck fetching jobs (all chunks failed or aged >30s), and currently-playing jobs exceeding `TTS_PLAYING_TIMEOUT_MS` (8s). Broadcasts `tts_stop` with `reason: "stall_recovery"`.
+4. **Age-based cleanup** (L2041-2049): Any non-terminal job older than 30s (and not currently playing) force-failed.
+**Also**: Client disconnect detection (L5983-5988) — last real client leaving flushes TTS queue via `stopClientPlayback2("client_disconnect")`.
+**Race condition review**: All paths are idempotent and run on the single Node.js event loop (no true concurrency). Sweep vs handleTtsDone2, sweep vs drainAudioBuffer, sweep vs chunk fetch — all safe. `playingSince` timestamp + `createdAt` timestamp provide two independent age signals.
+**Cosmetic note**: Sweep-recovered entries keep `spoken=false` (handleTtsDone2 bypassed). Entry shows as "unspoken" in flow mode — arguably correct since audio may not have fully played.
+**Test**: `testTtsStallRecovery` (sweep function exists, playingSince field, TTS_PLAYING_TIMEOUT_MS constant, stall_recovery broadcast, orphan detection in drainAudioBuffer, sweepStaleTtsJobs scheduled via setInterval).
 
 ---
 

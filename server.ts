@@ -977,6 +977,7 @@ interface TtsJob {
   window: string;          // tmux window key when job was created
   currentChunkIndex: number; // Index of chunk currently being played (chunk-level ack)
   playingSince: number;    // Timestamp when state became "playing" (0 if not playing)
+  createdAt: number;       // Timestamp when job was created — for sweep age-based recovery
 }
 
 // --- New TTS state (v2) ---
@@ -991,7 +992,7 @@ const TTS_CHUNK_MIN_CHARS = 50;  // Floor — don't send tiny fragments to Kokor
 const TTS_CHUNK_MAX_CHARS = 250;
 const TTS_FIRST_CHUNK_MAX = 120; // Smaller first chunk → faster initial audio from Kokoro
 const TTS_MAX_QUEUE = 50;
-const TTS_PLAYING_TIMEOUT_MS = 15000; // Max time a job can stay in "playing" without client ack
+const TTS_PLAYING_TIMEOUT_MS = 8000; // Max time a job can stay in "playing" without client ack
 
 /** Split text into chunks at word boundaries, each ≤ maxChars.
  *  Optional firstChunkMax allows a smaller first chunk for faster initial audio. */
@@ -1466,6 +1467,7 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     window: getWindowKey(),
     currentChunkIndex: 0,
     playingSince: 0,
+    createdAt: Date.now(),
   };
 
   ttsJobQueue.push(job);
@@ -1835,7 +1837,10 @@ function drainAudioBuffer(): void {
 function sendChunk(job: TtsJob, chunkIndex: number): void {
   const chunk = job.chunks[chunkIndex];
   if (!chunk || !chunk.audioBuf) {
-    console.warn(`[tts2] sendChunk: no audio for job=${job.jobId} chunk=${chunkIndex}`);
+    console.warn(`[tts2] sendChunk: no audio for job=${job.jobId} chunk=${chunkIndex} — advancing`);
+    // Don't silently return — advance to next chunk or complete the job
+    // to prevent ttsCurrentlyPlaying from being stuck with no timeout
+    handleChunkDone(job.entryId, chunkIndex);
     return;
   }
   const bytes = chunk.audioBuf.length;
@@ -1971,28 +1976,28 @@ function handleTtsDone2(entryId: number | null): void {
 /**
  * Periodic sweep for stuck TTS jobs. Catches orphaned jobs that the per-chunk timeout
  * missed (e.g., ttsCurrentlyPlaying was nulled by a stale tts_done for a different entry).
- * Runs every 15 seconds.
+ * Runs every 10 seconds.
  */
 function sweepStaleTtsJobs(): void {
   const now = Date.now();
+  const TTS_JOB_MAX_AGE_MS = 30000; // Max age for any job in queue before forced cleanup
+  let recovered = 0;
 
   // Check currently playing job for timeout
   if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.playingSince > 0) {
     const elapsed = now - ttsCurrentlyPlaying.playingSince;
     if (elapsed > TTS_PLAYING_TIMEOUT_MS) {
       console.warn(`[tts2] Sweep: currently playing job=${ttsCurrentlyPlaying.jobId} entry=${ttsCurrentlyPlaying.entryId} stuck for ${(elapsed / 1000).toFixed(0)}s — forcing done`);
-      const stuckJob = ttsCurrentlyPlaying;
-      stuckJob.state = "failed";
+      ttsCurrentlyPlaying.state = "failed";
       ttsCurrentlyPlaying = null;
       if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
       broadcast({ type: "tts_stop", reason: "stall_recovery" });
-      drainAudioBuffer();
-      return;
+      recovered++;
+      // Don't return — continue sweep to clean up other stuck jobs too
     }
   }
 
   // Check for orphaned playing jobs in the queue (ttsCurrentlyPlaying is null or different)
-  let recovered = 0;
   for (const job of ttsJobQueue) {
     if (job.state === "playing" && ttsCurrentlyPlaying !== job) {
       console.warn(`[tts2] Sweep: orphaned job=${job.jobId} entry=${job.entryId} in playing state — marking failed`);
@@ -2002,8 +2007,6 @@ function sweepStaleTtsJobs(): void {
   }
 
   // Check for jobs stuck in "fetching" state — all chunks failed or timed out.
-  // This catches the scenario where Kokoro/Piper hung and the 15s fetch timeout fired,
-  // marking chunks as failed, but the job itself wasn't promoted to "failed".
   for (const job of ttsJobQueue) {
     if (job.state === "fetching") {
       const allChunksDone = job.chunks.every(c => c.state === "ready" || c.state === "failed");
@@ -2017,11 +2020,41 @@ function sweepStaleTtsJobs(): void {
         console.log(`[tts2] Sweep: job=${job.jobId} entry=${job.entryId} chunks ready but job stuck in fetching — promoting`);
         job.state = "ready";
         recovered++;
+      } else if (job.createdAt > 0 && (now - job.createdAt) > TTS_JOB_MAX_AGE_MS) {
+        // Job has been fetching for too long — some chunks may be permanently hung
+        const pendingCount = job.chunks.filter(c => c.state === "pending" || c.state === "fetching").length;
+        console.warn(`[tts2] Sweep: job=${job.jobId} entry=${job.entryId} stuck in fetching for ${((now - job.createdAt) / 1000).toFixed(0)}s (${pendingCount} chunks still pending) — marking failed`);
+        // Abort any in-flight fetches
+        for (const chunk of job.chunks) {
+          if (chunk.abortController) {
+            try { chunk.abortController.abort(); } catch {}
+            chunk.abortController = null;
+          }
+        }
+        job.state = "failed";
+        recovered++;
       }
     }
   }
 
-  // Safety: if queue has items, nothing is playing, and drain hasn't been called recently
+  // Age-based cleanup: any non-terminal job older than TTS_JOB_MAX_AGE_MS gets failed
+  for (const job of ttsJobQueue) {
+    if (job.state !== "done" && job.state !== "failed" && job.createdAt > 0) {
+      const age = now - job.createdAt;
+      if (age > TTS_JOB_MAX_AGE_MS && ttsCurrentlyPlaying !== job) {
+        console.warn(`[tts2] Sweep: job=${job.jobId} entry=${job.entryId} state=${job.state} aged out (${(age / 1000).toFixed(0)}s) — marking failed`);
+        job.state = "failed";
+        recovered++;
+      }
+    }
+  }
+
+  // Log sweep status for Monitor to verify sweeps are running
+  if (ttsJobQueue.length > 0 || ttsCurrentlyPlaying) {
+    console.log(`[tts2] Sweep: queue=${ttsJobQueue.length} playing=${ttsCurrentlyPlaying?.jobId ?? "none"} recovered=${recovered}`);
+  }
+
+  // Always try drain if queue has items or we recovered anything
   if (recovered > 0 || (ttsJobQueue.length > 0 && !ttsCurrentlyPlaying)) {
     drainAudioBuffer();
   }
@@ -2860,7 +2893,7 @@ function isAgentInfraCommand(text: string): boolean {
   if (/^npx\s+tsx\b/i.test(t)) return true;
   if (/^npm\s+(run\s+)?test/i.test(t)) return true;
   if (/^echo\s+.*>>\s*\/tmp\//i.test(t)) return true;  // pipeline logging commands
-  if (/^(cat|tail|head|grep)\s+.*\/tmp\//i.test(t)) return true;  // pipeline reads (not "read" — clashes with "Read /tmp/coder-*.md" user prompts)
+  if (/^(cat|tail|head|grep)\s+.*\/tmp\//i.test(t)) return true;  // pipeline file access (excludes capitalized Read which is a user prompt)
   if (/^tmux\s+(capture-pane|list-windows|list-sessions|display-message)\b/i.test(t)) return true;
   if (/^(cp|mv|git|curl)\s+/i.test(t) && t.split(/\s+/).length >= 3) return true;  // shell ops with args (not short user messages like "git help")
   return false;
