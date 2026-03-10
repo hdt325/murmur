@@ -3022,42 +3022,23 @@ async function testStatusLineFilter() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Triplicate user entry: passive watcher re-detection guard
-// ──────────────────────────────────────────────────────────────
+// Triplicate user entry guard — replaced by push architecture's central dedup
+// Old passive watcher ring buffer (_recentPassiveInputs) removed.
+// Push architecture uses isDuplicateEntry + wasRecentlySent instead.
 async function testTriplicateUserEntry_passiveGuard() {
-  console.log("\n[TRIPLICATE] Passive watcher user input re-detection guard");
+  console.log("\n[TRIPLICATE] Push architecture dedup guards (replaces passive watcher ring buffer)");
 
   const src = readFileSync("server.ts", "utf-8");
 
-  // Passive watcher tracks recent inputs via ring buffer
-  const hasTracking = /_recentPassiveInputs/.test(src);
-  report("Passive watcher tracks recent inputs via ring buffer", hasTracking);
+  // Push handler uses wasRecentlySent to skip programmatically-sent input
+  report("Push handler checks wasRecentlySent", src.includes("terminal.wasRecentlySent?.(userInput)"));
 
-  // Ring buffer entries have timestamp for pruning
-  const hasTs = src.includes("_recentPassiveInputs") && src.includes("ts: Date.now()");
-  report("Passive input ring buffer has timestamp tracking", hasTs);
-
-  // Guard exists in passive watcher section (between "Spinner detected" and "Start streaming")
-  const passiveSection = src.slice(
-    src.indexOf("Spinner detected — native CLI input"),
-    src.indexOf("Start streaming just like a Murmur-initiated input")
-  );
-  const hasGuard = passiveSection.includes("_recentPassiveInputs") &&
-    passiveSection.includes("Skipping already-processed input");
-  report("Passive watcher has re-detection guard before streaming", hasGuard);
-
-  // Guard uses space-stripped normalization (handles tmux wrap differences)
-  const hasNorm = /normalizedPassive.*replace.*\\s\+/s.test(src) ||
-    /userInput.*trim\(\).*toLowerCase\(\).*replace\(\/\\s\+\/g/s.test(src);
-  report("Guard uses space-stripped normalization", hasNorm);
-
-  // Guard uses time-based pruning (60s window)
-  const hasWindow = /60000/.test(passiveSection);
-  report("Guard has 60-second time window", hasWindow);
+  // Central dedup in isDuplicateEntry catches duplicate user entries
+  report("isDuplicateEntry guards user entries", src.includes("isDuplicateEntry(entry)") && src.includes('rejectedRole: "user"'));
 
   // addUserEntry still has its own dedup as defense-in-depth
-  const hasDedup = /DEDUP-TRACE.*DEDUP HIT/.test(src);
-  report("addUserEntry retains dedup as defense-in-depth", hasDedup);
+  const hasDedup = /DEDUP-TRACE/.test(src);
+  report("addUserEntry retains dedup trace logging", hasDedup);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -4225,14 +4206,14 @@ async function testInputSourceTagging() {
   const hasWasRecentlyMethod = tmuxSrc.includes("wasRecentlySent(text: string)");
   report("TmuxBackend implements wasRecentlySent", hasWasRecentlyMethod);
 
-  // 13. Multi-line extraction stops at spinner chars ✻ and ⏺
-  const passiveWatcherCode = src.slice(src.indexOf("Spinner detected — native CLI input"), src.indexOf("Spinner detected — native CLI input") + 2000);
-  const stopsAtSpinner = passiveWatcherCode.includes("✻") && passiveWatcherCode.includes("⏺");
-  report("Multi-line extraction stops at Claude output markers (✻, ⏺)", stopsAtSpinner);
+  // 13. Push handler input extraction stops at spinner chars
+  const pushInputCode = src.slice(src.indexOf("Spinner detected — native CLI input"), src.indexOf("Spinner detected — native CLI input") + 2000);
+  const stopsAtSpinner = pushInputCode.includes("✻") && pushInputCode.includes("⏺");
+  report("Push handler extraction stops at Claude output markers (✻, ⏺)", stopsAtSpinner);
 
-  // 14. Multi-line extraction stops at CLI status lines
-  const stopsAtStatus = passiveWatcherCode.includes("Press (up|down|esc|enter|tab)");
-  report("Multi-line extraction stops at CLI status lines", stopsAtStatus);
+  // 14. Push handler extraction stops at CLI status lines
+  const stopsAtStatus = pushInputCode.includes("Press (up|down|esc|enter|tab)");
+  report("Push handler extraction stops at CLI status lines", stopsAtStatus);
 }
 
 // --- Per-window conversation isolation ---
@@ -4324,26 +4305,21 @@ async function testPerWindowConversationIsolation() {
   });
   report("Live: test entries tagged with window field (needs restart)", entryCheck === "has_window" || (src.includes("entry.window =") && src.includes("getWindowKey()")));
 
-  // 14. Window switch resets passive watcher state (root cause of single-window bug)
-  const switchResetsSnapshot = src.includes('lastPassiveSnapshot = ""') || src.includes("lastPassiveSnapshot = captureTmuxPane()");
-  report("Window switch resets lastPassiveSnapshot for new pane", switchResetsSnapshot);
-
-  // 15. Window switch resets scrollback cache
+  // 14. Window switch resets scrollback cache (push architecture — no passive snapshot)
   const switchResetsCache = src.includes('_scrollbackCache = { text: "", ts: 0 }');
   report("Window switch resets _scrollbackCache", switchResetsCache);
 
-  // 16. Window switch resets stream state to IDLE
+  // 15. Window switch resets stream state to IDLE
   const switchResetsStream = src.includes('streamState = "IDLE"');
   report("Window switch resets streamState to IDLE", switchResetsStream);
 
-  // 17. Window switch initializes new pane snapshot (via _activateWindowCore)
+  // 16. Window switch resets preInputSnapshot (via _activateWindowCore)
   const activateSnap = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
-  const switchInitSnapshot = activateSnap.includes("lastPassiveSnapshot = captureTmuxPane");
-  report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
-
-  // 18. Window switch resets preInputSnapshot (via _activateWindowCore)
   const switchResetsPreInput = activateSnap.includes('preInputSnapshot = ""') || activateSnap.includes("preInputSnapshot = ");
   report("Window switch resets preInputSnapshot", switchResetsPreInput);
+
+  // 17. Window switch logged for Monitor dashboard
+  report("Window switch logs to _windowLog", src.includes("_windowLog.push"));
 
   // 19. _pinCurrentPane targets session:window, not just session (root cause of all-entries-in-one-window)
   const tmuxSrc = readFileSync("terminal/tmux-backend.ts", "utf-8");
@@ -4449,33 +4425,20 @@ async function testNonVoiceSessionTtsSuppression() {
   report("WINDOW-TTS-GUARD diagnostic log message present", hasLogMsg);
 }
 
-// --- Paste input detection via snapshot diff ---
+// --- Input extraction in push architecture ---
 async function testPasteInputDetection() {
-  console.log("\n[PASTE-DETECT] Dual input extraction: prompt parsing + snapshot diff");
+  console.log("\n[INPUT-EXTRACT] Push handler input extraction (replaced snapshot diff)");
   const src = readFileSync("server.ts", "utf-8");
 
-  // 1. Both extraction methods exist
-  const hasPromptMethod = src.includes("Method 1: Prompt line parsing");
-  const hasDiffMethod = src.includes("Method 2: Snapshot diff");
-  report("Dual extraction: prompt parsing + snapshot diff", hasPromptMethod && hasDiffMethod);
+  // Push architecture: prompt-line parsing in handleNativeInputDetected
+  const pushSection = src.slice(src.indexOf("Spinner detected — native CLI input"), src.indexOf("Spinner detected — native CLI input") + 2000);
+  report("Push handler extracts input from prompt line", pushSection.includes("❯ ") && pushSection.includes("userInput"));
 
-  // 2. Diff method compares lastPassiveSnapshot with current pane
-  const hasDiffComparison = src.includes("lastPassiveSnapshot.split") && src.includes("divergeIdx");
-  report("Diff method compares saved snapshot with current pane", hasDiffComparison);
+  // Filters spinner/chrome from multi-line input
+  report("Filters spinner chars from input lines", pushSection.includes("⠋⠙⠹⠸"));
 
-  // 3. Diff filters out spinner/chrome lines
-  const spinnerStart = src.indexOf("Method 2: Snapshot diff");
-  const spinnerSection = src.slice(spinnerStart, spinnerStart + 1000);
-  const diffFiltersSpinner = spinnerSection.includes("⠋⠙⠹⠸") && spinnerSection.includes("newParts");
-  report("Diff method filters spinner and chrome lines", diffFiltersSpinner);
-
-  // 4. Uses the longer result (diff catches paste that prompt parsing misses)
-  const usesLonger = src.includes("diffInput.length > userInput.length");
-  report("Uses longer result (diff wins for pasted text)", usesLonger);
-
-  // 5. Log message for paste detection
-  const hasPasteLog = src.includes("paste detected");
-  report("Diagnostic log when diff input is used (paste detected)", hasPasteLog);
+  // Uses wasRecentlySent to avoid double-counting programmatic sends
+  report("Checks wasRecentlySent for programmatic input", pushSection.includes("wasRecentlySent"));
 }
 
 // --- Status scoping on window switch ---
@@ -4492,11 +4455,11 @@ async function testStatusScopingOnWindowSwitch() {
   const checksUnset = src.includes('currentWindowKey !== "_unset"');
   report("isWindowActive() gates on _unset sentinel", hasHelper && checksUnset);
 
-  // 3. Passive watcher is gated on isWindowActive
+  // 3. Push handler registers pipe output callback (replaces passive watcher)
   const passiveStart = src.indexOf("function startPassiveWatcher");
   const passiveFn = src.slice(passiveStart, passiveStart + 300);
-  const passiveGated = passiveFn.includes("isWindowActive()");
-  report("Passive watcher gates on isWindowActive()", passiveGated);
+  const hasPushCallback = passiveFn.includes("terminal.onOutput") && passiveFn.includes("handlePipeOutput");
+  report("startPassiveWatcher registers push pipe callback", hasPushCallback);
 
   // 4. Terminal broadcaster is gated on isWindowActive
   const termBroadcast = src.indexOf("Broadcast tmux pane content with ANSI");
@@ -4565,33 +4528,21 @@ async function testTtsQueueStallRecovery() {
   report("Sweep safety-drains when queue non-empty + nothing playing", safetyDrain);
 }
 
-// --- Paste input detection via pending prompt capture ---
+// --- Push architecture replaces pending prompt capture ---
 async function testBug_pasteInputDetection() {
-  console.log("\n[PASTE-DETECT] Paste detection via pending prompt input capture");
+  console.log("\n[PUSH-INPUT] Push architecture input detection (replaced pending prompt capture)");
   const src = readFileSync("server.ts", "utf-8");
 
-  // 1. Pending input state variables exist
-  const hasPendingVars = src.includes("let _pendingPromptInput") && src.includes("let _pendingPromptInputTs");
-  report("Pending prompt input state variables declared", hasPendingVars);
+  // Push handler detects native input via spinner in handlePipeOutput
+  report("handlePipeOutput detects spinner for native input", src.includes("scheduleIdleActivityCheck"));
 
-  // 2. Idle path captures prompt content when user is mid-type/paste
-  const idleSection = src.slice(src.indexOf("Prompt has content — user is mid-type") - 50, src.indexOf("Prompt has content — user is mid-type") + 1200);
-  const capturesPending = idleSection.includes("_pendingPromptInput") && idleSection.includes("_pendingPromptInputTs = Date.now()");
-  report("Idle path captures pending input from prompt line", capturesPending);
+  // handleNativeInputDetected extracts input from pane
+  report("handleNativeInputDetected function exists", src.includes("function handleNativeInputDetected"));
 
-  // 3. Spinner handler uses pending input as third extraction method
-  const spinnerSection = src.slice(src.indexOf("Method 3: Pending input"), src.indexOf("Method 3: Pending input") + 1500);
-  const usesPending = spinnerSection.includes("pendingInput.length > userInput.length") && spinnerSection.includes("paste detected");
-  report("Spinner handler uses pending input for paste detection", usesPending);
-
-  // 4. Pending input cleared on window activation (in _activateWindowCore)
-  const activateSection = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
-  const clearedOnActivate = activateSection.includes("_pendingPromptInput = \"\"");
-  report("Pending input cleared on window activation", clearedOnActivate);
-
-  // 5. Pending input consumed after use (prevents stale reuse)
-  const consumeIdx = src.indexOf('_pendingPromptInput = ""; // Consume');
-  report("Pending input consumed after extraction (no stale reuse)", consumeIdx > 0);
+  // Push handler filters tool output and agent commands
+  const pushSection = src.slice(src.indexOf("Spinner detected — native CLI input"), src.indexOf("Spinner detected — native CLI input") + 1500);
+  report("Filters agent infrastructure commands", pushSection.includes("isAgentInfraCommand"));
+  report("Filters tool output lines", pushSection.includes("isToolOutputLine"));
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -5546,7 +5497,7 @@ async function testDebugStateEndpoint() {
   report("state has pinnedPaneId", "pinnedPaneId" in state);
   report("state has streamState", "streamState" in state);
   report("state has isWindowActive", "isWindowActive" in state);
-  report("state has passiveWatcherRunning", "passiveWatcherRunning" in state);
+  report("state has pushArchitecture", "pushArchitecture" in state);
   report("state has conversationEntryCount", "conversationEntryCount" in state);
   report("state has windowEntriesKeys", "windowEntriesKeys" in state);
   report("state has cooldown", "cooldown" in state);
@@ -6435,22 +6386,15 @@ async function testEntryQuality_assistantDedup() {
   report("Assistant dedup uses normalized text comparison", hasNormCompare);
 }
 
-// --- Entry quality: passive input dedup ring buffer ---
+// --- Entry quality: push architecture dedup (replaces passive input ring buffer) ---
 async function testEntryQuality_passiveInputDedup() {
-  console.log("\n[ENTRY-QUALITY] Passive watcher uses ring buffer for input dedup (not single var)");
+  console.log("\n[ENTRY-QUALITY] Push architecture dedup (replaces passive watcher ring buffer)");
   const src = readFileSync("server.ts", "utf-8");
 
-  const hasRingBuffer = src.includes("_recentPassiveInputs");
-  report("Passive watcher uses _recentPassiveInputs ring buffer", hasRingBuffer);
-
-  // Ring buffer is pruned by time and capped
-  const passiveStart = src.indexOf("_recentPassiveInputs.some");
-  const passiveSection = src.slice(passiveStart - 300, passiveStart + 500);
-  const hasPrune = passiveSection.includes(".filter(e => e.ts >=");
-  report("Ring buffer prunes entries older than cutoff", hasPrune);
-
-  const hasCap = passiveSection.includes("_recentPassiveInputs.shift()");
-  report("Ring buffer caps at max entries", hasCap);
+  // _recentPassiveInputs removed — isDuplicateEntry handles all dedup centrally
+  report("No _recentPassiveInputs (removed with polling)", !src.includes("_recentPassiveInputs"));
+  report("isDuplicateEntry handles central dedup", src.includes("function isDuplicateEntry"));
+  report("Dedup rejections logged to _dedupLog", src.includes("_dedupLog.push"));
 }
 
 // --- Entry quality: TTS sweep calls drain ---
@@ -6566,19 +6510,14 @@ async function testBug049_electronBackgroundUpdate() {
   report("Background update has error handler", hasCatch);
 }
 
-// --- BUG-043: Passive poll configurable ---
+// --- BUG-043: Push architecture replaces passive polling ---
 async function testBug043_passivePollConfigurable() {
-  console.log("\n[BUG-043] Passive watcher polling interval configurable");
+  console.log("\n[BUG-043] Push architecture replaces passive polling (no configurable interval needed)");
   const src = readFileSync("server.ts", "utf-8");
 
-  const hasConstant = src.includes("PASSIVE_POLL_MS");
-  report("PASSIVE_POLL_MS constant defined", hasConstant);
-
-  const hasEnvVar = src.includes("MURMUR_PASSIVE_POLL_MS");
-  report("Interval configurable via MURMUR_PASSIVE_POLL_MS env var", hasEnvVar);
-
-  const usesConstant = src.includes("}, PASSIVE_POLL_MS)");
-  report("setInterval uses PASSIVE_POLL_MS constant", usesConstant);
+  report("No PASSIVE_POLL_MS (push replaces polling)", !src.includes("PASSIVE_POLL_MS"));
+  report("Uses PARSE_DEBOUNCE_MS for push debounce", src.includes("PARSE_DEBOUNCE_MS"));
+  report("Uses handlePipeOutput for event-driven processing", src.includes("function handlePipeOutput"));
 }
 
 // --- BUG-048: Recording state sync ---
@@ -6893,28 +6832,16 @@ async function testBugU4_testEntryIsolation() {
 }
 
 async function testBugU5_staleSnapshotTTL() {
-  console.log("\n[Bug U5] Stale passive snapshot TTL guard");
+  console.log("\n[Bug U5] Push architecture eliminates stale snapshot issue");
   const src = readFileSync("server.ts", "utf-8");
 
-  // lastPassiveSnapshot should have a timestamp tracker
-  report("_lastPassiveSnapshotTs declared", src.includes("_lastPassiveSnapshotTs"));
+  // Push architecture: no passive snapshots, no TTL needed
+  report("No _lastPassiveSnapshotTs (removed with polling)", !src.includes("_lastPassiveSnapshotTs"));
+  report("No PASSIVE_SNAPSHOT_TTL_MS (removed with polling)", !src.includes("PASSIVE_SNAPSHOT_TTL_MS"));
+  report("No lastPassiveSnapshot (removed with polling)", !src.includes("let lastPassiveSnapshot"));
 
-  // TTL constant should exist (5 minutes)
-  report("PASSIVE_SNAPSHOT_TTL_MS defined", src.includes("PASSIVE_SNAPSHOT_TTL_MS"));
-  const ttlMatch = src.match(/PASSIVE_SNAPSHOT_TTL_MS\s*=\s*(\d+)/);
-  const ttlMs = ttlMatch ? parseInt(ttlMatch[1]) : 0;
-  report("TTL is 5 minutes (300000ms)", ttlMs === 300000 || src.includes("5 * 60 * 1000"));
-
-  // Snapshot usage should check TTL before using
-  const passiveSection = src.slice(src.indexOf("Take pre-snapshot from saved state"));
-  report("Checks snapshot age before using", passiveSection.slice(0, 500).includes("PASSIVE_SNAPSHOT_TTL_MS"));
-
-  // Snapshot diff (Method 2) should also check TTL
-  report("Snapshot diff checks TTL", src.includes("Bug U5: Skip snapshot diff if snapshot is stale"));
-
-  // Timestamp updated when snapshot is saved
-  const snapshotSave = src.slice(src.indexOf("lastPassiveSnapshot = pane;"));
-  report("Timestamp updated on snapshot save", snapshotSave.slice(0, 200).includes("_lastPassiveSnapshotTs = Date.now()"));
+  // Push handler uses real-time pipe output instead of stale snapshots
+  report("Push handler uses real-time pipe data", src.includes("handlePipeOutput") && src.includes("_pipeInputLog"));
 }
 
 async function testBugU6_scrollJackingPrevention() {
@@ -7035,20 +6962,17 @@ async function testPushArchitecture() {
 // --- Round 22: Parser double-fire, filler clobber, stale dedup ---
 
 async function testParserDoubleFire() {
-  console.log("\n[Parser Double-Fire] broadcastCurrentOutput dedup guard");
+  console.log("\n[Parser Double-Fire] Push architecture eliminates double-fire via single debounced path");
   const src = readFileSync("server.ts", "utf-8");
 
-  // _lastBroadcastHash and _lastBroadcastTs should exist
-  report("_lastBroadcastHash declared", src.includes("_lastBroadcastHash"));
-  report("_lastBroadcastTs declared", src.includes("_lastBroadcastTs"));
+  // Push architecture: single debounced path eliminates double-fire at root cause
+  report("No _lastBroadcastHash (dedup guard removed — single path)", !src.includes("_lastBroadcastHash"));
+  report("No BROADCAST_DEDUP_MS (dedup guard removed — single path)", !src.includes("BROADCAST_DEDUP_MS"));
 
-  // BROADCAST_DEDUP_MS constant
-  report("BROADCAST_DEDUP_MS defined", src.includes("BROADCAST_DEDUP_MS"));
-
-  // broadcastCurrentOutput should check the hash before proceeding
-  const bcoFn = src.slice(src.indexOf("function broadcastCurrentOutput()"), src.indexOf("function broadcastCurrentOutput()") + 800);
-  report("Checks paneHash === _lastBroadcastHash", bcoFn.includes("paneHash === _lastBroadcastHash"));
-  report("Returns early on duplicate pane content", bcoFn.includes("return;") && bcoFn.includes("_lastBroadcastTs"));
+  // Single parse path: handlePipeOutput → schedulePaneCheck → performPaneCheck → broadcastCurrentOutput
+  report("schedulePaneCheck debounces with PARSE_DEBOUNCE_MS", src.includes("PARSE_DEBOUNCE_MS") && src.includes("schedulePaneCheck"));
+  report("performPaneCheck is the single entry to broadcastCurrentOutput",
+    src.includes("function performPaneCheck") && src.includes("broadcastCurrentOutput()"));
 }
 
 async function testFillerClobberGuard() {

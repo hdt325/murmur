@@ -6293,6 +6293,47 @@ app.get("/debug/render-log", (_req, res) => {
 
 // ── Cross-reference endpoints for Monitor ──
 
+/** /debug/trace/recent?count=N — bulk lifecycle traces for last N entries
+ *  MUST be registered BEFORE /debug/trace/:entryId (Express matches :entryId wildcard first) */
+app.get("/debug/trace/recent", (req, res) => {
+  const count = Math.min(safeInt(req.query.count as string, 20), 50);
+  const recentEntries = conversationEntries.slice(-count);
+  const traces = recentEntries.map(entry => {
+    const entryId = entry.id;
+    const mutations = _entryMutationLog.filter(m => m.entryId === entryId);
+    const dedupChecks = _dedupLog.filter(d => d.matchedEntryId === entryId);
+    const ttsEntries = _ttsHistory.filter(t => t.entryId === entryId);
+    const ttsFetches = _ttsFetchLog.filter(t => t.entryId === entryId);
+    const highlights = _highlightLog.filter(h => h.entryId === entryId);
+    const queueEvents = _queueHistory.filter(q => q.entryId === entryId);
+    const renders = _renderLog.filter(r => r.entryId === entryId);
+    const creation = _entryLog.find(e => e.id === entryId);
+
+    const anomalies: string[] = [];
+    if (entry.speakable && !entry.spoken && ttsEntries.length === 0) anomalies.push("no TTS");
+    if (mutations.filter(m => m.field === "text").length > 3) anomalies.push("excessive text mutations");
+
+    return {
+      entryId,
+      role: entry.role,
+      text: entry.text.slice(0, 120),
+      speakable: entry.speakable,
+      spoken: entry.spoken,
+      ts: entry.ts,
+      creation_ts: creation?.ts ?? null,
+      mutation_count: mutations.length,
+      tts_count: ttsEntries.length,
+      fetch_count: ttsFetches.length,
+      highlight_count: highlights.length,
+      render_count: renders.length,
+      dedup_matches: dedupChecks.length,
+      queue_events: queueEvents.length,
+      anomalies,
+    };
+  });
+  res.json({ count: traces.length, requested: count, traces });
+});
+
 /** /debug/trace/:entryId — full lifecycle trace across ALL ring buffers */
 app.get("/debug/trace/:entryId", (req, res) => {
   const entryId = parseInt(req.params.entryId, 10);
@@ -6429,45 +6470,6 @@ app.get("/debug/health", (_req, res) => {
   });
 });
 
-/** /debug/trace/recent?count=N — bulk lifecycle traces for last N entries */
-app.get("/debug/trace/recent", (req, res) => {
-  const count = Math.min(safeInt(req.query.count as string, 20), 50);
-  const recentEntries = conversationEntries.slice(-count);
-  const traces = recentEntries.map(entry => {
-    const entryId = entry.id;
-    const mutations = _entryMutationLog.filter(m => m.entryId === entryId);
-    const dedupChecks = _dedupLog.filter(d => d.matchedEntryId === entryId);
-    const ttsEntries = _ttsHistory.filter(t => t.entryId === entryId);
-    const ttsFetches = _ttsFetchLog.filter(t => t.entryId === entryId);
-    const highlights = _highlightLog.filter(h => h.entryId === entryId);
-    const queueEvents = _queueHistory.filter(q => q.entryId === entryId);
-    const renders = _renderLog.filter(r => r.entryId === entryId);
-    const creation = _entryLog.find(e => e.id === entryId);
-
-    const anomalies: string[] = [];
-    if (entry.speakable && !entry.spoken && ttsEntries.length === 0) anomalies.push("no TTS");
-    if (mutations.filter(m => m.field === "text").length > 3) anomalies.push("excessive text mutations");
-
-    return {
-      entryId,
-      role: entry.role,
-      text: entry.text.slice(0, 120),
-      speakable: entry.speakable,
-      spoken: entry.spoken,
-      ts: entry.ts,
-      creation_ts: creation?.ts ?? null,
-      mutation_count: mutations.length,
-      tts_count: ttsEntries.length,
-      fetch_count: ttsFetches.length,
-      highlight_count: highlights.length,
-      render_count: renders.length,
-      dedup_matches: dedupChecks.length,
-      queue_events: queueEvents.length,
-      anomalies,
-    };
-  });
-  res.json({ count: traces.length, requested: count, traces });
-});
 
 // Diagnostic: test loadScrollbackEntries against a specific target without modifying state
 // Usage: /debug/scrollback-parse?target=murmur:3
