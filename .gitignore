@@ -18,3 +18,6 @@ build/
 .env.*.local
 *.swp
 .cache/
+window-entries.json
+window-switch-verify.mjs
+tests/screenshots-tts-bug/

@@ -183,6 +183,10 @@
 **Priority**: Low
 **Notes**: Requires native WatchOS app (Swift), not possible via web
 
+### #42 — Consolidate agent worktrees under project folder
+**Priority**: Medium
+**Notes**: Move `murmur-agent1` through `murmur-agent8` from `~/Desktop/Programming/` into `murmur/agents/`. Must use `git worktree remove` + `git worktree add` (not raw mv). Update agent charters (CLAUDE.md paths), coordinator memory, and tmux respawn commands.
+
 ## Reviewer Audit — Open Findings
 
 - **BUG-107**: Recursive `_sendTtsDone` stack overflow in index.html (Critical)
