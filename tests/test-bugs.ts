@@ -2335,6 +2335,14 @@ async function main() {
   await testEntryQuality_passiveInputDedup();
   await testEntryQuality_ttsSweepDrain();
 
+  // Round 16: Bug batch 3 — CORS, persistence, AudioContext, debug cap, pre-buffer, Electron
+  await testBug056_corsRestriction();
+  await testBug055_entryPersistence();
+  await testBug054_audioContextGuard();
+  await testBug057_debugMessageCap();
+  await testBug060_preBufferCleanup();
+  await testBug049_electronBackgroundUpdate();
+
   await teardown();
 }
 
@@ -6427,6 +6435,96 @@ async function testEntryQuality_ttsSweepDrain() {
   // Sweep interval registered
   const hasInterval = src.includes("setInterval(sweepStaleTtsJobs");
   report("Sweep runs on setInterval", hasInterval);
+}
+
+// --- BUG-056: CORS restriction ---
+async function testBug056_corsRestriction() {
+  console.log("\n[BUG-056] CORS restriction to localhost origins only");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const hasCorsMiddleware = src.includes("Access-Control-Allow-Origin") && src.includes("localhost");
+  report("CORS middleware sets Access-Control-Allow-Origin for localhost", hasCorsMiddleware);
+
+  const hasMethodsHeader = src.includes("Access-Control-Allow-Methods");
+  report("CORS sets Allow-Methods header", hasMethodsHeader);
+
+  const hasOptionsHandler = src.includes("OPTIONS") && src.includes("204");
+  report("OPTIONS preflight returns 204", hasOptionsHandler);
+
+  const hasOriginCheck = src.includes("_req.headers.origin") || src.includes("req.headers.origin");
+  report("CORS validates origin header before setting", hasOriginCheck);
+}
+
+// --- BUG-055: Entry persistence ---
+async function testBug055_entryPersistence() {
+  console.log("\n[BUG-055] Conversation entries persisted to disk");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const hasPersistFn = src.includes("function persistWindowEntries");
+  report("persistWindowEntries function exists", hasPersistFn);
+
+  const hasLoadOnStartup = src.includes("WINDOW_ENTRIES_FILE") && src.includes("readFileSync");
+  report("Entries loaded from disk on startup", hasLoadOnStartup);
+
+  const hasAtomicWrite = src.includes(".tmp") && src.includes("renameSync");
+  report("Uses atomic write (tmp + rename)", hasAtomicWrite);
+
+  const hasDebounce = src.includes("_persistTimer") && src.includes("clearTimeout(_persistTimer)");
+  report("Persistence is debounced to avoid thrashing", hasDebounce);
+}
+
+// --- BUG-054: AudioContext guard ---
+async function testBug054_audioContextGuard() {
+  console.log("\n[BUG-054] AudioContext duplicate guard");
+  const src = readFileSync("index.html", "utf-8");
+
+  const hasMicGuard = src.includes("if (micStream) return");
+  report("initMicMeter guards against duplicate mic init", hasMicGuard);
+
+  const hasCtxGuard = src.includes("if (!ttsAudioCtx)") || src.includes('ttsAudioCtx.state === "closed"');
+  report("AudioContext creation guarded against duplicates", hasCtxGuard);
+
+  const hasClosedCheck = src.includes('ttsAudioCtx.state === "closed"');
+  report("Closed AudioContext cleared before reuse", hasClosedCheck);
+}
+
+// --- BUG-057: Debug message cap ---
+async function testBug057_debugMessageCap() {
+  console.log("\n[BUG-057] Debug panel messages capped");
+  const src = readFileSync("index.html", "utf-8");
+
+  const hasWsLogCap = src.includes("_wsLog.length > 200") && src.includes("_wsLog.shift()");
+  report("WS log capped at 200 entries with shift", hasWsLogCap);
+
+  const debugSrc = readFileSync("public/js/debug.js", "utf-8");
+  const hasServerLogCap = debugSrc.includes("_serverLogEntries.length > 500") && debugSrc.includes("_serverLogEntries.shift()");
+  report("Server log entries capped at 500", hasServerLogCap);
+}
+
+// --- BUG-060: Pre-buffer cleanup ---
+async function testBug060_preBufferCleanup() {
+  console.log("\n[BUG-060] Pre-buffer blob cleared after use");
+  const src = readFileSync("index.html", "utf-8");
+
+  const hasCleanup = src.includes("preBufferBlob = null") && src.includes("BUG-060");
+  report("Pre-buffer blob nulled after send to prevent stale reuse", hasCleanup);
+
+  const hasDiscardGuard = src.includes("_discardRecording") && src.includes("return;");
+  report("Discard flag prevents pre-buffer send when recording discarded", hasDiscardGuard);
+}
+
+// --- BUG-049: Electron background content update ---
+async function testBug049_electronBackgroundUpdate() {
+  console.log("\n[BUG-049] Electron content update runs in background");
+  const src = readFileSync("electron/main.js", "utf-8");
+
+  // Should NOT await contentUpdateCheck in startup flow
+  const startupSection = src.slice(src.indexOf("isPackaged"), src.indexOf("ensureServer"));
+  const noAwait = !startupSection.includes("await contentUpdateCheck");
+  report("contentUpdateCheck is NOT awaited during startup", noAwait);
+
+  const hasCatch = src.includes("contentUpdateCheck(murmurDir).catch");
+  report("Background update has error handler", hasCatch);
 }
 
 main().catch(err => {

@@ -404,6 +404,19 @@ const VM_EVENTS_DIR = join(VM_LOGS, "events");
 const VM_EXCHANGES_DIR = join(VM_LOGS, "conversations");
 
 const app = express();
+
+// BUG-056: Restrict CORS to localhost origins only
+app.use((_req, res, next) => {
+  const origin = _req.headers.origin;
+  if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  }
+  if (_req.method === "OPTIONS") { res.status(204).end(); return; }
+  next();
+});
+
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 

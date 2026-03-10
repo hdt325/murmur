@@ -4127,6 +4127,8 @@
         console.log("[mic] Mic access granted");
         micStream = stream;
         // Reuse pre-unlocked AudioContext if available (iOS: unlocked on first gesture)
+        // BUG-054: Guard — close stale context before creating new (prevents duplicate AudioContexts)
+        if (ttsAudioCtx && ttsAudioCtx.state === "closed") ttsAudioCtx = null;
         const audioCtx = ttsAudioCtx || new AudioContext();
         ttsAudioCtx = audioCtx; // Share for TTS playback
         const source = audioCtx.createMediaStreamSource(stream);
@@ -6516,6 +6518,7 @@
           } else {
             sendAudioToServer(recBlob);
           }
+          preBufferBlob = null; // BUG-060: Clear after use — prevents stale pre-buffer on rapid re-record
           autoListenActive = false;
         };
 
