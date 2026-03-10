@@ -2329,6 +2329,12 @@ async function main() {
   await testBug045_terminalBroadcastDedup();
   await testBug047_ttsQueueTrimming();
 
+  // Round 15: Entry quality — status line filter, dedup widening, TTS sweep robustness
+  await testEntryQuality_statusLineFilter();
+  await testEntryQuality_assistantDedup();
+  await testEntryQuality_passiveInputDedup();
+  await testEntryQuality_ttsSweepDrain();
+
   await teardown();
 }
 
@@ -2826,9 +2832,9 @@ async function testEntryBugs_dedupAndCap() {
   const hasRecentSlice = /recentEntries\s*=\s*conversationEntries\.slice\(-20\)/.test(src);
   report("Dedup checks last 20 entries (not just currentTurn)", hasRecentSlice);
 
-  // Bug 1: Dedup should allow repeats for distant turns (>2 apart)
-  const hasDistanceCheck = /currentTurn\s*-\s*e\.turn\s*<=\s*2/.test(src);
-  report("Dedup allows repeats for distant turns (>2 apart)", hasDistanceCheck);
+  // Dedup is now text-based across all recent entries (no turn distance restriction)
+  const hasTextDedup = src.includes("paraNorm") && src.includes("eNorm");
+  report("Dedup uses text-based matching across all recent entries", hasTextDedup);
 
   // Bug 1: Both dedup sites use the new cross-turn logic
   const dedupSites = (src.match(/recentEntries\.some/g) || []).length;
@@ -2949,11 +2955,11 @@ async function testStatusLineFilter() {
 
   // Pattern is in the skip section (isChromeSkip returns a reason → line is skipped), not just non-speakable
   const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip("), src.indexOf("function isChromeSkip(") + 2500);
-  const isSkipFilter = chromeSkipFn.includes("status_cooking") && /\[✻✶✢✽\]/.test(chromeSkipFn);
+  const isSkipFilter = chromeSkipFn.includes("status_cooking") && chromeSkipFn.includes("·");
   report("Status lines are skip-filtered (not just non-speakable)", isSkipFilter);
 
   // Simple pattern: starts with spinner char — no verb/timing checks needed
-  const hasSimplePattern = /\^\[✻✶✢✽\]/.test(src);
+  const hasSimplePattern = src.includes("✻✶✢✽") && src.includes("status_cooking");
   report("Pattern uses simple spinner-char-at-start check", hasSimplePattern);
 
   // Verify the filter matches known status lines
@@ -2976,20 +2982,20 @@ async function testTriplicateUserEntry_passiveGuard() {
 
   const src = readFileSync("server.ts", "utf-8");
 
-  // Passive watcher tracks last processed user input
-  const hasTracking = /_lastPassiveUserInput/.test(src);
-  report("Passive watcher tracks last processed user input", hasTracking);
+  // Passive watcher tracks recent inputs via ring buffer
+  const hasTracking = /_recentPassiveInputs/.test(src);
+  report("Passive watcher tracks recent inputs via ring buffer", hasTracking);
 
-  // Has timestamp tracking for the guard
-  const hasTs = /_lastPassiveUserInputTs/.test(src);
-  report("Passive watcher tracks input timestamp", hasTs);
+  // Ring buffer entries have timestamp for pruning
+  const hasTs = src.includes("_recentPassiveInputs") && src.includes("ts: Date.now()");
+  report("Passive input ring buffer has timestamp tracking", hasTs);
 
   // Guard exists in passive watcher section (between "Spinner detected" and "Start streaming")
   const passiveSection = src.slice(
     src.indexOf("Spinner detected — native CLI input"),
     src.indexOf("Start streaming just like a Murmur-initiated input")
   );
-  const hasGuard = passiveSection.includes("_lastPassiveUserInput") &&
+  const hasGuard = passiveSection.includes("_recentPassiveInputs") &&
     passiveSection.includes("Skipping already-processed input");
   report("Passive watcher has re-detection guard before streaming", hasGuard);
 
@@ -2998,9 +3004,9 @@ async function testTriplicateUserEntry_passiveGuard() {
     /userInput.*trim\(\).*toLowerCase\(\).*replace\(\/\\s\+\/g/s.test(src);
   report("Guard uses space-stripped normalization", hasNorm);
 
-  // Guard has 30s time window
-  const hasWindow = /30000/.test(passiveSection);
-  report("Guard has 30-second time window", hasWindow);
+  // Guard uses time-based pruning (60s window)
+  const hasWindow = /60000/.test(passiveSection);
+  report("Guard has 60-second time window", hasWindow);
 
   // addUserEntry still has its own dedup as defense-in-depth
   const hasDedup = /DEDUP-TRACE.*DEDUP HIT/.test(src);
@@ -4309,7 +4315,9 @@ async function testTestEntryBroadcastIsolation() {
   report("ConversationEntry has sourceTag field", hasSourceTag);
 
   // 2. addUserEntry stamps sourceTag on entries
-  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 6000);
+  const addUserStart = src.indexOf("function addUserEntry(");
+  const addUserEnd = src.indexOf("\n}\n", addUserStart);
+  const addUserFn = src.slice(addUserStart, addUserEnd > addUserStart ? addUserEnd : addUserStart + 7000);
   const stampsSourceTag = addUserFn.includes("sourceTag: _source");
   report("addUserEntry stamps sourceTag from _source parameter", stampsSourceTag);
 
@@ -4879,7 +4887,8 @@ async function testUserEntryDedup60s() {
 
   // Verify dedup window is 60s (was 30s — duplicates appeared at +35s and +73s)
   const addUserIdx = src.indexOf("function addUserEntry");
-  const addUserBody = src.slice(addUserIdx, addUserIdx + 3000);
+  const addUserBodyEnd = src.indexOf("\n}\n", addUserIdx);
+  const addUserBody = src.slice(addUserIdx, addUserBodyEnd > addUserIdx ? addUserBodyEnd : addUserIdx + 7000);
   const has60s = addUserBody.includes("60000");
   report("User entry dedup window is 60s", has60s);
 
@@ -4900,9 +4909,9 @@ async function testAssistantEntryDedup() {
   const hasNormDedup = bcoBody.includes("paraNorm") || bcoBody.includes("toLowerCase");
   report("Assistant dedup uses normalized text comparison", hasNormDedup);
 
-  // Should check across gen bumps (turn range > 2)
-  const hasCrossGenCheck = bcoBody.includes("turn <= 3") || bcoBody.includes("currentTurn - e.turn <= 3");
-  report("Assistant dedup spans across gen bumps (turn<=3)", hasCrossGenCheck);
+  // Should not restrict by turn — dedup is purely text-based across all recent entries
+  const noBrokenTurnCheck = !bcoBody.includes("e.turn <= 2") && !bcoBody.includes("e.turn <= 3");
+  report("Assistant dedup is text-based (no turn restriction)", noBrokenTurnCheck);
 }
 
 async function testEntryCapInPushEntry() {
@@ -6333,6 +6342,91 @@ async function testBug047_ttsQueueTrimming() {
   // Age-based trim (jobs older than 30s)
   const hasAgeTrim = trimSection.includes("createdAt") && trimSection.includes("30000");
   report("Trims jobs older than 30s", hasAgeTrim);
+}
+
+// --- Entry quality: status line filter ---
+async function testEntryQuality_statusLineFilter() {
+  console.log("\n[ENTRY-QUALITY] Status line text filtered from isChromeSkip and addUserEntry");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // isChromeSkip catches spinner prefixes including middle dot ·
+  const chromeStart = src.indexOf("function isChromeSkip");
+  const chromeEnd = src.indexOf("\n}\n", chromeStart);
+  const chromeBody = src.slice(chromeStart, chromeEnd);
+  const hasMiddleDot = chromeBody.includes("·");
+  report("isChromeSkip filters middle dot · prefix lines", hasMiddleDot);
+
+  const hasCompacting = chromeBody.includes("Compacting conversation");
+  report("isChromeSkip filters 'Compacting conversation'", hasCompacting);
+
+  const hasCrunched = chromeBody.includes("Crunched for");
+  report("isChromeSkip filters 'Crunched for' status text", hasCrunched);
+
+  // addUserEntry also filters status lines before dedup
+  const addStart = src.indexOf("function addUserEntry");
+  const addEnd = src.indexOf("\n}\n", addStart);
+  const addBody = src.slice(addStart, addEnd);
+  const hasStatusFilter = addBody.includes("Filtered status line") && addBody.includes("Background command");
+  report("addUserEntry filters status line text from becoming entries", hasStatusFilter);
+}
+
+// --- Entry quality: assistant dedup widened ---
+async function testEntryQuality_assistantDedup() {
+  console.log("\n[ENTRY-QUALITY] broadcastCurrentOutput assistant dedup widened across turns");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find the dedup block in broadcastCurrentOutput
+  const dedupIdx = src.indexOf("Normalized match across gen bumps");
+  const dedupSection = src.slice(dedupIdx - 400, dedupIdx + 200);
+
+  // Should NOT have turn-based restriction (was: currentTurn - e.turn <= 3)
+  const noTurnRestriction = !dedupSection.includes("e.turn <= 2") && !dedupSection.includes("e.turn <= 3");
+  report("Assistant dedup has no narrow turn restriction", noTurnRestriction);
+
+  // Should use normalized comparison
+  const hasNormCompare = dedupSection.includes("paraNorm") && dedupSection.includes("eNorm");
+  report("Assistant dedup uses normalized text comparison", hasNormCompare);
+}
+
+// --- Entry quality: passive input dedup ring buffer ---
+async function testEntryQuality_passiveInputDedup() {
+  console.log("\n[ENTRY-QUALITY] Passive watcher uses ring buffer for input dedup (not single var)");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const hasRingBuffer = src.includes("_recentPassiveInputs");
+  report("Passive watcher uses _recentPassiveInputs ring buffer", hasRingBuffer);
+
+  // Ring buffer is pruned by time and capped
+  const passiveStart = src.indexOf("_recentPassiveInputs.some");
+  const passiveSection = src.slice(passiveStart - 300, passiveStart + 500);
+  const hasPrune = passiveSection.includes(".filter(e => e.ts >=");
+  report("Ring buffer prunes entries older than cutoff", hasPrune);
+
+  const hasCap = passiveSection.includes("_recentPassiveInputs.shift()");
+  report("Ring buffer caps at max entries", hasCap);
+}
+
+// --- Entry quality: TTS sweep calls drain ---
+async function testEntryQuality_ttsSweepDrain() {
+  console.log("\n[ENTRY-QUALITY] sweepStaleTtsJobs calls drain after recovery");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const sweepStart = src.indexOf("function sweepStaleTtsJobs");
+  const sweepEnd = src.indexOf("\n}\n", sweepStart);
+  const sweepBody = src.slice(sweepStart, sweepEnd);
+
+  const callsDrain = sweepBody.includes("drainAudioBuffer()");
+  report("Sweep calls drainAudioBuffer after recovery", callsDrain);
+
+  const hasOrphanCheck = sweepBody.includes("orphaned") && sweepBody.includes('"playing"');
+  report("Sweep checks for orphaned playing jobs", hasOrphanCheck);
+
+  const hasAgeCleanup = sweepBody.includes("TTS_JOB_MAX_AGE_MS") && sweepBody.includes("aged out");
+  report("Sweep has age-based cleanup with logging", hasAgeCleanup);
+
+  // Sweep interval registered
+  const hasInterval = src.includes("setInterval(sweepStaleTtsJobs");
+  report("Sweep runs on setInterval", hasInterval);
 }
 
 main().catch(err => {

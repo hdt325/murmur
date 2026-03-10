@@ -2565,8 +2565,7 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
   // Stop TTS + reset all state
   stopClientPlayback2("session_switch");
   lastPassiveSnapshot = "";
-  _lastPassiveUserInput = "";
-  _lastPassiveUserInputTs = 0;
+  _recentPassiveInputs = [];
   _cooldownThinking = false;
   lastStreamEndTime = 0;
   preInputSnapshot = "";
@@ -2784,6 +2783,11 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
     console.log(`[addUserEntry] Filtered agent command from="${_source}": "${text.slice(0, 80)}"`);
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
+  // Filter status line text that passive watcher may scrape near the prompt
+  if (/^[✻✶✢✽·]/.test(text.trim()) || /^(Compacting conversation|Crunched for |Background command)/i.test(text.trim()) || /^\d+\s+background\s+task/i.test(text.trim())) {
+    console.log(`[addUserEntry] Filtered status line from="${_source}": "${text.slice(0, 80)}"`);
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
   // Dedup by inputId: if an entry with same inputId already exists, return it
   if (inputId) {
     const existing = conversationEntries.find(e => e.inputId === inputId);
@@ -2947,7 +2951,9 @@ function isChromeSkip(trimmed: string): string {
   if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) return "menu_fragment";
   if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) return "menu_label";
   if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) return "feedback_prompt";
-  if (/^[✻✶✢✽]/.test(trimmed)) return "status_cooking";
+  if (/^[✻✶✢✽·]/.test(trimmed)) return "status_cooking";
+  if (/^Compacting conversation/i.test(trimmed)) return "status_compacting";
+  if (/^Crunched for /i.test(trimmed)) return "status_crunched";
   if (/@(code|ma)\b/.test(trimmed)) return "ink_tui";
   if (/→\s*·/.test(trimmed)) return "arrow_dot";
   if ((trimmed.match(/\s{3,}/g) || []).length >= 2 && trimmed.length < 120) return "garbled_tui";
@@ -3501,11 +3507,11 @@ function broadcastCurrentOutput() {
       const paraNorm = para.text.trim().toLowerCase().replace(/\s+/g, " ");
       const isDup = recentEntries.some(e => {
         if (e.role !== "assistant" || matchedEntryIds.has(e.id)) return false;
-        // Exact text match within recent turns
-        if (e.text === para.text && (e.turn === currentTurn || currentTurn - e.turn <= 2)) return true;
+        // Exact text match — no turn restriction (gen bumps can jump turns arbitrarily)
+        if (e.text === para.text) return true;
         // Normalized match across gen bumps — catches re-created entries with identical content
         const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
-        return eNorm === paraNorm && (e.turn === currentTurn || currentTurn - e.turn <= 3);
+        return eNorm === paraNorm;
       });
       if (!isDup) {
         // First new assistant content in this turn — cancel old-turn TTS so new response plays
@@ -4153,8 +4159,8 @@ function stopTmuxStreaming() {
 // Polls tmux pane every 2s while IDLE. If spinner detected, starts streaming.
 let passiveWatcher: ReturnType<typeof setInterval> | null = null;
 let lastPassiveSnapshot: string = "";
-let _lastPassiveUserInput = ""; // Track last user input detected by passive watcher to prevent triplicates
-let _lastPassiveUserInputTs = 0;
+// Track recent passive inputs to prevent duplicates (ring buffer of last 10)
+let _recentPassiveInputs: Array<{ normalized: string; ts: number }> = [];
 let _cooldownThinking = false; // Track if we sent thinking state during cooldown
 let lastStreamEndTime = 0; // Cooldown: don't re-trigger passive watcher right after streaming ends
 const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
@@ -4318,12 +4324,14 @@ function startPassiveWatcher() {
       // (prevents triplicates when tmux shows same ❯ text across multiple poll cycles)
       if (userInput) {
         const normalizedPassive = userInput.trim().toLowerCase().replace(/\s+/g, "");
-        if (normalizedPassive === _lastPassiveUserInput && Date.now() - _lastPassiveUserInputTs < 30000) {
+        const cutoff = Date.now() - 60000;
+        _recentPassiveInputs = _recentPassiveInputs.filter(e => e.ts >= cutoff); // prune old
+        if (_recentPassiveInputs.some(e => e.normalized === normalizedPassive)) {
           console.log(`[passive] Skipping already-processed input: "${userInput.slice(0, 60)}"`);
           return;
         }
-        _lastPassiveUserInput = normalizedPassive;
-        _lastPassiveUserInputTs = Date.now();
+        _recentPassiveInputs.push({ normalized: normalizedPassive, ts: Date.now() });
+        if (_recentPassiveInputs.length > 10) _recentPassiveInputs.shift(); // cap at 10
       }
 
       // Guard: skip if this text was sent programmatically via Murmur text box or STT.
