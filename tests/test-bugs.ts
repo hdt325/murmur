@@ -2351,6 +2351,10 @@ async function main() {
   await testBug062_sessionPalette();
   await testBug063_electronBounds();
 
+  // Round 18: Entry loading on window switch + Kokoro reconnect
+  await testWindowSwitchEntryLoading();
+  await testKokoroReconnectDrain();
+
   await teardown();
 }
 
@@ -6636,6 +6640,62 @@ async function testBug063_electronBounds() {
 
   const usesOnCreate = src.includes("saved?.x") || src.includes("saved?.width");
   report("Saved bounds used when creating window", usesOnCreate);
+}
+
+// --- Round 18: Entry loading on window switch + Kokoro reconnect ---
+
+async function testWindowSwitchEntryLoading() {
+  console.log("\n[Window Switch] Entry loading on window switch");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find _activateWindowCore function body
+  const fnStart = src.indexOf("function _activateWindowCore(");
+  const fnEnd = src.indexOf("\nfunction ", fnStart + 50);
+  const fnBody = src.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 3000);
+
+  // Fix 1: No longer filters cached entries by e.window === currentWindowKey
+  // (cache key already scopes to correct window — strict filter dropped valid entries
+  // persisted from previous server sessions with stale window tags)
+  const hasStrictWindowFilter = fnBody.includes("e.window === currentWindowKey");
+  report("Cache load does NOT filter by e.window (cache key scopes entries)", !hasStrictWindowFilter);
+
+  // Fix 2: Re-tags cached entries to current window key
+  const retagsEntries = fnBody.includes("e.window = currentWindowKey");
+  report("Cached entries re-tagged to current window key", retagsEntries);
+
+  // Fix 3: Falls back to scrollback parse when cache is empty
+  const hasScrollbackFallback = fnBody.includes("loadScrollbackEntries()");
+  report("Falls back to scrollback parse when cache empty", hasScrollbackFallback);
+
+  // Fix 4: Broadcasts entries after loading (either to ws or broadcast)
+  const hasBroadcast = fnBody.includes('broadcast(') && fnBody.includes('"entry"');
+  const hasSendToWs = fnBody.includes("opts.sendToWs");
+  report("Entries sent to client(s) after window switch", hasBroadcast || hasSendToWs);
+
+  // Fix 5: Logs entry count for debugging
+  const hasEntryCountLog = fnBody.includes("cached entries for") || fnBody.includes("entries from scrollback");
+  report("Logs entry count after loading", hasEntryCountLog);
+}
+
+async function testKokoroReconnectDrain() {
+  console.log("\n[Kokoro Reconnect] TTS drain on service recovery");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Health check interval exists (30s)
+  const hasHealthInterval = src.includes("setInterval(async ()") && src.includes("checkService") && src.includes("30000");
+  report("Service health check interval (30s) exists", hasHealthInterval);
+
+  // Recovery drain: when Kokoro transitions from down to up, drain TTS queue
+  const hasRecoveryDrain = src.includes("!prev.kokoro && serviceStatus.kokoro") && src.includes("drainAudioBuffer()");
+  report("Kokoro recovery triggers TTS queue drain", hasRecoveryDrain);
+
+  // Service status broadcast on change
+  const hasBroadcastOnChange = src.includes("prev.whisper !== serviceStatus.whisper") && src.includes('type: "services"');
+  report("Service status broadcast on change", hasBroadcastOnChange);
+
+  // Startup service check
+  const hasStartupCheck = src.includes("checkAllServices()");
+  report("Services checked on startup", hasStartupCheck);
 }
 
 main().catch(err => {

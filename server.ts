@@ -2592,15 +2592,23 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
 
   // Load entries for this window
   const cached = loadWindowEntries(currentWindowKey);
-  const realCached = cached?.filter(e => !isTestEntry(e)).filter(e => !e.window || e.window === currentWindowKey);
+  // Filter test entries only — cache key already scopes to the correct window.
+  // The old `e.window === currentWindowKey` filter was too strict: entries persisted
+  // from a previous server session or loaded from scrollback could have a stale window
+  // tag (e.g. different pane format), causing ALL cached entries to be discarded.
+  const realCached = cached?.filter(e => !isTestEntry(e));
   if (realCached && realCached.length > 0) {
+    // Re-tag entries to current window key (fixes stale window tags from persistence)
+    for (const e of realCached) e.window = currentWindowKey;
     if (realCached.length < (cached?.length ?? 0)) {
-      console.log(`[window] Cleaned ${(cached?.length ?? 0) - realCached.length} test/cross-window entries from cache`);
+      console.log(`[window] Cleaned ${(cached?.length ?? 0) - realCached.length} test entries from cache`);
     }
     setConversationEntries(realCached);
+    console.log(`[window] Loaded ${realCached.length} cached entries for ${currentWindowKey}`);
   } else {
     const scrollback = loadScrollbackEntries();
     setConversationEntries(scrollback);
+    console.log(`[window] Parsed ${scrollback.length} entries from scrollback for ${currentWindowKey}`);
   }
   for (const e of conversationEntries) e.spoken = true;
   if (conversationEntries.length > 0) {
@@ -2704,7 +2712,8 @@ function loadWindowEntries(windowKey: string): ConversationEntry[] | null {
 let _switchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Execute the actual window switch (called after debounce from tmux:switch: handler) */
-function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws").WebSocket): void {
+function _executeWindowSwitch(session: string, windowIdx: number, _ws: import("ws").WebSocket): void {
+  // Broadcast to ALL clients (not just requesting ws) so every connected device updates.
   _activateWindowCore(session, windowIdx, { stopStreaming: true });
 }
 
