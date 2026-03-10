@@ -528,14 +528,14 @@ function combineAudioBuffers(preBuffer: Buffer, mainAudio: Buffer): Buffer {
   writeFileSync(mainFile, mainAudio);
 
   // Use ffmpeg to concatenate: convert both to same format, then combine
-  execSync(
-    `ffmpeg -y -i "${preFile}" -i "${mainFile}" ` +
-      `-filter_complex "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a0];` +
-      `[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a1];` +
-      `[a0][a1]concat=n=2:v=0:a=1[out]" ` +
-      `-map "[out]" -c:a libopus "${outFile}"`,
-    { stdio: "ignore", timeout: 10000 }
-  );
+  execFileSync("ffmpeg", [
+    "-y", "-i", preFile, "-i", mainFile,
+    "-filter_complex",
+    "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a0];" +
+    "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=mono[a1];" +
+    "[a0][a1]concat=n=2:v=0:a=1[out]",
+    "-map", "[out]", "-c:a", "libopus", outFile,
+  ], { stdio: "ignore", timeout: 10000 });
   try {
     return Buffer.from(readFileSync(outFile));
   } finally {
@@ -701,7 +701,7 @@ const USER_INITIATED_BUMP_REASONS = new Set<GenerationEvent["reason"]>([
 
 interface GenerationEvent {
   gen: number;
-  reason: "user_stop" | "voice_change" | "new_input" | "session_switch" | "client_disconnect" | "barge_in";
+  reason: "user_stop" | "voice_change" | "new_input" | "passive_redetect" | "session_switch" | "client_disconnect" | "barge_in";
   ts: number;
   entryId?: number;
 }
@@ -871,9 +871,11 @@ function cleanTtsText(text: string): string {
   return text
     // M12: Strip ANSI escape sequences (CSI, OSC, charset, and other escapes)
     // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")   // CSI sequences (colors, cursor)
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "")   // CSI sequences (colors, cursor, DEC private modes)
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")  // OSC sequences (title, hyperlinks)
-    .replace(/\x1b[()][A-Z0-9]/g, "")         // Charset selection (e.g. \x1b(B)
+    .replace(/\x1b[()][A-B0-2]/g, "")         // Charset selection (e.g. \x1b(B, \x1b)0)
+    .replace(/\x1b[#%][A-Za-z0-9]/g, "")      // Line attrs & charset designators
+    .replace(/\x1b[78DMEHNOcn><=]/g, "")      // Single-character escape commands
     // M4: Strip HTML tags, then decode common HTML entities
     .replace(/<[^>]+>/g, "")
     .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
@@ -2390,8 +2392,24 @@ let entryTtsCursor: Map<number, number> = new Map();
 // --- Per-window conversation arrays ---
 // Each tmux window gets its own conversation entries array.
 // Prevents test entries and CLI output from leaking across windows.
+const WINDOW_ENTRIES_FILE = join(__dirname, "window-entries.json");
 const windowEntries = new Map<string, ConversationEntry[]>();
 let currentWindowKey = "_unset"; // Sentinel: no window selected until client sends window_preference
+
+// Load persisted window entries from disk on startup
+try {
+  if (existsSync(WINDOW_ENTRIES_FILE)) {
+    const raw = JSON.parse(readFileSync(WINDOW_ENTRIES_FILE, "utf-8"));
+    if (raw && typeof raw === "object") {
+      for (const [key, entries] of Object.entries(raw)) {
+        if (Array.isArray(entries)) windowEntries.set(key, entries as ConversationEntry[]);
+      }
+      console.log(`[startup] Loaded ${windowEntries.size} window entry caches from disk`);
+    }
+  }
+} catch (err) {
+  console.error("[startup] Failed to load window entries from disk:", (err as Error).message);
+}
 
 // --- Server's own pane exclusion ---
 // The server itself runs in a tmux pane. We MUST never scrape our own pane,
@@ -2472,21 +2490,38 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   _pendingPromptInputTs = 0;
   _scrollbackCache = { text: "", ts: 0 };
   lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
+  _lastWindowSwitchTs = Date.now();
   if (streamState !== "IDLE") streamState = "IDLE";
   entryTtsCursor.clear();
 
   // Load entries for this window
   const cached = loadWindowEntries(currentWindowKey);
-  if (cached) {
-    setConversationEntries(cached.filter(e => !e.window || e.window === currentWindowKey));
+  // Filter out test garbage before checking — test entries should never block scrollback parsing
+  const realCached = cached?.filter(e => !isTestEntry(e)).filter(e => !e.window || e.window === currentWindowKey);
+  if (realCached && realCached.length > 0) {
+    setConversationEntries(realCached);
   } else if (!isOwnPane) {
     // Only scrape scrollback for non-own panes — own pane scraping blocked to prevent
     // coordinator/agent output from leaking into conversation view
     const scrollback = loadScrollbackEntries();
     setConversationEntries(scrollback);
   } else {
-    // Own pane with no cached entries — start with empty (passive watcher won't scrape either)
-    setConversationEntries([]);
+    // Own pane with no cache — keep existing conversationEntries if any (don't wipe),
+    // otherwise show an informational entry
+    if (conversationEntries.length === 0) {
+      const infoEntry: ConversationEntry = {
+        id: ++entryIdCounter,
+        role: "assistant",
+        text: `This is the Murmur server's own terminal (${session}:${windowIdx}). Switch to a Claude session window to see conversation entries.`,
+        ts: Date.now(),
+        spoken: true,
+        speakable: false,
+        turn: currentTurn,
+        window: currentWindowKey,
+      };
+      setConversationEntries([infoEntry]);
+    }
+    console.log(`[window] Own pane — kept ${conversationEntries.length} existing entries`);
   }
   for (const e of conversationEntries) e.spoken = true;
   if (conversationEntries.length > 0) {
@@ -2526,17 +2561,45 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   console.log(`[window] Activated ${target}, sent ${recentEntries.length} entries + idle status`);
 }
 
-/** Update conversationEntries and sync to the per-window map */
-function setConversationEntries(entries: ConversationEntry[]): void {
-  conversationEntries = entries;
-  const key = getWindowKey();
-  if (key) windowEntries.set(key, entries);
+/** Debounced persistence of windowEntries to disk. Called after map updates. */
+let _persistTimer: ReturnType<typeof setTimeout> | null = null;
+function persistWindowEntries(): void {
+  if (_persistTimer) clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    try {
+      const obj: Record<string, ConversationEntry[]> = {};
+      // Filter test entries from persistence — they should never pollute the cache
+      for (const [key, entries] of windowEntries) obj[key] = entries.filter(e => !isTestEntry(e));
+      const tmpFile = WINDOW_ENTRIES_FILE + ".tmp";
+      writeFileSync(tmpFile, JSON.stringify(obj));
+      renameSync(tmpFile, WINDOW_ENTRIES_FILE);
+    } catch (err) {
+      console.error("[window] Failed to persist window entries:", (err as Error).message);
+    }
+  }, 2000); // 2s debounce — fast enough for switches, avoids thrashing during streaming
 }
 
-/** Save current entries to the per-window map (call before switching windows) */
+/** Update conversationEntries and sync to the per-window map.
+ *  Uses currentWindowKey (cached from last activation) — NOT getWindowKey() which
+ *  re-derives from terminal.displayTarget and could drift if tmux state changed. */
+function setConversationEntries(entries: ConversationEntry[]): void {
+  conversationEntries = entries;
+  const key = currentWindowKey && currentWindowKey !== "_unset" ? currentWindowKey : getWindowKey();
+  if (key) windowEntries.set(key, entries);
+  persistWindowEntries();
+}
+
+/** Save current entries to the per-window map (call before switching windows).
+ *  Uses currentWindowKey (snapshot from last activation) — NOT getWindowKey() which
+ *  would re-derive from terminal state and could mismatch if _window changed. */
 function saveCurrentWindowEntries(): void {
-  const key = getWindowKey();
-  if (key) windowEntries.set(key, conversationEntries);
+  const key = currentWindowKey;
+  if (key && key !== "_unset") {
+    windowEntries.set(key, conversationEntries);
+    console.log(`[window] Saved ${conversationEntries.length} entries under key "${key}"`);
+    persistWindowEntries();
+  }
 }
 
 /** Load entries for a window key from the map, or empty array if not cached */
@@ -2565,21 +2628,23 @@ function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws
   preInputSnapshot = "";
   _scrollbackCache = { text: "", ts: 0 };
   lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
+  _lastWindowSwitchTs = Date.now();
   if (streamState !== "IDLE") streamState = "IDLE";
   entryTtsCursor.clear();
 
   const isSelfPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
   if (isSelfPane) {
-    console.log(`[tmux] Own pane detected (${_serverOwnPaneId}) — will skip scraping, serve cached entries only`);
+    console.log(`[tmux] Own pane detected (${_serverOwnPaneId}) — will skip scraping, show info entry`);
   }
 
   const cached = loadWindowEntries(currentWindowKey);
-  if (cached) {
-    const cleaned = cached.filter(e => !e.window || e.window === currentWindowKey);
-    if (cleaned.length < cached.length) {
-      console.log(`[tmux] Cleaned ${cached.length - cleaned.length} cross-window entries from cache`);
+  // Filter out test garbage + cross-window entries before checking — test entries should never block scrollback parsing
+  const realCached = cached?.filter(e => !isTestEntry(e)).filter(e => !e.window || e.window === currentWindowKey);
+  if (realCached && realCached.length > 0) {
+    if (realCached.length < (cached?.length ?? 0)) {
+      console.log(`[tmux] Cleaned ${(cached?.length ?? 0) - realCached.length} test/cross-window entries from cache`);
     }
-    setConversationEntries(cleaned);
+    setConversationEntries(realCached);
     console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
   } else if (!isSelfPane) {
     const scrollback = loadScrollbackEntries();
@@ -2590,8 +2655,22 @@ function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws
       console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
     }
   } else {
-    setConversationEntries([]);
-    console.log(`[tmux] Own pane with no cached entries — starting empty`);
+    // Own pane with no cache — keep existing conversationEntries if any (don't wipe),
+    // otherwise show an informational entry
+    if (conversationEntries.length === 0) {
+      const infoEntry: ConversationEntry = {
+        id: ++entryIdCounter,
+        role: "assistant",
+        text: `This is the Murmur server's own terminal (${session}:${windowIdx}). Switch to a Claude session window to see conversation entries.`,
+        ts: Date.now(),
+        spoken: true,
+        speakable: false,
+        turn: currentTurn,
+        window: currentWindowKey,
+      };
+      setConversationEntries([infoEntry]);
+    }
+    console.log(`[tmux] Own pane — kept ${conversationEntries.length} existing entries`);
   }
   for (const e of conversationEntries) e.spoken = true;
   if (conversationEntries.length > 0) {
@@ -2617,14 +2696,62 @@ function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws
   } catch {}
 }
 
+/** Returns true if entry looks like test injection garbage that should not be persisted or cached */
+function isTestEntry(e: ConversationEntry): boolean {
+  const t = e.text;
+  return /^dedup-test-|^test-paste-|^reply to dedup-test-/.test(t) || e.sourceTag?.startsWith("text-input-test") === true;
+}
+
+/** Central dedup check: returns true if an entry with same role + normalized text
+ *  already exists in conversationEntries within the dedup window.
+ *  This is the FINAL guard — catches duplicates that slip through caller-level dedup. */
+function isDuplicateEntry(entry: ConversationEntry): boolean {
+  const DEDUP_WINDOW_MS = 60000; // 60s for user entries, turn-based for assistant
+  const norm = entry.text.trim().toLowerCase().replace(/\s+/g, " ");
+  if (norm.length === 0) return false;
+  const normNoSpaces = norm.replace(/\s/g, "");
+  const cutoff = Date.now() - DEDUP_WINDOW_MS;
+
+  if (entry.role === "user") {
+    // User entries: check within last 60s by normalized text
+    return conversationEntries.some(e => {
+      if (e.role !== "user" || e.ts < cutoff) return false;
+      const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
+      if (eNorm === norm) return true;
+      // Fuzzy: strip all spaces (handles tmux wrap boundary mismatches)
+      return eNorm.replace(/\s/g, "") === normNoSpaces;
+    });
+  } else {
+    // Assistant entries: check within same turn or ±3 turns, AND within 60s
+    return conversationEntries.some(e => {
+      if (e.role !== "assistant" || e.ts < cutoff) return false;
+      if (Math.abs((e.turn ?? 0) - (entry.turn ?? 0)) > 3) return false;
+      const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
+      return eNorm === norm;
+    });
+  }
+}
+
 /** Push an entry into conversationEntries with window tag automatically set */
-function pushEntry(entry: ConversationEntry): void {
+function pushEntry(entry: ConversationEntry): boolean {
+  // Central dedup guard — catches duplicates from any code path
+  if (isDuplicateEntry(entry)) {
+    console.log(`[DEDUP-CENTRAL] Blocked duplicate ${entry.role} entry: "${entry.text.slice(0, 60)}" (turn=${entry.turn})`);
+    return false;
+  }
+
   const wk = getWindowKey();
   entry.window = wk;
-  // Non-voice sessions (coordinator, agents): force speakable=false to prevent TTS leak
+  // Non-voice sessions (coordinator, agents): suppress TTS playback but keep speakable=true
+  // so clean mode still shows the entry. speakable = "this is prose content" (display flag),
+  // spoken = "TTS completed or skipped" (audio flag).
   if (!isVoiceSession() && entry.speakable) {
-    entry.speakable = false;
-    console.log(`[WINDOW-TTS-GUARD] Suppressed speakable for entry ${entry.id} — non-voice session (window=${wk})`);
+    entry.spoken = true; // Skip TTS — mark as already spoken so TTS queue ignores it
+    console.log(`[WINDOW-TTS-GUARD] Suppressed TTS for entry ${entry.id} — non-voice session (window=${wk}), speakable preserved`);
+  }
+  // Non-speakable entries should be marked spoken immediately to prevent false "dropped TTS" alerts
+  if (!entry.speakable && !entry.spoken) {
+    entry.spoken = true;
   }
   // Safety: if conversationEntries somehow has entries from a different window, log it
   if (conversationEntries.length > 0) {
@@ -2637,6 +2764,7 @@ function pushEntry(entry: ConversationEntry): void {
   // Enforce cap on every push — prevents overflow during rapid gen bumps
   // where dedicated trimEntriesToCap call sites may be skipped.
   trimEntriesToCap();
+  return true;
 }
 
 // Add a user entry and broadcast the updated entry list
@@ -2649,6 +2777,11 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   }
   // Suppress Claude Code team/agent messages
   if (/^<\/?teammate-message|^\{"type":"idle_notification"|^\{"type":"shutdown|^\{"type":"teammate_terminated"|^<\/?task-notification/.test(text.trim())) {
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
+  // Filter agent infrastructure commands (tmux send-keys, test runners, etc.)
+  if (isAgentInfraCommand(text)) {
+    console.log(`[addUserEntry] Filtered agent command from="${_source}": "${text.slice(0, 80)}"`);
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
   // Dedup by inputId: if an entry with same inputId already exists, return it
@@ -2723,7 +2856,7 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
     id: ++entryIdCounter,
     role: "user",
     text,
-    speakable: false,
+    speakable: true, // User entries are always prose — speakable for clean mode visibility + TTS
     spoken: false,
     ts: Date.now(),
     turn: currentTurn,
@@ -2761,6 +2894,23 @@ function isToolOutputLine(text: string): boolean {
   return false;
 }
 
+/** Detect agent infrastructure commands that should NOT become user conversation entries.
+ *  These are commands agents run in their CLI (tmux send-keys, test runners, etc.)
+ *  that the passive watcher might scrape from the ❯ prompt line. */
+function isAgentInfraCommand(text: string): boolean {
+  const t = text.trim();
+  if (/^tmux\s+send-keys\b/i.test(t)) return true;
+  if (/\s-t\s+(test-runner|murmur-test)/i.test(t)) return true;
+  if (/^node\s+--import\s+tsx/i.test(t)) return true;
+  if (/^npx\s+tsx\b/i.test(t)) return true;
+  if (/^npm\s+(run\s+)?test/i.test(t)) return true;
+  if (/^echo\s+.*>>\s*\/tmp\//i.test(t)) return true;  // pipeline logging commands
+  if (/^(cat|tail|head|grep)\s+.*\/tmp\//i.test(t)) return true;  // pipeline reads (not "read" — clashes with "Read /tmp/coder-*.md" user prompts)
+  if (/^tmux\s+(capture-pane|list-windows|list-sessions|display-message)\b/i.test(t)) return true;
+  if (/^(cp|mv|git|curl)\s+/i.test(t) && t.split(/\s+/).length >= 3) return true;  // shell ops with args (not short user messages like "git help")
+  return false;
+}
+
 // ── State machine for extractStructuredOutput (BUG-116 redesign) ──
 // States: PROSE (capture as speakable), TOOL_BLOCK (skip — entered on tool marker,
 // exited on ⏺-prose / empty line / prompt), AGENT_BLOCK (skip — XML tags),
@@ -2792,6 +2942,8 @@ function isChromeSkip(trimmed: string): string {
   if (/^[↓↑←→▶▷▸▹►▼▽▾▿◀◁◂◃◄]\s*(to\b|select|navigate|more|back|next|prev)/i.test(trimmed)) return "nav_hint";
   if (/^(yes|no|allow|deny|always allow|don't allow)\s*$/i.test(trimmed)) return "permission_choice";
   if (/^[│┃┆┇┊┋╎╏║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═╌╍╴╵╶╷↑↓←→↖↗↘↙⇐⇒⇑⇓▲▼◀▶►◄△▽◁▷▸▹◂◃☰☱☲☳⬆⬇⬅➡\s]+$/.test(trimmed)) return "box_drawing";
+  // Table data rows: start with │/║ and contain 2+ │/║ separators (e.g. "│ Passed │ 603 │ +5 │")
+  if (/^[│║]/.test(trimmed) && (trimmed.match(/[│║]/g) || []).length >= 3) return "table_data_row";
   if (/^\d+\s+(team|tasks|plan|tools|model|mode|mcp|memory|permissions)\b/i.test(trimmed) && trimmed.length < 50) return "menu_fragment";
   if (/^(team|tasks|plan|tools|model|mode)\s*$/i.test(trimmed)) return "menu_label";
   if (/^(bad|poor|fine|good|great|dismiss)\s*$/i.test(trimmed) && trimmed.length < 20) return "feedback_prompt";
@@ -3075,13 +3227,22 @@ function loadScrollbackEntries(): ConversationEntry[] {
 
     // Skip voice panel instruction turns entirely
     if (MURMUR_CONTEXT_FILTER.test(start.input)) continue;
+    // Skip agent infrastructure commands (tmux send-keys, test runners, etc.)
+    if (isAgentInfraCommand(start.input)) continue;
+
+    // Dedup: skip if this exact user input already exists in entries
+    const normalizedInput = start.input.trim().toLowerCase().replace(/\s+/g, " ");
+    if (entries.some(e => e.role === "user" && e.text.trim().toLowerCase().replace(/\s+/g, " ") === normalizedInput)) {
+      console.log(`[scrollback] Skipping duplicate user entry: "${start.input.slice(0, 60)}"`);
+      continue;
+    }
 
     // User entry
     entries.push({
       id: ++entryIdCounter,
       role: "user",
       text: start.input,
-      speakable: false,
+      speakable: true, // User entries are prose — speakable for clean mode visibility
       spoken: true,
       ts: Date.now() - (totalTurns - t) * 300000,
       turn: turnNum,
@@ -3110,22 +3271,103 @@ function loadScrollbackEntries(): ConversationEntry[] {
       if (/^Background command/i.test(trimmed)) continue;
       if (/^\d+\s+background\s+task/i.test(trimmed)) continue;
       if (/^[✻✶✢✽]/.test(trimmed)) continue;
+      // Table data rows: box-drawing + content (e.g. │ Passed │ 603 │)
+      if (/^[│║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰]/.test(trimmed) && (trimmed.match(/[│║┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬╭╮╯╰─━═]/g) || []).length >= 3) continue;
       responseLines.push(lines[i]);
     }
 
-    const text = reflowText(responseLines.join("\n")).trim();
-    if (text) {
-      entries.push({
-        id: ++entryIdCounter,
-        role: "assistant",
-        text,
-        speakable: isVoiceSession(), // Only speakable if watching a voice session
-        spoken: true, // silent — user replays on demand
-        ts: Date.now() - (totalTurns - t) * 300000 + 1000,
-        turn: turnNum,
-        window: getWindowKey(),
-      });
-      console.log(`[scrollback] Turn ${t}: user="${start.input.slice(0, 60)}" → assistant text ${text.length} chars`);
+    // Classify response lines into speakable (prose) vs non-speakable (tool) paragraphs
+    // using the same state machine logic as extractStructuredOutput.
+    const paragraphs: ExtractedParagraph[] = [];
+    {
+      let pLines: string[] = [];
+      let pSpeakable = true;
+      let pState: "PROSE" | "TOOL_BLOCK" = "PROSE";
+      let toolEmptyCount = 0;
+
+      const flush = () => {
+        const t2 = reflowText(pLines.join("\n").trim());
+        if (t2) paragraphs.push({ text: t2, speakable: pSpeakable });
+        pLines = [];
+        pSpeakable = true;
+      };
+
+      for (const rl of responseLines) {
+        const tr = rl.trim();
+
+        if (pState === "TOOL_BLOCK") {
+          if (isProseMarker(tr)) {
+            toolEmptyCount = 0;
+            if (pLines.length > 0) flush();
+            pState = "PROSE";
+            pSpeakable = true;
+            // fall through to PROSE processing
+          } else if (!tr) {
+            toolEmptyCount++;
+            if (toolEmptyCount >= 2) {
+              if (pLines.length > 0) flush();
+              pState = "PROSE";
+              pSpeakable = true;
+              toolEmptyCount = 0;
+            }
+            continue;
+          } else if (isToolMarker(tr)) {
+            toolEmptyCount = 0;
+            if (pLines.length > 0) flush();
+            pSpeakable = false;
+            pLines.push(rl.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, ""));
+            continue;
+          } else {
+            toolEmptyCount = 0;
+            pLines.push(rl);
+            continue;
+          }
+        }
+
+        if (isToolMarker(tr)) {
+          if (pLines.length > 0) flush();
+          pState = "TOOL_BLOCK";
+          toolEmptyCount = 0;
+          pSpeakable = false;
+          pLines.push(rl.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, ""));
+          continue;
+        }
+
+        // PROSE: empty line = paragraph break
+        if (!tr) {
+          if (pLines.length > 0) flush();
+          continue;
+        }
+
+        // Strip ⏺ from prose lines
+        const clean = rl.replace(/^\s*⏺\s*/, "").replace(/\s*⏺\s*$/, "");
+        if (clean.trim()) {
+          pLines.push(clean);
+        }
+      }
+      if (pLines.length > 0) flush();
+    }
+
+    if (paragraphs.length > 0) {
+      let addedCount = 0;
+      for (const para of paragraphs) {
+        const normalizedText = para.text.trim().toLowerCase().replace(/\s+/g, " ");
+        if (entries.some(e => e.role === "assistant" && e.text.trim().toLowerCase().replace(/\s+/g, " ") === normalizedText)) {
+          continue; // Dedup
+        }
+        entries.push({
+          id: ++entryIdCounter,
+          role: "assistant",
+          text: para.text,
+          speakable: para.speakable,
+          spoken: true,
+          ts: Date.now() - (totalTurns - t) * 300000 + 1000,
+          turn: turnNum,
+          window: getWindowKey(),
+        });
+        addedCount++;
+      }
+      console.log(`[scrollback] Turn ${t}: user="${start.input.slice(0, 60)}" → ${paragraphs.length} paragraphs (${paragraphs.filter(p => p.speakable).length} speakable), ${addedCount} entries added`);
     } else {
       console.log(`[scrollback] Turn ${t}: user="${start.input.slice(0, 60)}" → NO assistant text (${responseLines.length} response lines, all empty after filter)`);
     }
@@ -3297,10 +3539,12 @@ function broadcastCurrentOutput() {
   // Remove stale assistant entries if paragraphs shrunk (rare reparse)
   // But never remove entries that were already spoken — they're real content
   // Only trim when NOT actively responding (avoids losing content mid-stream)
+  // Guard: never remove current-turn entries — paragraph count fluctuates during parsing
   if (paragraphs.length < assistantEntries.length && streamState !== "RESPONDING") {
     const staleEntries = assistantEntries.slice(paragraphs.length);
-    const staleIds = new Set(staleEntries.filter(e => !e.spoken).map(e => e.id));
+    const staleIds = new Set(staleEntries.filter(e => !e.spoken && e.turn !== currentTurn).map(e => e.id));
     if (staleIds.size > 0) {
+      console.log(`[stream] Removing ${staleIds.size} stale entries (not spoken, not current turn)`);
       setConversationEntries(conversationEntries.filter(e => !staleIds.has(e.id)));
     }
   }
@@ -3633,14 +3877,22 @@ function handleStreamDone() {
 
   console.log(`[stream] Done after ${(elapsed / 1000).toFixed(1)}s`);
 
-  // System context response — suppress current turn entries and TTS, keep old turns
+  // System context response — suppress only system-context entries, keep user's real entries
   if (_isSystemContext) {
     _isSystemContext = false;
-    setConversationEntries(conversationEntries.filter(e => e.turn !== currentTurn));
+    const beforeCount = conversationEntries.length;
+    // Only remove entries created during this system context turn that match context patterns
+    // or have no meaningful user content. Preserve entries from other turns entirely.
+    setConversationEntries(conversationEntries.filter(e => {
+      if (e.turn !== currentTurn) return true; // Keep entries from other turns
+      if (e.role === "user" && !MURMUR_CONTEXT_FILTER.test(e.text.trim())) return true; // Keep real user entries
+      return false; // Remove system context user entry + its assistant response
+    }));
+    const removed = beforeCount - conversationEntries.length;
     broadcast({ type: "entry", entries: conversationEntries, partial: false });
     broadcast({ type: "voice_status", state: "idle" });
     broadcastPipelineTrace();
-    console.log("[stream] System context response suppressed from UI");
+    console.log(`[stream] System context response suppressed (removed ${removed} entries, kept ${conversationEntries.length})`);
     streamState = "DONE";
     return;
   }
@@ -3658,9 +3910,15 @@ function handleStreamDone() {
       assistantEntries[i].speakable = para.speakable;
     } else {
       // Skip if identical text exists in recent entries (cross-turn dedup for gen bumps)
+      // Use normalized comparison to catch whitespace-only differences
       const recentEntries = conversationEntries.slice(-20);
-      const isDup = recentEntries.some(e => e.role === "assistant" && e.text === para.text &&
-        (e.turn === currentTurn || currentTurn - e.turn <= 2));
+      const paraNorm = para.text.trim().toLowerCase().replace(/\s+/g, " ");
+      const isDup = recentEntries.some(e => {
+        if (e.role !== "assistant") return false;
+        if (e.turn !== currentTurn && currentTurn - (e.turn ?? 0) > 2) return false;
+        const eNorm = e.text.trim().toLowerCase().replace(/\s+/g, " ");
+        return eNorm === paraNorm;
+      });
       if (!isDup) {
         const newId = ++entryIdCounter;
         pushEntry({
@@ -3930,7 +4188,7 @@ function startPassiveWatcher() {
         console.log("[passive] Interrupted prompt detected — ending stream");
         streamState = "IDLE";
         lastStreamEndTime = Date.now();
-        stopClientPlayback2("new_input");
+        stopClientPlayback2("passive_redetect");
         broadcast({ type: "voice_status", state: "idle" });
       }
     }
@@ -4043,6 +4301,13 @@ function startPassiveWatcher() {
       if (pendingInput.length > userInput.length + 10) {
         console.log(`[passive] Pending input longer (${pendingInput.length} vs ${userInput.length}) — using pending (paste detected)`);
         userInput = pendingInput;
+      }
+
+      // Filter agent infrastructure commands — these are agent-to-agent commands
+      // (e.g. UX-Expert running tmux send-keys), not real user conversation input
+      if (userInput && isAgentInfraCommand(userInput)) {
+        console.log(`[passive] Filtered agent infrastructure command: "${userInput.slice(0, 80)}"`);
+        userInput = "";
       }
 
       // Take pre-snapshot from saved state (before spinner appeared)
@@ -6098,6 +6363,33 @@ app.get("/debug/mic-persistence", (_req, res) => {
   });
 });
 
+app.get("/debug/state", (_req, res) => {
+  res.json({
+    currentWindowKey,
+    displayTarget: terminal?.displayTarget ?? null,
+    currentTarget: terminal?.currentTarget ?? null,
+    pinnedPaneId: (terminal as any)?.pinnedPaneId ?? null,
+    streamState,
+    isWindowActive: isWindowActive(),
+    passiveWatcherRunning: !!passiveWatcher,
+    lastTerminalTextLength: lastTerminalText.length,
+    lastPassiveSnapshotLength: lastPassiveSnapshot.length,
+    preInputSnapshotLength: preInputSnapshot.length,
+    conversationEntryCount: conversationEntries.length,
+    windowEntriesKeys: Object.fromEntries(
+      Array.from(windowEntries.entries()).map(([k, v]) => [k, v.length])
+    ),
+    cooldown: {
+      lastStreamEndTime,
+      cooldownRemaining: Math.max(0, PASSIVE_COOLDOWN_MS - (Date.now() - lastStreamEndTime)),
+      cooldownThinking: _cooldownThinking,
+    },
+    serverOwnPaneId: _serverOwnPaneId,
+    clients: clients.size,
+    cleanMode: _cleanMode,
+  });
+});
+
 app.get("/debug/log/stream", (_req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -6204,13 +6496,16 @@ setInterval(async () => {
 
 // Broadcast tmux pane content with ANSI colors for the terminal panel (every 500ms)
 let lastTerminalText = "";
+let _lastWindowSwitchTs = 0; // Track last switch for force-broadcast window
 setInterval(() => {
   if (clients.size === 0) return;
   if (!isWindowActive()) return; // No window selected — don't broadcast stale pane content
   if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return; // Never broadcast own pane
   try {
     const text = captureTerminalPane();
-    if (text && text !== lastTerminalText) {
+    // After a window switch, force-broadcast for 3s even if text matches (prevents empty-string deadlock)
+    const forceWindow = Date.now() - _lastWindowSwitchTs < 3000;
+    if ((text && text !== lastTerminalText) || (forceWindow && text)) {
       lastTerminalText = text;
       broadcast({ type: "terminal", text });
     }
@@ -6255,6 +6550,22 @@ if (existsSync(certPath) && existsSync(keyPath)) {
 // Graceful shutdown
 function cleanup() {
   console.log("Shutting down...");
+  // Flush pending windowEntries persistence synchronously before exit
+  if (_persistTimer) {
+    clearTimeout(_persistTimer);
+    _persistTimer = null;
+    try {
+      const obj: Record<string, ConversationEntry[]> = {};
+      // Filter test entries on shutdown too (matches persistWindowEntries behavior)
+      for (const [key, entries] of windowEntries) obj[key] = entries.filter(e => !isTestEntry(e));
+      const tmpFile = WINDOW_ENTRIES_FILE + ".tmp";
+      writeFileSync(tmpFile, JSON.stringify(obj));
+      renameSync(tmpFile, WINDOW_ENTRIES_FILE);
+      console.log("[shutdown] Flushed window entries to disk");
+    } catch (err) {
+      console.error("[shutdown] Failed to flush window entries:", (err as Error).message);
+    }
+  }
   stopTts();
   stopTmuxStreaming();
   watcher.close();

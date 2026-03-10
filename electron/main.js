@@ -479,7 +479,7 @@ function createWindow() {
     alwaysOnTop: true,
     resizable: true,
     hasShadow: true,
-    minWidth: 360,
+    minWidth: 240,
     minHeight: 300,
     backgroundColor: "#1a1a1e",
     webPreferences: {
@@ -504,6 +504,24 @@ function createWindow() {
       .header { -webkit-app-region: drag !important; }
       .header * { -webkit-app-region: no-drag !important; }
     `);
+  });
+
+  // Content Security Policy — restrict resources to localhost only
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        "Content-Security-Policy": [
+          "default-src 'self' http://localhost:* ws://localhost:*; " +
+          "script-src 'self' 'unsafe-inline' http://localhost:*; " +
+          "style-src 'self' 'unsafe-inline'; " +
+          "img-src 'self' data: http://localhost:*; " +
+          "connect-src 'self' http://localhost:* ws://localhost:* https://localhost:* wss://localhost:*; " +
+          "media-src 'self' blob: http://localhost:*; " +
+          "font-src 'self' data:;"
+        ],
+      },
+    });
   });
 
   // Grant only needed permissions for localhost (microphone for STT, notifications for updates)

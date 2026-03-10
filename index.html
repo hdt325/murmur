@@ -3876,7 +3876,12 @@
       muteBtn.classList.toggle("active", muted);
       muteBtn.style.opacity = m.micOn ? "1" : "0.3";
       muteBtn.style.pointerEvents = m.micOn ? "auto" : "none";
-      document.getElementById("flowMuteBtn")?.classList.toggle("active", muted);
+      const _fmb = document.getElementById("flowMuteBtn");
+      if (_fmb) {
+        _fmb.classList.toggle("active", muted);
+        _fmb.style.opacity = m.micOn ? "1" : "0.3";
+        _fmb.style.pointerEvents = m.micOn ? "auto" : "none";
+      }
       // Disable stop button when TTS is off (Text mode)
       stopBtn.style.opacity = m.ttsOn ? "1" : "0.3";
       stopBtn.style.pointerEvents = m.ttsOn ? "auto" : "none";
@@ -4103,6 +4108,7 @@
     let micAnalyser = null;
     let micDataArray = null;
     let micAnimFrame = null;
+    let _preBufferNode = null; // ScriptProcessor for pre-buffer ring — stored for cleanup/disconnect
     let micSmoothLevel = 0;
     let micPeakDecay = 0;
     let talkWaveFrame = null;
@@ -4132,7 +4138,10 @@
 
         // Rolling audio buffer: captures last ~400ms of mic audio continuously
         // so we can prepend pre-trigger speech when recording starts
+        // Disconnect previous ScriptProcessor if re-initializing
+        if (_preBufferNode) { try { _preBufferNode.disconnect(); } catch {} _preBufferNode = null; }
         const bufferNode = audioCtx.createScriptProcessor(4096, 1, 1);
+        _preBufferNode = bufferNode;
         const sampleRate = audioCtx.sampleRate;
         const PRE_BUFFER_SECONDS = 0.4;
         const maxSamples = Math.ceil(sampleRate * PRE_BUFFER_SECONDS);
@@ -5654,13 +5663,16 @@
           }
         }, 120000);
       }
-      // Apply state class with rAF so CSS transitions animate (class swap needs a frame gap)
-      const prevClasses = [...talkBtn.classList];
-      talkBtn.className = state === "idle" ? "" : state; // Set immediately for logic checks below
+      // Apply state class — use classList to preserve flow-overlay classes (flow-long-press, flow-confirm, rec-paused, think-recording)
+      const _talkStateClasses = ["idle-state", "recording", "transcribing", "thinking", "responding", "speaking", "mode-read", "mode-type", "mode-text", "think-mode"];
+      const stateClass = state === "idle" ? "idle-state" : state;
+      _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+      talkBtn.classList.add(stateClass);
       if (state !== "idle") {
         requestAnimationFrame(() => {
           // Re-apply in next frame so transitions fire (skip idle — switch case sets idle-state)
-          talkBtn.className = state;
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add(stateClass);
         });
       }
 
@@ -5677,7 +5689,8 @@
           else hint = thinkMode ? "Think mode — tap to record" : _talkHint;
           talkLabel.textContent = hint;
           talkLabel.className = "talk-label talk-idle-hint";
-          talkBtn.className = "idle-state";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("idle-state");
           if (mode.id === "listen") talkBtn.classList.add("mode-read");
           if (mode.id === "type") talkBtn.classList.add("mode-type");
           if (mode.id === "text") talkBtn.classList.add("mode-text");
@@ -5694,7 +5707,8 @@
         case "recording":
           talkLabel.textContent = "Listening...";
           talkLabel.className = "talk-label talk-wave-label";
-          talkBtn.className = "recording";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("recording");
           setWaveMode("mic");
           startTalkWaveform("#e8856a", micAnalyser, micDataArray);
           setHeaderState("recording", "Recording");
@@ -5709,7 +5723,8 @@
           // "Got it" — instant feedback before Whisper returns
           talkLabel.textContent = "Got it...";
           talkLabel.className = "talk-label";
-          talkBtn.className = "transcribing";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("transcribing");
           // Flow mode: hide live strip, show last text frozen
           if (flowMode) document.body.classList.remove("flow-recording");
           setWaveMode("freeze"); // Freeze/decay last waveform
@@ -5718,7 +5733,8 @@
         case "thinking":
           talkLabel.textContent = "Working... (tap to record next message)";
           talkLabel.className = "talk-label";
-          talkBtn.className = "thinking";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("thinking");
           setWaveMode("thinking");
           startTalkWaveform("#c9a22766", null, null); // synthetic amber
           setHeaderState("thinking", "Claude is thinking...");
@@ -5728,7 +5744,8 @@
         case "responding":
           talkLabel.textContent = "Working... (tap to record next message)";
           talkLabel.className = "talk-label";
-          talkBtn.className = "responding";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("responding");
           setWaveMode("responding");
           startTalkWaveform("#c9a22799", null, null); // synthetic amber, brighter
           setHeaderState("responding", "Claude is responding...");
@@ -5737,7 +5754,8 @@
         case "speaking": {
           talkLabel.textContent = "Speaking... (tap to stop)";
           talkLabel.className = "talk-label talk-wave-label";
-          talkBtn.className = "speaking";
+          _talkStateClasses.forEach(c => talkBtn.classList.remove(c));
+          talkBtn.classList.add("speaking");
           setWaveMode("speaking");
           // TTS analyser may not exist yet — retry briefly until it's created
           const tryStartTtsWave = (attempts) => {
@@ -5814,7 +5832,7 @@
       } else if (state === "blank") {
         if (_bargeInPaused) bargeInResume(); // No speech — resume TTS playback
         talkLabel.textContent = "No speech detected";
-        talkBtn.className = "";
+        ["idle-state","recording","transcribing","thinking","responding","speaking"].forEach(c => talkBtn.classList.remove(c));
         setWaveMode("idle");
         setTimeout(() => setTalkState("idle"), 1500);
       } else if (state === "wake_no_match") {
@@ -5823,7 +5841,7 @@
       } else if (state === "error") {
         setHeaderState("error", "Voice error");
         talkLabel.textContent = "Error";
-        talkBtn.className = "";
+        ["idle-state","recording","transcribing","thinking","responding","speaking"].forEach(c => talkBtn.classList.remove(c));
         setWaveMode("idle");
         setTimeout(() => setTalkState("idle"), 3000);
       }
@@ -6372,7 +6390,7 @@
 
     async function ensureMicStream() {
       if (micStream && micStream.getTracks().every(t => t.readyState === "live")) return micStream;
-      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; micAnalyser = null; micDataArray = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; micAnalyser = null; micDataArray = null; if (_preBufferNode) { try { _preBufferNode.disconnect(); } catch {} _preBufferNode = null; } }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       micStream = stream;
       initMicMeter();
@@ -6510,7 +6528,7 @@
         // Show settings button in Electron, plain message in browser
         if (window.murmurElectron?.openMicSettings) {
           talkLabel.textContent = "🎙 Open Mic Settings";
-          talkBtn.className = "";
+          ["idle-state","recording","transcribing","thinking","responding","speaking"].forEach(c => talkBtn.classList.remove(c));
           talkBtn.onclick = () => {
             window.murmurElectron.openMicSettings();
             talkBtn.onclick = null;
@@ -6519,7 +6537,7 @@
           return; // Leave button clickable — don't auto-reset
         }
         talkLabel.textContent = "Mic access denied";
-        talkBtn.className = "";
+        ["idle-state","recording","transcribing","thinking","responding","speaking"].forEach(c => talkBtn.classList.remove(c));
         setTimeout(() => setTalkState("idle"), 3000);
       }
     }
@@ -7599,6 +7617,7 @@
             micStream = null;
             micAnalyser = null;
             micDataArray = null;
+            if (_preBufferNode) { try { _preBufferNode.disconnect(); } catch {} _preBufferNode = null; }
             _micStoppedForBg = true;
           }
         }

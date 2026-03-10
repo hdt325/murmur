@@ -14,6 +14,7 @@ export class TmuxBackend implements TerminalManager {
   private _session: string;
   private _window: number; // -1 = use active window
   private _paneId: string | null = null; // Pinned pane ID (e.g. "%3") — prevents agent panes stealing focus
+  private _retryTimeout: ReturnType<typeof setTimeout> | null = null; // switchTarget retry timer
   // Track text sent via Murmur text box or STT so passive watcher skips re-detection
   private _sentInputs: Array<{ normalized: string; ts: number }> = [];
 
@@ -28,6 +29,11 @@ export class TmuxBackend implements TerminalManager {
   /** Human-readable session:window label (never a pane ID) */
   get displayTarget(): string {
     return this._window >= 0 ? `${this._session}:${this._window}` : this._session;
+  }
+
+  /** The pinned pane ID (e.g. "%3") or null if pin failed */
+  get pinnedPaneId(): string | null {
+    return this._paneId;
   }
 
   constructor(session = DEFAULT_SESSION) {
@@ -53,18 +59,70 @@ export class TmuxBackend implements TerminalManager {
       if (paneId && paneId.startsWith("%")) {
         this._paneId = paneId;
         console.log(`[tmux] Pinned to pane ${paneId} in ${target}`);
+        return;
       }
-    } catch {
-      console.log(`[tmux] Could not pin pane — will use session target`);
+      console.log(`[tmux] display-message returned unexpected pane ID: "${paneId}" for ${target}`);
+    } catch (err) {
+      // Window index may not exist — fall back to validating and retrying
+      console.log(`[tmux] Could not pin pane for ${this._session}:${this._window} — ${(err as Error).message?.slice(0, 120)} — validating window index`);
+    }
+
+    // Fallback: validate the window index exists, try first available window
+    if (this._window >= 0) {
+      try {
+        const windowList = execFileSync("tmux", [
+          "list-windows", "-t", this._session, "-F", "#{window_index}"
+        ], { encoding: "utf-8", timeout: 3000 }).trim();
+        const validWindows = windowList.split("\n").map(w => parseInt(w.trim())).filter(w => !isNaN(w));
+        if (validWindows.length > 0 && !validWindows.includes(this._window)) {
+          const fallback = validWindows[0];
+          console.log(`[tmux] Window ${this._window} not found in ${this._session} (valid: ${validWindows.join(",")}), falling back to :${fallback}`);
+          this._window = fallback;
+          try {
+            const paneId = execFileSync("tmux", [
+              "display-message", "-t", `${this._session}:${this._window}`, "-p", "#{pane_id}"
+            ], { encoding: "utf-8", timeout: 3000 }).trim();
+            if (paneId && paneId.startsWith("%")) {
+              this._paneId = paneId;
+              console.log(`[tmux] Pinned to fallback pane ${paneId} in ${this._session}:${this._window}`);
+              return;
+            }
+          } catch (err2) {
+            console.log(`[tmux] Fallback pin failed for ${this._session}:${this._window} — ${(err2 as Error).message?.slice(0, 120)}`);
+          }
+        }
+      } catch (err3) {
+        console.log(`[tmux] Could not list windows for ${this._session} — ${(err3 as Error).message?.slice(0, 120)}`);
+      }
     }
   }
 
   /** Switch target to a different session and optional window index. */
   switchTarget(session: string, window = -1): void {
+    // Cancel any pending retry from a previous switchTarget call
+    if (this._retryTimeout) {
+      clearTimeout(this._retryTimeout);
+      this._retryTimeout = null;
+    }
     this._session = session;
     this._window = window;
     this._paneId = null; // Clear pinned pane — re-pin to new target
     this._pinCurrentPane();
+    if (!this._paneId) {
+      console.warn(`[tmux] WARNING: pane pin failed for ${session}:${window} — falling back to session:window target`);
+      // Retry once after a short delay (tmux may be busy)
+      this._retryTimeout = setTimeout(() => {
+        this._retryTimeout = null;
+        if (!this._paneId) {
+          this._pinCurrentPane();
+          if (this._paneId) {
+            console.log(`[tmux] Retry succeeded — pinned to ${this._paneId}`);
+          } else {
+            console.warn(`[tmux] Retry also failed for ${session}:${window}`);
+          }
+        }
+      }, 500);
+    }
   }
 
   /** List all tmux sessions and their windows. */

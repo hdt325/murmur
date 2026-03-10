@@ -441,6 +441,17 @@ git push origin main   # → release.yml + deploy-site.yml
 
 Every bug fix MUST follow this sequence. Do NOT skip steps.
 
+### Step 0: Hypothesize + Gather Evidence BEFORE Diagnosing
+
+**Do NOT jump to a diagnosis.** Form hypotheses, then gather evidence for AND against each one.
+
+1. **List competing hypotheses** — at least 2-3 plausible explanations for the symptom. Never assume the first idea is correct.
+2. **Gather evidence for each hypothesis** — capture raw data: API state, pane content, debug endpoints, WS messages, log output. Save to `/tmp/evidence-*.json` or `.txt`.
+3. **Gather competing evidence** — actively look for data that would DISPROVE each hypothesis. If you can't disprove it, it gains credibility.
+4. **Only diagnose when evidence converges** — the root cause is the hypothesis that (a) all evidence supports AND (b) no evidence contradicts. If evidence is ambiguous, gather more before proceeding.
+
+**Common mistake**: Seeing one piece of data that fits a theory and concluding that's the bug. One data point is not a diagnosis — it's a clue.
+
 ### Step 1: Investigate BEFORE Changing Code
 
 - **Read the full function/module** involved in the bug — not just the line that looks wrong.

@@ -136,6 +136,15 @@ export class PtyBackend implements TerminalManager {
   }
 
   startPipeStream(filePath: string): void {
+    // Validate path: no traversal, no shell metacharacters
+    if (filePath.includes("..")) {
+      console.error(`[pty] Rejected path traversal: ${filePath.slice(0, 80)}`);
+      return;
+    }
+    if (!/^[a-zA-Z0-9._\-\/]+$/.test(filePath)) {
+      console.error(`[pty] Rejected unsafe pipe path: ${filePath.slice(0, 80)}`);
+      return;
+    }
     this.pipeFilePath = filePath;
   }
 

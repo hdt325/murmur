@@ -43,7 +43,12 @@ export function haptic(pattern) {
 
 /** Strip ANSI escape codes from terminal text. */
 export function stripAnsi(str) {
-  return str.replace(/\x1B\[[0-9;]*[A-Za-z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "");
+  return str
+    .replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "")       // CSI sequences (includes ? for DEC private modes)
+    .replace(/\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)/g, "")  // OSC sequences (BEL or ST terminator)
+    .replace(/\x1B[()][A-B0-2]/g, "")               // Charset switching (e.g. \x1B(B, \x1B)0)
+    .replace(/\x1B[#%][A-Za-z0-9]/g, "")            // Line attrs & charset designators
+    .replace(/\x1B[78DMEHNOcn><=]/g, "");            // Single-character escape commands (save/restore cursor, etc.)
 }
 
 /** Platform detection. */

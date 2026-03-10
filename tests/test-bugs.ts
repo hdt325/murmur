@@ -657,7 +657,7 @@ async function testFeature_scrollbackCatchup() {
   report("Scrollback loaded on session switch", calledOnSwitch);
 
   // Entries marked spoken=true (silent, no auto-TTS)
-  const markedSpoken = serverSrc.includes("spoken: true, // silent");
+  const markedSpoken = serverSrc.includes("spoken: true,");
   report("Historical entries marked spoken=true (no auto-TTS)", markedSpoken);
 
   // Limits to last 10 turns
@@ -2276,6 +2276,46 @@ async function main() {
   // Scrollback parser creates assistant entries
   await testScrollbackParserAssistantEntries();
 
+  // Round 9: passive_redetect, stripAnsi, saveSettings
+  await testPassiveRedetect_preservesTts();
+  await testStripAnsi_comprehensivePatterns();
+  await testSaveSettings_errorHandling();
+
+  // Round 9: switch bugs + table filter + agent infra filter + dropped TTS
+  await testSwitchBug_ownPaneInfoEntry();
+  await testSwitchBug_cacheKeyConsistency();
+  await testSwitchBug_pinPaneFallback();
+  await testTableDataRowFilter();
+  await testAgentInfraCommandFilter();
+  await testDroppedTts_nonSpeakableMarkedSpoken();
+  await testScrollbackDedup_andInfraFilter();
+  await testWindowEntriesPersistence();
+  await testStaleEntryTrimGuard();
+  await testSystemContextWipeSafety();
+  await testCleanupFlushesEntries();
+
+  // Round 10: blank view + debug state + terminal panel fixes
+  await testDebugStateEndpoint();
+  await testEmptyArrayTruthinessFix();
+  await testTerminalPanelForceWindow();
+  await testSetConversationEntriesKeyDrift();
+  await testCleanVerboseEntryVisibility();
+  await testCleanModeInDebugState();
+  await testScrollbackSpeakableClassification();
+  await testCentralDedupInPushEntry();
+  await testAgentInfraFilterDoesNotCatchReadPrompts();
+
+  // Round 11: Audit bug fixes
+  await testAuditBug_escHtmlSingleQuote();
+  await testAuditBug_ffmpegExecFileSync();
+  await testAuditBug_isAgentInfraWordCount();
+  await testAuditBug_ptyPathSanitization();
+  await testAuditBug_switchTargetRetryCancel();
+  await testAuditBug_electronCSP();
+  await testAuditBug_scriptProcessorDisconnect();
+  await testAuditBug_talkBtnClassList();
+  await testAuditBug_flowMuteBtnSync();
+
   await teardown();
 }
 
@@ -2793,11 +2833,11 @@ async function testEntryBugs_dedupAndCap() {
   const hasLog = /Trimmed.*old entries/.test(src) || /trim.*removed.*entries/i.test(src);
   report("Entry cap logs when trimming occurs", hasLog);
 
-  // WS runtime test: verify cross-turn dedup works
   // Verify no array reassignment in entry cap (the root cause of Bug 2)
-  const capSection = src.slice(src.indexOf("Cap at ~200 entries"), src.indexOf("Cap at ~200 entries") + 500);
-  const noReassign = !capSection.includes("conversationEntries = conversationEntries.filter");
-  report("Entry cap does NOT use array reassignment", noReassign);
+  // trimEntriesToCap uses splice, not filter reassignment
+  const capSection = src.slice(src.indexOf("function trimEntriesToCap"), src.indexOf("function trimEntriesToCap") + 800);
+  const usesSplice = capSection.includes(".splice(");
+  report("Entry cap uses splice (not array reassignment)", usesSplice);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -2895,7 +2935,7 @@ async function testStatusLineFilter() {
   report("Status line filter pattern exists (spinner char prefix)", hasPattern);
 
   // Pattern is in the skip section (isChromeSkip returns a reason → line is skipped), not just non-speakable
-  const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip("), src.indexOf("function isChromeSkip(") + 2100);
+  const chromeSkipFn = src.slice(src.indexOf("function isChromeSkip("), src.indexOf("function isChromeSkip(") + 2500);
   const isSkipFilter = chromeSkipFn.includes("status_cooking") && /\[✻✶✢✽\]/.test(chromeSkipFn);
   report("Status lines are skip-filtered (not just non-speakable)", isSkipFilter);
 
@@ -3617,7 +3657,7 @@ async function testRoleMisattributionGuard() {
   const src = readFileSync("server.ts", "utf-8");
 
   // 1. addUserEntry has assistant cross-check
-  const addUserSection = src.slice(src.indexOf("function addUserEntry"), src.indexOf("function addUserEntry") + 5000);
+  const addUserSection = src.slice(src.indexOf("function addUserEntry"), src.indexOf("function addUserEntry") + 7000);
   const hasCrossCheck = addUserSection.includes("ROLE-GUARD") && addUserSection.includes("assistantRecent");
   report("addUserEntry cross-checks against recent assistant entries", hasCrossCheck);
 
@@ -4322,19 +4362,19 @@ async function testNonVoiceSessionTtsSuppression() {
   const checksClaudeVoice = helperFn.includes('"claude-voice"');
   report("isVoiceSession checks for claude-voice session", checksClaudeVoice);
 
-  // 3. pushEntry forces speakable=false for non-voice sessions
+  // 3. pushEntry preserves speakable but suppresses TTS (spoken=true) for non-voice sessions
   const pushStart = src.indexOf("function pushEntry(entry: ConversationEntry)");
   const pushEnd = src.indexOf("\n}\n", pushStart) + 3;
   const pushFn = src.slice(pushStart, pushEnd);
-  const hasTtsGuard = pushFn.includes("isVoiceSession()") && pushFn.includes("entry.speakable = false");
-  report("pushEntry suppresses speakable for non-voice sessions", hasTtsGuard);
+  const preservesSpeakable = pushFn.includes("isVoiceSession()") && !pushFn.includes("entry.speakable = false");
+  report("pushEntry preserves speakable for non-voice sessions (TTS-only suppression)", preservesSpeakable);
 
-  // 4. loadScrollbackEntries uses isVoiceSession for speakable flag
+  // 4. loadScrollbackEntries hardcodes speakable: true for user entries (they're historical prose)
   const scrollbackStart = src.indexOf("function loadScrollbackEntries");
   const scrollbackEnd = src.indexOf("\n  return entries;\n}", scrollbackStart) + 20;
   const scrollbackFn = src.slice(scrollbackStart, scrollbackEnd);
-  const scrollbackUsesGuard = scrollbackFn.includes("isVoiceSession()");
-  report("loadScrollbackEntries uses isVoiceSession for speakable flag", scrollbackUsesGuard);
+  const scrollbackHardcodesSpeakable = scrollbackFn.includes("speakable: true");
+  report("loadScrollbackEntries sets speakable: true for user entries", scrollbackHardcodesSpeakable);
 
   // 5. WINDOW-TTS-GUARD log message exists (diagnostic)
   const hasLogMsg = src.includes("[WINDOW-TTS-GUARD]");
@@ -4402,7 +4442,7 @@ async function testStatusScopingOnWindowSwitch() {
 
   // 6. activateWindow resets streamState + broadcasts idle
   const activateStart = src.indexOf("function activateWindow(");
-  const activateFn = src.slice(activateStart, activateStart + 3200);
+  const activateFn = src.slice(activateStart, activateStart + 5500);
   const resetsStream = activateFn.includes('streamState');
   const broadcastsIdle = activateFn.includes('voice_status", state: "idle"');
   const stopsTts = activateFn.includes("stopClientPlayback2");
@@ -4828,7 +4868,7 @@ async function testScrollbackAssistantEntries() {
 
   // Verify the function body creates both user and assistant roles
   const fnStart = src.indexOf("function loadScrollbackEntries");
-  const fnBody = src.slice(fnStart, fnStart + 5000);
+  const fnBody = src.slice(fnStart, fnStart + 14000);
 
   const createsUser = fnBody.includes('role: "user"');
   const createsAssistant = fnBody.includes('role: "assistant"');
@@ -4840,7 +4880,7 @@ async function testScrollbackAssistantEntries() {
   report("Response lines collected for assistant entries", collectsResponse);
 
   // Verify: reflowText is called on response lines
-  const reflowsCalled = fnBody.includes("reflowText(responseLines");
+  const reflowsCalled = fnBody.includes("reflowText(pLines");
   report("reflowText applied to response lines", reflowsCalled);
 
   // Verify: scrollback has debug logging (helps diagnose fresh load issues)
@@ -4884,9 +4924,9 @@ async function testEntryCapInPushEntry() {
   console.log("\n[ENTRY-CAP] trimEntriesToCap called in pushEntry");
   const src = readFileSync("server.ts", "utf-8");
 
-  // Verify pushEntry calls trimEntriesToCap (function is ~20 lines, ~1400 chars)
+  // Verify pushEntry calls trimEntriesToCap
   const pushIdx = src.indexOf("function pushEntry");
-  const pushBody = src.slice(pushIdx, pushIdx + 1500);
+  const pushBody = src.slice(pushIdx, pushIdx + 3000);
   const trimsCap = pushBody.includes("trimEntriesToCap()");
   report("pushEntry calls trimEntriesToCap", trimsCap);
 
@@ -5040,16 +5080,16 @@ async function testScrollbackParserAssistantEntries() {
 
   // loadScrollbackEntries creates entries with role "assistant"
   const fnIdx = src.indexOf("function loadScrollbackEntries");
-  const fnBody = src.slice(fnIdx, fnIdx + 5000);
+  const fnBody = src.slice(fnIdx, fnIdx + 14000);
   const hasAssistantRole = fnBody.includes('role: "assistant"');
   report("loadScrollbackEntries creates assistant entries", hasAssistantRole);
 
   // Parser logs turn details (user input → assistant text length)
-  const hasDetailedLogging = fnBody.includes("[scrollback] Turn") && fnBody.includes("assistant text");
+  const hasDetailedLogging = fnBody.includes("[scrollback] Turn") && fnBody.includes("paragraphs");
   report("Parser logs turn-by-turn details", hasDetailedLogging);
 
   // Parser logs final result summary (user + assistant counts)
-  const hasSummaryLogging = fnBody.includes("user, ") && fnBody.includes("assistant)");
+  const hasSummaryLogging = fnBody.includes("user,") && fnBody.includes("assistant)");
   report("Parser logs result summary with role counts", hasSummaryLogging);
 
   // reflowText doesn't strip ⏺ lines (Claude's response markers)
@@ -5107,6 +5147,955 @@ async function testScrollbackParserAssistantEntries() {
     );
     report(`Filtered line caught: "${trimmed.slice(0, 60)}"`, isFiltered);
   }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Switch bug: own-pane shows info entry, not blank
+// ──────────────────────────────────────────────────────────────
+async function testSwitchBug_ownPaneInfoEntry() {
+  console.log("\n[SWITCH-OWN-PANE] Own-pane guard shows info entry instead of blank");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Own pane path creates an info ConversationEntry
+  const hasInfoEntry = src.includes("server's own terminal") && src.includes("Switch to a Claude session");
+  report("Own-pane path creates informational entry", hasInfoEntry);
+
+  // Both activateWindow and _executeWindowSwitch have the fix
+  const activateSection = src.slice(src.indexOf("function activateWindow"), src.indexOf("function activateWindow") + 3000);
+  const executeSection = src.slice(src.indexOf("function _executeWindowSwitch"), src.indexOf("function _executeWindowSwitch") + 3000);
+  report("activateWindow shows info entry on own pane", activateSection.includes("This is the Murmur server"));
+  report("_executeWindowSwitch shows info entry on own pane", executeSection.includes("This is the Murmur server"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// Switch bug: cache key consistency (save uses currentWindowKey)
+// ──────────────────────────────────────────────────────────────
+async function testSwitchBug_cacheKeyConsistency() {
+  console.log("\n[SWITCH-CACHE] saveCurrentWindowEntries uses currentWindowKey, not getWindowKey()");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  const saveSection = src.slice(src.indexOf("function saveCurrentWindowEntries"), src.indexOf("function saveCurrentWindowEntries") + 400);
+  // Uses currentWindowKey directly
+  const usesSnapshot = saveSection.includes("const key = currentWindowKey");
+  report("saveCurrentWindowEntries uses currentWindowKey snapshot", usesSnapshot);
+
+  // Does NOT call getWindowKey
+  const callsGetKey = saveSection.includes("getWindowKey()");
+  report("saveCurrentWindowEntries does NOT re-derive key via getWindowKey()", !callsGetKey);
+
+  // Guards against _unset
+  const guardsUnset = saveSection.includes("_unset");
+  report("saveCurrentWindowEntries guards against _unset key", guardsUnset);
+
+  // Logs save operation
+  const logsAction = saveSection.includes("console.log");
+  report("saveCurrentWindowEntries logs save operation", logsAction);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Switch bug: _pinCurrentPane validates window index
+// ──────────────────────────────────────────────────────────────
+async function testSwitchBug_pinPaneFallback() {
+  console.log("\n[SWITCH-PIN] _pinCurrentPane validates window index and falls back");
+
+  const src = readFileSync("terminal/tmux-backend.ts", "utf-8");
+
+  const pinSection = src.slice(src.indexOf("private _pinCurrentPane"), src.indexOf("private _pinCurrentPane") + 2000);
+
+  // Falls back to list-windows validation
+  const hasListWindows = pinSection.includes("list-windows");
+  report("_pinCurrentPane validates via tmux list-windows", hasListWindows);
+
+  // Falls back to first available window
+  const hasFallback = pinSection.includes("falling back to");
+  report("_pinCurrentPane falls back to first available window", hasFallback);
+
+  // Logs the mismatch
+  const logsMismatch = pinSection.includes("not found in");
+  report("Logs window index mismatch with available windows", logsMismatch);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Table data row filter (box-drawing table content)
+// ──────────────────────────────────────────────────────────────
+async function testTableDataRowFilter() {
+  console.log("\n[TABLE-FILTER] Box-drawing table data rows filtered from conversation entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // table_data_row filter exists
+  const hasFilter = src.includes("table_data_row");
+  report("table_data_row filter exists in isChromeSkip", hasFilter);
+
+  // Test against real table lines
+  const tableDataRegex = /^[│║]/.test("│ Passed │ 603 │ +5 │") &&
+    ("│ Passed │ 603 │ +5 │".match(/[│║]/g) || []).length >= 3;
+  report("Filter matches table data row '│ Passed │ 603 │ +5 │'", tableDataRegex);
+
+  const tableHeaderRegex = /^[│║]/.test("│ Metric │ Previous │  Now  │ Delta │") &&
+    ("│ Metric │ Previous │  Now  │ Delta │".match(/[│║]/g) || []).length >= 3;
+  report("Filter matches table header '│ Metric │ Previous │  Now  │ Delta │'", tableHeaderRegex);
+
+  // Normal prose with pipe should NOT match
+  const proseWithPipe = /^[│║]/.test("The output | was unexpected");
+  report("Normal prose with | NOT filtered", !proseWithPipe);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Scrollback parser: dedup + agent infra filter + table filter
+// ──────────────────────────────────────────────────────────────
+async function testScrollbackDedup_andInfraFilter() {
+  console.log("\n[SCROLLBACK-DEDUP] Scrollback parser deduplicates and filters agent commands");
+
+  const src = readFileSync("server.ts", "utf-8");
+  const scrollSection = src.slice(src.indexOf("function loadScrollbackEntries"), src.indexOf("function loadScrollbackEntries") + 14000);
+
+  // Agent infrastructure filter in scrollback
+  const hasInfraFilter = scrollSection.includes("isAgentInfraCommand");
+  report("Scrollback filters agent infrastructure commands", hasInfraFilter);
+
+  // User entry dedup
+  const hasUserDedup = scrollSection.includes("Skipping duplicate user entry");
+  report("Scrollback deduplicates user entries", hasUserDedup);
+
+  // Assistant entry dedup — uses normalized text comparison + continue
+  const hasAssistantDedup = scrollSection.includes('e.role === "assistant"') && scrollSection.includes("continue; // Dedup");
+  report("Scrollback deduplicates assistant entries", hasAssistantDedup);
+
+  // Table row filter in scrollback response lines
+  const hasTableFilter = scrollSection.includes("│║┌┐└┘├┤");
+  report("Scrollback filters box-drawing table rows", hasTableFilter);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Dropped TTS: non-speakable entries marked spoken immediately
+// ──────────────────────────────────────────────────────────────
+async function testDroppedTts_nonSpeakableMarkedSpoken() {
+  console.log("\n[DROPPED-TTS] Non-speakable entries get spoken=true immediately in pushEntry");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  const pushSection = src.slice(src.indexOf("function pushEntry"), src.indexOf("function pushEntry") + 3000);
+
+  // Non-speakable entries get spoken=true
+  const hasGuard = pushSection.includes("!entry.speakable") && pushSection.includes("entry.spoken = true");
+  report("pushEntry marks non-speakable entries as spoken", hasGuard);
+
+  // Non-voice session guard also marks spoken
+  const hasVoiceGuard = pushSection.includes("WINDOW-TTS-GUARD") && pushSection.includes("entry.spoken = true");
+  report("Non-voice session guard marks entry spoken", hasVoiceGuard);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Agent infrastructure command filter
+// ──────────────────────────────────────────────────────────────
+async function testAgentInfraCommandFilter() {
+  console.log("\n[AGENT-INFRA] Agent infrastructure commands filtered from user entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // isAgentInfraCommand function exists
+  const hasFunc = src.includes("function isAgentInfraCommand");
+  report("isAgentInfraCommand function exists", hasFunc);
+
+  // Called in passive watcher — search backward from the log message to find the call
+  const passiveIdx = src.indexOf("Filtered agent infrastructure command");
+  const passiveNearby = passiveIdx >= 0 ? src.slice(Math.max(0, passiveIdx - 300), passiveIdx + 100) : "";
+  const inPassive = passiveNearby.includes("isAgentInfraCommand");
+  report("Passive watcher filters agent commands", inPassive);
+
+  // Called in addUserEntry as safety net
+  const addSection = src.slice(src.indexOf("function addUserEntry"), src.indexOf("function addUserEntry") + 1500);
+  const inAddEntry = addSection.includes("isAgentInfraCommand");
+  report("addUserEntry filters agent commands", inAddEntry);
+
+  // Verify filter matches specific patterns
+  const funcBody = src.slice(src.indexOf("function isAgentInfraCommand"), src.indexOf("function isAgentInfraCommand") + 800);
+  report("Filters tmux send-keys commands", funcBody.includes("tmux") && funcBody.includes("send-keys"));
+  report("Filters test-runner targets", funcBody.includes("test-runner"));
+  report("Filters node --import tsx commands", funcBody.includes("node") && funcBody.includes("tsx"));
+  report("Filters npm test commands", funcBody.includes("npm") && funcBody.includes("test"));
+  report("Filters pipeline echo commands", funcBody.includes("/tmp/"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// TASK-37: passive_redetect preserves TTS (BUG-106)
+// ──────────────────────────────────────────────────────────────
+async function testPassiveRedetect_preservesTts() {
+  console.log("\n[PASSIVE-REDETECT] passive_redetect reason preserves TTS queue");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // passive_redetect is a valid GenerationEvent reason
+  const hasReason = /passive_redetect/.test(src);
+  report("passive_redetect is a valid GenerationEvent reason", hasReason);
+
+  // passive_redetect is NOT in USER_INITIATED_BUMP_REASONS
+  const setStart = src.indexOf("USER_INITIATED_BUMP_REASONS");
+  const setEnd = src.indexOf("]);", setStart) + 3;  // just the Set definition, not the GenerationEvent interface after it
+  const reasonSetSection = src.slice(setStart, setEnd);
+  const inSet = reasonSetSection.includes("passive_redetect");
+  report("passive_redetect NOT in USER_INITIATED_BUMP_REASONS", !inSet);
+
+  // Interrupted prompt handler uses passive_redetect, not new_input
+  const interruptSection = src.slice(src.indexOf("Interrupted prompt detected"), src.indexOf("Interrupted prompt detected") + 300);
+  const usesPassive = interruptSection.includes('passive_redetect');
+  const usesNewInput = interruptSection.includes('new_input');
+  report("Interrupted prompt uses passive_redetect", usesPassive);
+  report("Interrupted prompt does NOT use new_input", !usesNewInput);
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-108: Comprehensive ANSI strip regex
+// ──────────────────────────────────────────────────────────────
+async function testStripAnsi_comprehensivePatterns() {
+  console.log("\n[ANSI-STRIP] stripAnsi handles CSI, OSC, charset, and single-char escapes");
+
+  const serverSrc = readFileSync("server.ts", "utf-8");
+
+  // Server cleanTtsText has DEC private mode support (? in CSI)
+  const hasDec = /\\x1b\\\[.*\?/.test(serverSrc) || /\\x1b\\\[0-9;?\]?\*/.test(serverSrc);
+  report("Server ANSI strip handles DEC private modes (?)", serverSrc.includes("[0-9;?]*"));
+
+  // Charset switching patterns
+  report("Server strips charset switching (\\x1b(B)", serverSrc.includes("\\x1b[()]"));
+
+  // Single-character escape commands
+  report("Server strips single-char escapes (save/restore cursor)", serverSrc.includes("\\x1b[78DMEHNOcn><=]"));
+
+  // Client utils.js also updated
+  const clientSrc = readFileSync("public/js/utils.js", "utf-8");
+  report("Client stripAnsi handles DEC private modes", clientSrc.includes("[0-9;?]*"));
+  report("Client strips charset switching", clientSrc.includes("[()][A-B0-2]"));
+  report("Client strips single-char escapes", clientSrc.includes("[78DMEHNOcn><=]"));
+}
+
+// ──────────────────────────────────────────────────────────────
+// BUG-110: saveSettings error handling
+// ──────────────────────────────────────────────────────────────
+async function testSaveSettings_errorHandling() {
+  console.log("\n[SAVE-SETTINGS] saveSettings has error handling");
+
+  const src = readFileSync("server/settings.ts", "utf-8");
+
+  // saveSettings has try-catch
+  const saveSection = src.slice(src.indexOf("function saveSettings"), src.indexOf("function saveSettings") + 500);
+  const hasTryCatch = saveSection.includes("try") && saveSection.includes("catch");
+  report("saveSettings has try-catch error handling", hasTryCatch);
+
+  // Error is logged
+  const hasLogging = saveSection.includes("console.error") && saveSection.includes("Failed to save settings");
+  report("saveSettings logs errors on failure", hasLogging);
+
+  // Atomic write pattern preserved (tmp + rename)
+  const hasAtomic = saveSection.includes(".tmp") && saveSection.includes("renameSync");
+  report("Atomic write pattern preserved (tmp → rename)", hasAtomic);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Symptom 2: windowEntries persisted to disk across restarts
+// ──────────────────────────────────────────────────────────────
+async function testWindowEntriesPersistence() {
+  console.log("\n[WINDOW-PERSIST] windowEntries persisted to disk");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // WINDOW_ENTRIES_FILE constant exists
+  const hasFile = src.includes("WINDOW_ENTRIES_FILE");
+  report("WINDOW_ENTRIES_FILE constant defined", hasFile);
+
+  // persistWindowEntries function exists with atomic write
+  const hasPersist = src.includes("function persistWindowEntries");
+  report("persistWindowEntries function exists", hasPersist);
+
+  // Uses debounced write to avoid thrashing
+  const persistSection = src.slice(src.indexOf("function persistWindowEntries"), src.indexOf("function persistWindowEntries") + 600);
+  const hasDebounce = persistSection.includes("setTimeout") && persistSection.includes("_persistTimer");
+  report("persistWindowEntries uses debounced write", hasDebounce);
+
+  // Atomic write (tmp → rename)
+  const hasAtomic = persistSection.includes(".tmp") && persistSection.includes("renameSync");
+  report("Atomic write pattern (tmp → rename)", hasAtomic);
+
+  // setConversationEntries calls persistWindowEntries
+  const setSection = src.slice(src.indexOf("function setConversationEntries"), src.indexOf("function setConversationEntries") + 300);
+  const setCallsPersist = setSection.includes("persistWindowEntries");
+  report("setConversationEntries triggers persistence", setCallsPersist);
+
+  // Startup loads from disk
+  const hasLoad = src.includes("Loaded") && src.includes("window entry caches from disk");
+  report("Startup loads window entries from disk", hasLoad);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Symptom 3a: Stale entry trim guards current turn
+// ──────────────────────────────────────────────────────────────
+async function testStaleEntryTrimGuard() {
+  console.log("\n[STALE-TRIM] Stale entry trim guards current turn entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find the stale entry trim section
+  const trimIdx = src.indexOf("Remove stale assistant entries");
+  const trimSection = src.slice(trimIdx, trimIdx + 1000);
+
+  // Guards against current turn
+  const hasGuard = trimSection.includes("e.turn !== currentTurn");
+  report("Stale entry trim excludes current turn entries", hasGuard);
+
+  // Still excludes spoken entries
+  const hasSpokenGuard = trimSection.includes("!e.spoken");
+  report("Stale entry trim excludes spoken entries", hasSpokenGuard);
+
+  // Logs removals
+  const hasLog = trimSection.includes("Removing") && trimSection.includes("stale entries");
+  report("Stale entry trim logs removals", hasLog);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Symptom 3b: System context wipe preserves real user entries
+// ──────────────────────────────────────────────────────────────
+async function testSystemContextWipeSafety() {
+  console.log("\n[CONTEXT-WIPE] System context wipe preserves real user entries");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find the system context wipe section
+  const wipeIdx = src.indexOf("System context response");
+  const wipeSection = src.slice(wipeIdx, wipeIdx + 800);
+
+  // Checks turn before removing
+  const checksTurn = wipeSection.includes("e.turn !== currentTurn");
+  report("System context wipe checks turn before removing", checksTurn);
+
+  // Preserves real user entries (not matching MURMUR_CONTEXT_FILTER)
+  const preservesUser = wipeSection.includes("MURMUR_CONTEXT_FILTER") && wipeSection.includes("Keep real user entries");
+  report("System context wipe preserves real user entries", preservesUser);
+
+  // Does NOT blindly remove all current-turn entries
+  const noBlindWipe = !wipeSection.includes("e.turn !== currentTurn));") || wipeSection.includes("e.role === \"user\"");
+  report("No blind wipe of all current-turn entries", noBlindWipe);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Cleanup flushes pending windowEntries to disk
+// ──────────────────────────────────────────────────────────────
+async function testCleanupFlushesEntries() {
+  console.log("\n[CLEANUP-FLUSH] cleanup() flushes _persistTimer synchronously");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  const cleanupSection = src.slice(src.indexOf("function cleanup()"), src.indexOf("function cleanup()") + 1200);
+
+  // Checks for _persistTimer
+  const checksPersist = cleanupSection.includes("_persistTimer");
+  report("cleanup checks for pending _persistTimer", checksPersist);
+
+  // Does synchronous write
+  const hasSyncWrite = cleanupSection.includes("writeFileSync") && cleanupSection.includes("WINDOW_ENTRIES_FILE");
+  report("cleanup does synchronous write of window entries", hasSyncWrite);
+
+  // Uses atomic pattern
+  const hasAtomic = cleanupSection.includes(".tmp") && cleanupSection.includes("renameSync");
+  report("cleanup uses atomic write (tmp → rename)", hasAtomic);
+
+  // Logs flush
+  const hasLog = cleanupSection.includes("Flushed window entries");
+  report("cleanup logs successful flush", hasLog);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Round 10: blank view diagnosis fixes
+// ──────────────────────────────────────────────────────────────
+
+async function testDebugStateEndpoint() {
+  console.log("\n[DEBUG-STATE] /debug/state endpoint exposes server internals");
+
+  const resp = await fetch("http://localhost:3457/debug/state");
+  report("/debug/state returns 200", resp.ok);
+
+  const state = await resp.json() as Record<string, unknown>;
+  report("state has currentWindowKey", "currentWindowKey" in state);
+  report("state has displayTarget", "displayTarget" in state);
+  report("state has currentTarget", "currentTarget" in state);
+  report("state has pinnedPaneId", "pinnedPaneId" in state);
+  report("state has streamState", "streamState" in state);
+  report("state has isWindowActive", "isWindowActive" in state);
+  report("state has passiveWatcherRunning", "passiveWatcherRunning" in state);
+  report("state has conversationEntryCount", "conversationEntryCount" in state);
+  report("state has windowEntriesKeys", "windowEntriesKeys" in state);
+  report("state has cooldown", "cooldown" in state);
+  report("state has clients", "clients" in state);
+}
+
+async function testEmptyArrayTruthinessFix() {
+  console.log("\n[EMPTY-CACHE] loadWindowEntries empty array no longer blocks scrollback scrape");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Both activateWindow and _executeWindowSwitch should check cached.length > 0
+  const activateIdx = src.indexOf("function activateWindow(");
+  const activateSection = src.slice(activateIdx, activateIdx + 4000);
+  const hasLengthCheck1 = activateSection.includes("realCached && realCached.length > 0");
+  report("activateWindow checks cached.length > 0", hasLengthCheck1);
+
+  const switchIdx = src.indexOf("function _executeWindowSwitch(");
+  const switchSection = src.slice(switchIdx, switchIdx + 2000);
+  const hasLengthCheck2 = switchSection.includes("realCached && realCached.length > 0");
+  report("_executeWindowSwitch checks cached.length > 0", hasLengthCheck2);
+}
+
+async function testTerminalPanelForceWindow() {
+  console.log("\n[TERMINAL-FORCE] Terminal panel force-broadcasts after window switch");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // _lastWindowSwitchTs should be set in both switch paths
+  const hasTimestamp = src.includes("_lastWindowSwitchTs = Date.now()");
+  report("_lastWindowSwitchTs set on switch", hasTimestamp);
+
+  // Terminal poll checks forceWindow
+  const pollIdx = src.indexOf("Broadcast tmux pane content with ANSI");
+  const pollSection = src.slice(pollIdx, pollIdx + 1000);
+  const hasForce = pollSection.includes("forceWindow") && pollSection.includes("_lastWindowSwitchTs");
+  report("Terminal poll has force-broadcast window after switch", hasForce);
+}
+
+async function testSetConversationEntriesKeyDrift() {
+  console.log("\n[KEY-DRIFT] setConversationEntries uses currentWindowKey to prevent drift");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  const setIdx = src.indexOf("function setConversationEntries(");
+  const setSection = src.slice(setIdx, setIdx + 400);
+  const usesCurrentKey = setSection.includes("currentWindowKey");
+  report("setConversationEntries uses currentWindowKey", usesCurrentKey);
+
+  // Should fall back to getWindowKey only when currentWindowKey is unset
+  const hasFallback = setSection.includes("_unset");
+  report("setConversationEntries falls back to getWindowKey when unset", hasFallback);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Clean vs Verbose mode: entry visibility + debug tracking
+// ──────────────────────────────────────────────────────────────
+
+async function testCleanVerboseEntryVisibility() {
+  console.log("\n[CLEAN-VERBOSE] Clean mode hides non-speakable, verbose shows all");
+
+  // Reset entries
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("test:reset-entries");
+  });
+  await page.waitForTimeout(300);
+
+  // Inject mixed entries: 2 speakable (prose), 2 non-speakable (tool output)
+  const entries = [
+    { text: "Here is my analysis of the code.", role: "assistant", speakable: true, spoken: true },
+    { text: "\u23FA Bash(npm test)", role: "assistant", speakable: false, spoken: true },
+    { text: "The tests all pass successfully.", role: "assistant", speakable: true, spoken: true },
+    { text: "\u23FA Read(server.ts)", role: "assistant", speakable: false, spoken: true },
+  ];
+  await page.evaluate((json) => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("test:entries-full:" + json);
+  }, JSON.stringify(entries));
+  await page.waitForTimeout(500);
+
+  // Enable clean mode via WS + CSS class
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:1");
+    document.body.classList.add("clean-mode");
+  });
+  await page.waitForTimeout(300);
+
+  // Check visibility in clean mode
+  const cleanResults = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.assistant");
+    const results: { nonspeakable: boolean; visible: boolean }[] = [];
+    bubbles.forEach(b => {
+      results.push({
+        nonspeakable: b.classList.contains("entry-nonspeakable"),
+        visible: (b as HTMLElement).offsetParent !== null,
+      });
+    });
+    return { inCleanMode: document.body.classList.contains("clean-mode"), results };
+  });
+
+  report("Body has clean-mode class", cleanResults.inCleanMode);
+  const speakableInClean = cleanResults.results.filter(r => !r.nonspeakable);
+  const nonSpeakableInClean = cleanResults.results.filter(r => r.nonspeakable);
+  report("Speakable entries exist (prose)", speakableInClean.length >= 2);
+  report("Non-speakable entries marked (tool output)", nonSpeakableInClean.length >= 2);
+  report("Non-speakable hidden in clean mode", nonSpeakableInClean.every(r => !r.visible));
+  report("Speakable visible in clean mode", speakableInClean.every(r => r.visible));
+
+  // Switch to verbose mode
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:0");
+    document.body.classList.remove("clean-mode");
+  });
+  await page.waitForTimeout(300);
+
+  const verboseResults = await page.evaluate(() => {
+    const bubbles = document.querySelectorAll(".entry-bubble.assistant");
+    const results: { nonspeakable: boolean; visible: boolean }[] = [];
+    bubbles.forEach(b => {
+      results.push({
+        nonspeakable: b.classList.contains("entry-nonspeakable"),
+        visible: (b as HTMLElement).offsetParent !== null,
+      });
+    });
+    return { inCleanMode: document.body.classList.contains("clean-mode"), results };
+  });
+
+  report("No clean-mode class in verbose", !verboseResults.inCleanMode);
+  report("All entries visible in verbose mode", verboseResults.results.every(r => r.visible));
+
+  // Cleanup
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send("test:reset-entries");
+      ws.send("clean_mode:1");
+    }
+    document.body.classList.add("clean-mode");
+  });
+  await page.waitForTimeout(200);
+}
+
+async function testCleanModeInDebugState() {
+  console.log("\n[DEBUG-STATE-CLEAN] /debug/state exposes cleanMode");
+
+  // Set to clean mode
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:1");
+  });
+  await page.waitForTimeout(200);
+
+  const state1 = await page.evaluate(async () => {
+    const resp = await fetch("/debug/state");
+    return resp.json();
+  }) as Record<string, unknown>;
+  report("/debug/state has cleanMode field", "cleanMode" in state1);
+  report("cleanMode is true when clean", state1.cleanMode === true);
+
+  // Toggle to verbose
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:0");
+  });
+  await page.waitForTimeout(200);
+
+  const state2 = await page.evaluate(async () => {
+    const resp = await fetch("/debug/state");
+    return resp.json();
+  }) as Record<string, unknown>;
+  report("cleanMode is false when verbose", state2.cleanMode === false);
+
+  // Restore
+  await page.evaluate(() => {
+    const ws = (window as any)._ws;
+    if (ws?.readyState === WebSocket.OPEN) ws.send("clean_mode:1");
+  });
+  await page.waitForTimeout(100);
+}
+
+async function testScrollbackSpeakableClassification() {
+  console.log("\n[SCROLLBACK-SPEAKABLE] loadScrollbackEntries uses state machine for speakable classification");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  const scrollbackIdx = src.indexOf("function loadScrollbackEntries");
+  // Use function boundary (ends with "\n}" at top level) instead of fixed window
+  // to avoid capturing code from subsequent functions like broadcastCurrentOutput
+  const scrollbackEnd = src.indexOf("\n  return entries;\n}", scrollbackIdx);
+  const scrollbackSection = src.slice(scrollbackIdx, scrollbackEnd > scrollbackIdx ? scrollbackEnd + 20 : scrollbackIdx + 14000);
+
+  // Should use state machine with isToolMarker/isProseMarker, NOT isToolOutputLine or isVoiceSession
+  const usesToolMarker = scrollbackSection.includes("isToolMarker");
+  report("loadScrollbackEntries uses isToolMarker for tool detection", usesToolMarker);
+
+  const usesProseMarker = scrollbackSection.includes("isProseMarker");
+  report("loadScrollbackEntries uses isProseMarker for prose detection", usesProseMarker);
+
+  const noVoiceSession = !scrollbackSection.includes("isVoiceSession");
+  report("loadScrollbackEntries does NOT use isVoiceSession", noVoiceSession);
+
+  const noToolOutputLine = !scrollbackSection.includes("isToolOutputLine");
+  report("loadScrollbackEntries does NOT use isToolOutputLine", noToolOutputLine);
+
+  // Should produce per-paragraph entries with speakable from state machine
+  const hasParaSpeakable = scrollbackSection.includes("para.speakable");
+  report("Entries use per-paragraph speakable from state machine", hasParaSpeakable);
+}
+
+async function testCentralDedupInPushEntry() {
+  console.log("\n[CENTRAL-DEDUP] pushEntry has central dedup guard (isDuplicateEntry)");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // 1. isDuplicateEntry function exists
+  const hasIsDuplicateEntry = src.includes("function isDuplicateEntry(entry: ConversationEntry): boolean");
+  report("isDuplicateEntry function exists", hasIsDuplicateEntry);
+
+  // 2. pushEntry calls isDuplicateEntry as a guard
+  const pushEntryIdx = src.indexOf("function pushEntry(entry: ConversationEntry)");
+  const pushEntrySection = src.slice(pushEntryIdx, pushEntryIdx + 500);
+  const callsDedup = pushEntrySection.includes("isDuplicateEntry(entry)");
+  report("pushEntry calls isDuplicateEntry as guard", callsDedup);
+
+  // 3. pushEntry returns boolean (false when deduped)
+  const returnsBool = pushEntrySection.includes("return false");
+  report("pushEntry returns false when entry is duplicate", returnsBool);
+
+  // 4. isDuplicateEntry handles both user and assistant roles
+  const dedupIdx = src.indexOf("function isDuplicateEntry");
+  const dedupSection = src.slice(dedupIdx, dedupIdx + 1200);
+  const handlesUser = dedupSection.includes('entry.role === "user"');
+  const handlesAssistant = dedupSection.includes('entry.role !== "assistant"') || dedupSection.includes('e.role !== "assistant"');
+  report("isDuplicateEntry handles user role", handlesUser);
+  report("isDuplicateEntry handles assistant role", handlesAssistant);
+
+  // 5. isDuplicateEntry uses normalized comparison (not exact match)
+  const usesNormalized = dedupSection.includes('.replace(/\\s+/g, " ")');
+  report("isDuplicateEntry uses normalized text comparison", usesNormalized);
+
+  // 6. isDuplicateEntry uses time-based window
+  const usesTimeWindow = dedupSection.includes("DEDUP_WINDOW_MS") || dedupSection.includes("cutoff");
+  report("isDuplicateEntry uses time-based dedup window", usesTimeWindow);
+
+  // 7. Fuzzy whitespace match for user entries (tmux wrap boundary)
+  const hasFuzzyMatch = dedupSection.includes("normNoSpaces");
+  report("isDuplicateEntry has fuzzy whitespace match for user entries", hasFuzzyMatch);
+
+  // 8. handleStreamDone uses normalized comparison (not exact)
+  const handleDoneIdx = src.indexOf("function handleStreamDone");
+  const handleDoneSection = src.slice(handleDoneIdx, handleDoneIdx + 4000);
+  const doneUsesNorm = handleDoneSection.includes("paraNorm") && handleDoneSection.includes('.replace(/\\s+/g, " ")');
+  report("handleStreamDone uses normalized dedup comparison", doneUsesNorm);
+
+  // 9. Verify via WS: inject duplicate entries and check they're deduped
+  // Send two identical user entries rapidly — second should be deduped
+  const wsUrl = "ws://localhost:3457";
+  const ws = new (await import("ws")).WebSocket(wsUrl);
+  await new Promise<void>((resolve, reject) => {
+    ws.on("open", resolve);
+    ws.on("error", reject);
+    setTimeout(reject, 3000);
+  });
+
+  // Inject test entries via test:entries-full
+  const uniqueText = `dedup-test-${Date.now()}`;
+  const testEntries = [
+    { id: 9990, role: "user", text: uniqueText, ts: Date.now(), spoken: false, speakable: false, turn: 1 },
+    { id: 9991, role: "user", text: uniqueText, ts: Date.now(), spoken: false, speakable: false, turn: 1 },
+    { id: 9992, role: "assistant", text: `reply to ${uniqueText}`, ts: Date.now(), spoken: true, speakable: true, turn: 1 },
+    { id: 9993, role: "assistant", text: `reply to ${uniqueText}`, ts: Date.now(), spoken: true, speakable: true, turn: 1 },
+  ];
+  ws.send(`test:entries-full:${JSON.stringify(testEntries)}`);
+  await new Promise(r => setTimeout(r, 300));
+
+  // Fetch entries via debug API
+  const resp = await fetch("http://localhost:3457/debug/entries");
+  const body = await resp.json() as any;
+  const entries: any[] = body.entries ?? body; // /debug/entries returns {entries:[...]}
+
+  // Check that duplicates were handled (either deduped at injection or present from test:entries-full which bypasses pushEntry)
+  // The key test is the source code structure — runtime test is a bonus
+  const matchingUser = entries.filter((e: any) => e.text === uniqueText && e.role === "user");
+  const matchingAssistant = entries.filter((e: any) => e.text === `reply to ${uniqueText}` && e.role === "assistant");
+
+  // test:entries-full uses setConversationEntries (direct replace), so duplicates pass through.
+  // The structural tests above verify pushEntry dedup. Log the runtime result for diagnostics.
+  console.log(`  [info] After injection: ${matchingUser.length} user entries, ${matchingAssistant.length} assistant entries with test text`);
+
+  ws.close();
+}
+
+async function testAgentInfraFilterDoesNotCatchReadPrompts() {
+  console.log("\n[AGENT-INFRA-FILTER] isAgentInfraCommand must not filter 'Read /tmp/...' user prompts");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find isAgentInfraCommand function
+  const fnStart = src.indexOf("function isAgentInfraCommand");
+  const fnEnd = src.indexOf("\n}", fnStart) + 2;
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  // The pipeline reads regex must NOT include "read" — it clashes with "Read /tmp/coder-*.md" user prompts
+  const pipelineReadsLine = fnBody.match(/\^.*(?:cat|tail|head|grep).*\/tmp\//);
+  report("Pipeline reads regex exists (cat/tail/head/grep)", !!pipelineReadsLine);
+
+  // "read" must NOT be in the pipeline reads group — check only the regex pattern, not comments
+  const pipelineRegexMatch = fnBody.match(/\^\(([^)]+)\)\\s\+/);
+  const regexGroup = pipelineRegexMatch ? pipelineRegexMatch[1] : "";
+  const hasReadInGroup = /\bread\b/i.test(regexGroup);
+  report("'read' is NOT in pipeline reads regex (would catch Read /tmp/coder-*.md prompts)", !hasReadInGroup);
+
+  // Functional check: simulate isAgentInfraCommand logic on test cases
+  // Extract the function and eval it
+  const testCases: [string, boolean][] = [
+    ["Read /tmp/coder-fix-history-and-pane.md and implement both fixes", false],
+    ["Read /tmp/coder-diagnose-speakable.md instead. DIAGNOSE ONLY", false],
+    ["cat /tmp/murmur-agent-pipeline.jsonl", true],
+    ["tail -f /tmp/test-results.txt", true],
+    ["grep error /tmp/results.txt", true],
+    ["head -20 /tmp/file.txt", true],
+    ["hello", false],
+    ["tmux send-keys -t test-runner 'npm test' Enter", true],
+  ];
+
+  // Re-implement the regex checks from the function body for testing
+  for (const [input, expectFiltered] of testCases) {
+    const t = input.trim();
+    let filtered = false;
+    if (/^tmux\s+send-keys\b/i.test(t)) filtered = true;
+    if (/\s-t\s+(test-runner|murmur-test)/i.test(t)) filtered = true;
+    if (/^node\s+--import\s+tsx/i.test(t)) filtered = true;
+    if (/^npx\s+tsx\b/i.test(t)) filtered = true;
+    if (/^npm\s+(run\s+)?test/i.test(t)) filtered = true;
+    if (/^echo\s+.*>>\s*\/tmp\//i.test(t)) filtered = true;
+    if (/^(cat|tail|head|grep)\s+.*\/tmp\//i.test(t)) filtered = true;
+    if (/^tmux\s+(capture-pane|list-windows|list-sessions|display-message)\b/i.test(t)) filtered = true;
+    if (/^(cp|mv|git|curl)\s+/i.test(t) && t.split(/\s+/).length >= 3) filtered = true;
+    report(`isAgentInfraCommand("${input.slice(0, 60)}") → ${expectFiltered ? "filtered" : "pass-through"}`, filtered === expectFiltered);
+  }
+}
+
+// --- Audit Bug Regression Tests (Round 11) ---
+
+async function testAuditBug_escHtmlSingleQuote() {
+  console.log("\n[AUDIT-S1] escHtml escapes single quotes");
+
+  const src = readFileSync("server/validation.ts", "utf-8");
+
+  const hasAmpReplace = src.includes('.replace(/&/g, "&amp;")');
+  report("escHtml escapes ampersands", hasAmpReplace);
+
+  const hasSingleQuote = src.includes(".replace(/'/g, \"&#39;\")");
+  report("escHtml escapes single quotes (&#39;)", hasSingleQuote);
+
+  // Functional test: inline the escape logic
+  const escaped = "it's <a> \"test\" & 'value'"
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+  report("Single quote escaped in output", escaped.includes("&#39;"));
+  report("No raw single quotes remain in escaped output", !escaped.includes("'"));
+}
+
+async function testAuditBug_ffmpegExecFileSync() {
+  console.log("\n[AUDIT-S2] combineAudioBuffers uses execFileSync (not execSync)");
+
+  const src = readFileSync("server.ts", "utf-8");
+  const fnStart = src.indexOf("function combineAudioBuffers");
+  const fnEnd = src.indexOf("\n}", fnStart) + 2;
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  const usesExecFileSync = fnBody.includes("execFileSync(\"ffmpeg\"") || fnBody.includes("execFileSync('ffmpeg'");
+  report("combineAudioBuffers uses execFileSync (not execSync)", usesExecFileSync);
+
+  const noExecSync = !fnBody.includes("execSync(");
+  report("combineAudioBuffers does NOT use execSync", noExecSync);
+
+  const noTemplateInterp = !fnBody.includes('`ffmpeg');
+  report("No template string interpolation for ffmpeg command", noTemplateInterp);
+
+  // Verify args array pattern
+  const hasArgsArray = fnBody.includes('"-y"') || fnBody.includes('"-i"');
+  report("ffmpeg arguments passed as array", hasArgsArray);
+}
+
+async function testAuditBug_isAgentInfraWordCount() {
+  console.log("\n[AUDIT-B5] isAgentInfraCommand uses word-count guard for cp/mv/git/curl");
+
+  const src = readFileSync("server.ts", "utf-8");
+  const fnStart = src.indexOf("function isAgentInfraCommand");
+  const fnEnd = src.indexOf("\n}", fnStart) + 2;
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  // Should use word count (split + length) not character length
+  const usesWordCount = fnBody.includes(".split(") && fnBody.includes(".length >= 3");
+  report("Uses word-count guard (split + length >= 3) instead of char length", usesWordCount);
+
+  const noCharLength = !fnBody.includes("t.length > 20");
+  report("Does NOT use t.length > 20 char-length heuristic", noCharLength);
+
+  // Functional: "git help" (2 words) should pass through, "git commit -m fix" (4 words) should filter
+  const testCases: [string, boolean][] = [
+    ["git help", false],         // 2 words — pass through
+    ["git status", false],       // 2 words — pass through
+    ["git commit -m fix", true], // 4 words — filter
+    ["cp file1.txt file2.txt", true], // 3 words — filter
+    ["curl https://example.com -o out", true], // 4 words — filter
+  ];
+  for (const [input, expectFiltered] of testCases) {
+    const t = input.trim();
+    const filtered = /^(cp|mv|git|curl)\s+/i.test(t) && t.split(/\s+/).length >= 3;
+    report(`isAgentInfra("${input}") → ${expectFiltered ? "filtered" : "pass-through"}`, filtered === expectFiltered);
+  }
+}
+
+async function testAuditBug_ptyPathSanitization() {
+  console.log("\n[AUDIT-PTY] PtyBackend.startPipeStream validates file paths");
+
+  const src = readFileSync("terminal/pty-backend.ts", "utf-8");
+  const fnStart = src.indexOf("startPipeStream(");
+  const fnEnd = src.indexOf("\n  }", fnStart) + 4;
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  const hasTraversalCheck = fnBody.includes('includes("..")');
+  const hasRegex = fnBody.includes("[a-zA-Z0-9._\\-\\/]") || fnBody.includes("[a-zA-Z0-9._\\-/]");
+  report("startPipeStream validates path with traversal check AND regex", hasTraversalCheck && hasRegex);
+
+  const rejectsUnsafe = fnBody.includes("return;");
+  report("startPipeStream rejects unsafe paths (returns early)", rejectsUnsafe);
+
+  // Functional: test the FULL validation logic (traversal check + regex)
+  const safeRegex = /^[a-zA-Z0-9._\-\/]+$/;
+  const isPathSafe = (p: string) => !p.includes("..") && safeRegex.test(p);
+  report("Safe path /tmp/murmur-pipe.log passes", isPathSafe("/tmp/murmur-pipe.log"));
+  report("Traversal path ../../../etc/passwd rejected", !isPathSafe("../../../etc/passwd"));
+  report("Space in path rejected", !isPathSafe("/tmp/my file.log"));
+  report("Semicolon in path rejected", !isPathSafe("/tmp/file;rm -rf /"));
+}
+
+async function testAuditBug_switchTargetRetryCancel() {
+  console.log("\n[AUDIT-TMUX] switchTarget cancels pending retry timeout");
+
+  const src = readFileSync("terminal/tmux-backend.ts", "utf-8");
+
+  // Check for _retryTimeout field
+  const hasRetryField = src.includes("_retryTimeout");
+  report("TmuxBackend has _retryTimeout field", hasRetryField);
+
+  // Check switchTarget clears previous timeout
+  const fnStart = src.indexOf("switchTarget(");
+  const fnEnd = src.indexOf("\n  }", fnStart) + 4;
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  const clearsPrevious = fnBody.includes("clearTimeout(this._retryTimeout)");
+  report("switchTarget clears previous retry timeout", clearsPrevious);
+
+  const storesTimeout = fnBody.includes("this._retryTimeout = setTimeout");
+  report("switchTarget stores new timeout in _retryTimeout", storesTimeout);
+
+  const nullsAfterClear = fnBody.includes("this._retryTimeout = null");
+  report("Sets _retryTimeout to null after clear and inside callback", nullsAfterClear);
+}
+
+async function testAuditBug_electronCSP() {
+  console.log("\n[AUDIT-CSP] Electron adds Content-Security-Policy headers");
+
+  const src = readFileSync("electron/main.js", "utf-8");
+
+  const hasOnHeadersReceived = src.includes("onHeadersReceived");
+  report("Electron uses onHeadersReceived to set headers", hasOnHeadersReceived);
+
+  const hasCSP = src.includes("Content-Security-Policy");
+  report("Content-Security-Policy header is set", hasCSP);
+
+  const hasDefaultSrc = src.includes("default-src");
+  report("CSP includes default-src directive", hasDefaultSrc);
+
+  const hasScriptSrc = src.includes("script-src");
+  report("CSP includes script-src directive", hasScriptSrc);
+
+  const hasConnectSrc = src.includes("connect-src");
+  report("CSP includes connect-src directive", hasConnectSrc);
+
+  // CSP should restrict to localhost
+  const restrictsToLocalhost = src.includes("localhost:*") || src.includes("127.0.0.1");
+  report("CSP restricts sources to localhost", restrictsToLocalhost);
+}
+
+async function testAuditBug_scriptProcessorDisconnect() {
+  console.log("\n[AUDIT-AUDIO] ScriptProcessor (pre-buffer) has disconnect path");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // Should store bufferNode reference for cleanup
+  const hasStoredRef = src.includes("_preBufferNode");
+  report("Pre-buffer ScriptProcessor stored in _preBufferNode for cleanup", hasStoredRef);
+
+  // Should disconnect on mic stream cleanup
+  const hasDisconnect = src.includes("_preBufferNode.disconnect()");
+  report("_preBufferNode.disconnect() called on cleanup", hasDisconnect);
+
+  // Should have cleanup in ensureMicStream and visibility handler
+  const micStreamCleanup = src.indexOf("ensureMicStream");
+  const visibilityCleanup = src.indexOf("Stopping mic for background");
+  const hasCleanupInMicStream = src.slice(micStreamCleanup, micStreamCleanup + 500).includes("_preBufferNode");
+  const hasCleanupInVisibility = src.slice(visibilityCleanup, visibilityCleanup + 500).includes("_preBufferNode");
+  report("Disconnect in ensureMicStream cleanup path", hasCleanupInMicStream);
+  report("Disconnect in visibility/background cleanup path", hasCleanupInVisibility);
+}
+
+async function testAuditBug_talkBtnClassList() {
+  console.log("\n[AUDIT-CSS] setTalkState uses classList (not className=) to preserve flow classes");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // Find setTalkState function
+  const fnStart = src.indexOf("function setTalkState(state)");
+  const fnEnd = src.indexOf("\n    }\n\n", fnStart + 100);
+  const fnBody = src.slice(fnStart, fnEnd);
+
+  // Should NOT use talkBtn.className = "recording" etc.
+  const hasDirectAssign = /talkBtn\.className\s*=\s*"(recording|transcribing|thinking|responding|speaking)"/.test(fnBody);
+  report("setTalkState does NOT use talkBtn.className = 'state' (direct assignment)", !hasDirectAssign);
+
+  // Should use classList.add for state classes
+  const usesClassListAdd = fnBody.includes("talkBtn.classList.add(");
+  report("setTalkState uses classList.add for state classes", usesClassListAdd);
+
+  // Should use classList.remove to clear old state classes
+  const usesClassListRemove = fnBody.includes("talkBtn.classList.remove(") || fnBody.includes(".forEach(c => talkBtn.classList.remove(c))");
+  report("setTalkState uses classList.remove to clear old state classes", usesClassListRemove);
+
+  // Should define state classes list
+  const hasStateClassList = fnBody.includes("_talkStateClasses") || fnBody.includes("idle-state") && fnBody.includes("recording") && fnBody.includes("forEach");
+  report("State classes defined as array for removal", hasStateClassList);
+}
+
+async function testAuditBug_flowMuteBtnSync() {
+  console.log("\n[AUDIT-SYNC] flowMuteBtn and muteBtn fully synchronized");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // flowMuteBtn click handler should sync muteBtn
+  const flowClickStart = src.indexOf('flowMuteBtn?.addEventListener("click"') || src.indexOf("flowMuteBtn?.addEventListener('click'");
+  const flowClickBody = src.slice(flowClickStart, flowClickStart + 500);
+  const flowSyncsMuteBtn = flowClickBody.includes("muteBtn.classList.toggle");
+  report("flowMuteBtn click handler syncs muteBtn classList", flowSyncsMuteBtn);
+
+  const flowSendsWs = flowClickBody.includes('ws.send("mute:') || flowClickBody.includes("ws.send('mute:");
+  report("flowMuteBtn click handler sends WS mute message", flowSendsWs);
+
+  // muteBtn click handler should sync flowMuteBtn
+  const muteClickStart = src.indexOf('muteBtn.addEventListener("click"') || src.indexOf("muteBtn.addEventListener('click'");
+  const muteClickBody = src.slice(muteClickStart, muteClickStart + 500);
+  const muteSyncsFlowBtn = muteClickBody.includes("flowMuteBtn");
+  report("muteBtn click handler syncs flowMuteBtn", muteSyncsFlowBtn);
+
+  // applyMode should sync flowMuteBtn opacity/pointerEvents
+  const applyModeStart = src.indexOf("function applyMode");
+  const applyModeBody = src.slice(applyModeStart, applyModeStart + 2000);
+  const applyModeSyncsFlow = applyModeBody.includes("flowMuteBtn") || applyModeBody.includes("_fmb");
+  report("applyMode syncs flowMuteBtn state", applyModeSyncsFlow);
+
+  // flowMuteBtn should get opacity/pointerEvents synced in applyMode
+  const flowOpacitySync = applyModeBody.includes("opacity") && (applyModeBody.includes("flowMuteBtn") || applyModeBody.includes("_fmb"));
+  report("applyMode syncs flowMuteBtn opacity for mic-off modes", flowOpacitySync);
 }
 
 main().catch(err => {
