@@ -319,7 +319,8 @@ export class TmuxBackend implements TerminalManager {
 
   capturePane(): string {
     try {
-      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p"], {
+      // -J joins wrapped lines to prevent truncation on wide terminals (BUG-051)
+      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p", "-J"], {
         encoding: "utf-8",
         timeout: 2000,
       });
@@ -341,7 +342,7 @@ export class TmuxBackend implements TerminalManager {
 
   capturePaneScrollback(): string {
     try {
-      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p", "-S", "-2000"], {
+      return execFileSync("tmux", ["capture-pane", "-t", this.currentTarget, "-p", "-J", "-S", "-2000"], {
         encoding: "utf-8",
         timeout: 2000,
       });
