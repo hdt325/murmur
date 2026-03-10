@@ -2343,6 +2343,14 @@ async function main() {
   await testBug060_preBufferCleanup();
   await testBug049_electronBackgroundUpdate();
 
+  // Round 17: Final bug batch — configurable polling, rec state sync, capture-pane, palette, bounds
+  await testBug043_passivePollConfigurable();
+  await testBug048_recStateSync();
+  await testBug051_captureJoinWrapped();
+  await testBug061_fontZoomColdStart();
+  await testBug062_sessionPalette();
+  await testBug063_electronBounds();
+
   await teardown();
 }
 
@@ -6525,6 +6533,104 @@ async function testBug049_electronBackgroundUpdate() {
 
   const hasCatch = src.includes("contentUpdateCheck(murmurDir).catch");
   report("Background update has error handler", hasCatch);
+}
+
+// --- BUG-043: Passive poll configurable ---
+async function testBug043_passivePollConfigurable() {
+  console.log("\n[BUG-043] Passive watcher polling interval configurable");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const hasConstant = src.includes("PASSIVE_POLL_MS");
+  report("PASSIVE_POLL_MS constant defined", hasConstant);
+
+  const hasEnvVar = src.includes("MURMUR_PASSIVE_POLL_MS");
+  report("Interval configurable via MURMUR_PASSIVE_POLL_MS env var", hasEnvVar);
+
+  const usesConstant = src.includes("}, PASSIVE_POLL_MS)");
+  report("setInterval uses PASSIVE_POLL_MS constant", usesConstant);
+}
+
+// --- BUG-048: Recording state sync ---
+async function testBug048_recStateSync() {
+  console.log("\n[BUG-048] Recording state broadcast across tabs");
+  const serverSrc = readFileSync("server.ts", "utf-8");
+
+  const hasHandler = serverSrc.includes('msg.startsWith("rec_state:")');
+  report("Server handles rec_state: messages", hasHandler);
+
+  const broadcastsToOthers = serverSrc.includes("c !== ws") && serverSrc.includes("rec_state");
+  report("Server broadcasts rec_state to other clients (not sender)", broadcastsToOthers);
+
+  const clientSrc = readFileSync("index.html", "utf-8");
+  const sendsOnStart = clientSrc.includes('ws.send("rec_state:recording")');
+  report("Client sends rec_state:recording on start", sendsOnStart);
+
+  const sendsOnStop = clientSrc.includes('ws.send("rec_state:idle")');
+  report("Client sends rec_state:idle on stop", sendsOnStop);
+}
+
+// --- BUG-051: capture-pane join wrapped ---
+async function testBug051_captureJoinWrapped() {
+  console.log("\n[BUG-051] tmux capture-pane joins wrapped lines");
+  const src = readFileSync("terminal/tmux-backend.ts", "utf-8");
+
+  const captureFnStart = src.indexOf("capturePane(): string");
+  const captureFn = src.slice(captureFnStart, src.indexOf("}", captureFnStart + 50) + 1);
+  const hasJoinFlag = captureFn.includes('"-J"');
+  report("capturePane uses -J flag to join wrapped lines", hasJoinFlag);
+
+  const scrollFnStart = src.indexOf("capturePaneScrollback(): string");
+  const scrollFn = src.slice(scrollFnStart, src.indexOf("}", scrollFnStart + 50) + 1);
+  const scrollHasJoin = scrollFn.includes('"-J"');
+  report("capturePaneScrollback uses -J flag", scrollHasJoin);
+}
+
+// --- BUG-061: Font zoom cold start ---
+async function testBug061_fontZoomColdStart() {
+  console.log("\n[BUG-061] Font zoom applied on cold start");
+  const src = readFileSync("index.html", "utf-8");
+
+  const hasChatRestore = src.includes('localStorage.getItem("chat-font-size")') && src.includes("--chat-font-size");
+  report("Chat font size restored from localStorage on load", hasChatRestore);
+
+  const hasTermRestore = src.includes('localStorage.getItem("term-font-size")');
+  report("Terminal font size restored from localStorage on load", hasTermRestore);
+}
+
+// --- BUG-062: Session color palette expanded ---
+async function testBug062_sessionPalette() {
+  console.log("\n[BUG-062] Session color palette expanded beyond 8");
+  const src = readFileSync("index.html", "utf-8");
+
+  const paletteStart = src.indexOf("SESS_COLORS = [");
+  const paletteEnd = src.indexOf("];", paletteStart);
+  const paletteBlock = src.slice(paletteStart, paletteEnd);
+  const colorCount = (paletteBlock.match(/#[0-9a-fA-F]{6}/g) || []).length;
+  report(`Session palette has ${colorCount} colors (>8)`, colorCount > 8);
+}
+
+// --- BUG-063: Electron window bounds ---
+async function testBug063_electronBounds() {
+  console.log("\n[BUG-063] Electron window bounds saved and restored");
+  const src = readFileSync("electron/main.js", "utf-8");
+
+  const hasBoundsFile = src.includes("window-bounds.json");
+  report("Window bounds file path defined", hasBoundsFile);
+
+  const hasSaveFn = src.includes("function saveBounds");
+  report("saveBounds function exists", hasSaveFn);
+
+  const hasLoadFn = src.includes("function loadSavedBounds") || src.includes("loadSavedBounds");
+  report("loadSavedBounds function exists", hasLoadFn);
+
+  const hasMoveListener = src.includes('"move"') && src.includes("saveBounds");
+  report("Bounds saved on window move", hasMoveListener);
+
+  const hasResizeListener = src.includes('"resize"') && src.includes("saveBounds");
+  report("Bounds saved on window resize", hasResizeListener);
+
+  const usesOnCreate = src.includes("saved?.x") || src.includes("saved?.width");
+  report("Saved bounds used when creating window", usesOnCreate);
 }
 
 main().catch(err => {

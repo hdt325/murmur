@@ -434,12 +434,12 @@ async function startup() {
     return;
   }
 
-  // Check for content updates from GitHub
+  // Check for content updates from GitHub (background — don't block startup)
   const murmurDir = app.isPackaged
     ? path.join(process.resourcesPath, "murmur")
     : path.resolve(__dirname, "..");
   if (app.isPackaged) {
-    await contentUpdateCheck(murmurDir);
+    contentUpdateCheck(murmurDir).catch(err => console.warn("[update] Background content check failed:", err.message));
   }
 
   // Start server
@@ -464,17 +464,35 @@ async function startup() {
   }, 600);
 }
 
+// BUG-063: Save/restore window bounds
+const BOUNDS_FILE = path.join(app.getPath("userData"), "window-bounds.json");
+function loadSavedBounds() {
+  try {
+    const raw = fs.readFileSync(BOUNDS_FILE, "utf8");
+    const b = JSON.parse(raw);
+    if (b && typeof b.x === "number" && typeof b.y === "number" && b.width > 100 && b.height > 100) return b;
+  } catch {}
+  return null;
+}
+function saveBounds() {
+  if (!win) return;
+  try { fs.writeFileSync(BOUNDS_FILE, JSON.stringify(win.getBounds())); } catch {}
+}
+
 function createWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width: screenWidth, height: screenHeight } = primaryDisplay.workAreaSize;
-  const winWidth = 320;
-  const winHeight = screenHeight - 40;
+  const saved = loadSavedBounds();
+  const winWidth = saved?.width || 320;
+  const winHeight = saved?.height || (screenHeight - 40);
+  const winX = saved?.x ?? (screenWidth - winWidth - 20);
+  const winY = saved?.y ?? 20;
 
   win = new BrowserWindow({
     width: winWidth,
     height: winHeight,
-    x: screenWidth - winWidth - 20,
-    y: 20,
+    x: winX,
+    y: winY,
     frame: false,
     alwaysOnTop: true,
     resizable: true,
@@ -489,6 +507,15 @@ function createWindow() {
       backgroundThrottling: false, // Keep timers + AudioContext alive when Murmur is behind other windows
     },
   });
+
+  // BUG-063: Save window bounds on move/resize (debounced)
+  let _boundsTimer = null;
+  const debounceSaveBounds = () => {
+    if (_boundsTimer) clearTimeout(_boundsTimer);
+    _boundsTimer = setTimeout(saveBounds, 500);
+  };
+  win.on("move", debounceSaveBounds);
+  win.on("resize", debounceSaveBounds);
 
   // Float above other windows (like panel.swift's .floating level)
   win.setAlwaysOnTop(true, "floating");

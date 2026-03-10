@@ -6526,6 +6526,7 @@
         isRecording = true;
         _recordingStarting = false;
         recordingStartTime = Date.now();
+        if (ws?.readyState === WebSocket.OPEN) ws.send("rec_state:recording"); // BUG-048: sync tabs
 
         setTalkState("recording");
         startStreamingSTT();
@@ -6560,6 +6561,7 @@
       if (!isRecording || !mediaRecorder) return;
       console.log("[rec] Stopping recording");
       isRecording = false;
+      if (ws?.readyState === WebSocket.OPEN) ws.send("rec_state:idle"); // BUG-048: sync tabs
       _recordingPaused = false;
       talkBtn.classList.remove("rec-paused");
       stopSilenceDetection();
@@ -7905,6 +7907,14 @@
       "#7ae8d8", // teal
       "#e87ab8", // pink
       "#b8e87a", // lime
+      "#e8d87a", // gold
+      "#7a9ce8", // indigo
+      "#e87a9c", // rose
+      "#7ae8b8", // mint
+      "#c87ae8", // violet
+      "#7ad8e8", // cyan
+      "#e8b87a", // amber
+      "#9ce87a", // chartreuse
     ];
     const _sessColorCache = {}; // session name → color
     let _sessColorIdx = 0;

@@ -510,12 +510,12 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-043: passiveWatcher polling interval not configurable
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Fixed 2s polling interval too fast for low-power devices, too slow for responsive UI.
 **Root cause**: Hardcoded `passiveWatcherInterval = 2000`.
-**Proposed fix**: Make configurable via environment variable or settings.
+**Fix**: Extracted to `PASSIVE_POLL_MS` constant, configurable via `MURMUR_PASSIVE_POLL_MS` env var.
 
 ---
 
@@ -565,12 +565,12 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-048: Flow mode recording state not synced across tabs
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Starting recording in one tab doesn't reflect in another tab's UI.
 **Root cause**: Recording state is per-tab, not broadcast via WebSocket.
-**Proposed fix**: Broadcast recording state changes to all clients.
+**Fix**: Client sends `rec_state:recording`/`rec_state:idle` on start/stop, server broadcasts to other clients.
 
 ---
 
@@ -598,12 +598,12 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-051: tmux capture-pane truncation on very wide terminals
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Terminal content truncated if tmux pane is wider than expected.
 **Root cause**: `capturePane` doesn't specify `-J` flag for joined output on wide panes.
-**Proposed fix**: Add `-J` flag to capture-pane calls.
+**Fix**: Added `-J` flag to `capturePane()` and `capturePaneScrollback()` to join wrapped lines.
 
 ---
 
@@ -707,34 +707,33 @@ A log of bugs found, root cause, fix, and test coverage.
 
 ## BUG-061: Font zoom persists but doesn't apply on cold start
 
-**Status**: Open
+**Status**: Fixed (pre-existing)
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Saved font size in localStorage not applied until user interacts with zoom controls.
-**Root cause**: Font size restoration happens after initial render.
-**Proposed fix**: Apply saved font size in early initialization before first render.
+**Root cause**: Was already fixed — chatFontSize read from localStorage and applied to `--chat-font-size` CSS var on page load (line 7790-7791).
 
 ---
 
 ## BUG-062: Session color palette only 8 colors
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: With >8 tmux sessions, colors repeat, making sessions harder to distinguish.
 **Root cause**: `SESS_COLORS` array has only 8 entries.
-**Proposed fix**: Expand palette or use hash-based color generation.
+**Fix**: Expanded palette to 16 colors (added gold, indigo, rose, mint, violet, cyan, amber, chartreuse).
 
 ---
 
 ## BUG-063: Electron window position not saved
 
-**Status**: Open
+**Status**: Fixed
 **Severity**: Low
 **Found**: 2026-03-06 (audit)
 **Symptom**: Window position resets to center on every app launch.
 **Root cause**: Window bounds not persisted.
-**Proposed fix**: Save/restore window bounds in electron-store or JSON file.
+**Fix**: Save bounds to `window-bounds.json` in userData on move/resize (debounced), restore on launch.
 
 ---
 

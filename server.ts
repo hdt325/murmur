@@ -4185,6 +4185,7 @@ const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
 let _pendingPromptInput = "";
 let _pendingPromptInputTs = 0;
 
+const PASSIVE_POLL_MS = parseInt(process.env.MURMUR_PASSIVE_POLL_MS || "2000", 10); // BUG-043: configurable
 function startPassiveWatcher() {
   if (passiveWatcher) return;
   passiveWatcher = setInterval(() => {
@@ -4473,7 +4474,7 @@ function startPassiveWatcher() {
         }
       }
     }
-  }, 2000);
+  }, PASSIVE_POLL_MS);
 }
 
 function stopPassiveWatcher() {
@@ -5539,6 +5540,19 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         console.log("[ws] ElevenLabs API key cleared");
       } else {
         console.warn("[ws] Rejected invalid ElevenLabs API key format");
+      }
+      return;
+    }
+
+    // BUG-048: Recording state sync across tabs
+    if (msg.startsWith("rec_state:")) {
+      const state = msg.slice(10).trim();
+      if (state === "recording" || state === "idle") {
+        for (const c of clients) {
+          if (c !== ws && c.readyState === 1) {
+            c.send(JSON.stringify({ type: "rec_state", state }));
+          }
+        }
       }
       return;
     }
