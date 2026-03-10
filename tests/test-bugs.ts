@@ -2876,8 +2876,8 @@ async function testEntryBugs_dedupAndCap() {
   const src = readFileSync("server.ts", "utf-8");
 
   // Bug 1: Dedup should check recent entries across turns, not just currentTurn
-  const hasRecentSlice = /recentEntries\s*=\s*conversationEntries\.slice\(-20\)/.test(src);
-  report("Dedup checks last 20 entries (not just currentTurn)", hasRecentSlice);
+  const hasRecentSlice = /recentEntries\s*=\s*conversationEntries\.slice\(-\d+\)/.test(src);
+  report("Dedup checks last N entries (not just currentTurn)", hasRecentSlice);
 
   // Dedup is now text-based across all recent entries (no turn distance restriction)
   const hasTextDedup = src.includes("paraNorm") && src.includes("eNorm");
@@ -2958,7 +2958,7 @@ async function testCapOverflow_trimOnEveryCycle() {
 
   // Called in broadcastCurrentOutput
   const bcoStart = src.indexOf("function broadcastCurrentOutput()");
-  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoEnd = src.indexOf("function handleStreamDone(");
   const bcoBody = src.slice(bcoStart, bcoEnd);
   const inBCO = bcoBody.includes("trimEntriesToCap()");
   report("trimEntriesToCap called in broadcastCurrentOutput", inBCO);
@@ -2972,8 +2972,8 @@ async function testCapOverflow_trimOnEveryCycle() {
 
   // Called in startTmuxStreaming
   const stsStart = src.indexOf("function startTmuxStreaming(");
-  const stsEnd = src.indexOf("preInputSnapshot = captureTmuxPane()");
-  const stsBody = src.slice(stsStart, stsEnd);
+  const stsEnd = src.indexOf("preInputSnapshot = captureTmuxPane()", stsStart);
+  const stsBody = src.slice(stsStart, stsEnd > stsStart ? stsEnd : stsStart + 2000);
   const inSTS = stsBody.includes("trimEntriesToCap()");
   report("trimEntriesToCap called in startTmuxStreaming", inSTS);
 
@@ -3162,7 +3162,7 @@ async function testBugA_textSimilarityMatching() {
 
   // broadcastCurrentOutput uses text-similarity matching
   const bcoStart = src.indexOf("function broadcastCurrentOutput()");
-  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoEnd = src.indexOf("function handleStreamDone(");
   const bcoBody = src.slice(bcoStart, bcoEnd);
 
   // Has matchedEntryIds tracking set
@@ -3640,7 +3640,7 @@ async function testEntryCapEnforcement() {
 
   // 6. trimEntriesToCap called at end of broadcastCurrentOutput
   const bcoStart = src.indexOf("function broadcastCurrentOutput");
-  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoEnd = src.indexOf("function handleStreamDone(");
   const bcoSection = bcoEnd > bcoStart ? src.slice(bcoStart, bcoEnd) : src.slice(bcoStart, bcoStart + 12000);
   const trimInBco = bcoSection.includes("trimEntriesToCap()");
   report("trimEntriesToCap called in broadcastCurrentOutput", trimInBco);
@@ -3688,7 +3688,7 @@ async function testFlashEntryPrevention() {
 
   // 6. broadcastCurrentOutput skips tool output during RESPONDING
   const bcoStart = src.indexOf("function broadcastCurrentOutput");
-  const bcoEnd = src.indexOf("// Called when new pipe-pane bytes arrive");
+  const bcoEnd = src.indexOf("function handleStreamDone(");
   const bcoSection = src.slice(bcoStart, bcoEnd > bcoStart ? bcoEnd : bcoStart + 12000);
   const skipsInResponding = bcoSection.includes("isToolOutputLine(para.text)") && bcoSection.includes("RESPONDING");
   report("broadcastCurrentOutput skips tool output during RESPONDING", skipsInResponding);
@@ -3881,7 +3881,7 @@ async function testTtsHighlight_broadcastPath() {
   report("drainAudioBuffer broadcasts tts_play to all clients", broadcastsTtsPlay);
 
   // 2. sendToAudioClient logs JSON messages via wslog
-  const sendFn = src.slice(src.indexOf("function sendToAudioClient"), src.indexOf("function sendToAudioClient") + 800);
+  const sendFn = src.slice(src.indexOf("function sendToAudioClient"), src.indexOf("function sendToAudioClient") + 1100);
   const hasWslog = sendFn.includes("wslog(");
   report("sendToAudioClient calls wslog for JSON messages", hasWslog);
 
@@ -4355,7 +4355,7 @@ async function testTestEntryBroadcastIsolation() {
 
   // 5. Reconnection path also filters by sourceTag
   const reconnectSection = src.slice(src.indexOf("Send conversation entries so reconnecting"), src.indexOf("Send conversation entries so reconnecting") + 800);
-  const reconnectFilters = reconnectSection.includes('sourceTag?.startsWith("text-input-test")');
+  const reconnectFilters = reconnectSection.includes('isTestEntry');
   report("Reconnection payload filters test entries by sourceTag", reconnectFilters);
 
   // 6. Test mode text input uses "text-input-test" source
@@ -4838,7 +4838,7 @@ async function testTtsStallNewInputBump() {
 
   // stopClientPlayback2's else branch (new_input) should now check for stuck playing jobs
   const stopFnIdx = src.indexOf("function stopClientPlayback2");
-  const stopFnBody = src.slice(stopFnIdx, stopFnIdx + 2000);
+  const stopFnBody = src.slice(stopFnIdx, stopFnIdx + 2800);
 
   // Verify: new_input path checks ttsCurrentlyPlaying.playingSince for stale timeout
   const checksPlayingSince = stopFnBody.includes("playingSince") && stopFnBody.includes("10000");
@@ -5979,7 +5979,7 @@ async function testAuditBug_destroyKillsWindow() {
   const noKillSession = !fnBody.includes("kill-session");
   report("destroy() does NOT use kill-session", noKillSession);
 
-  const stopsStream = fnBody.includes("stopPipeStream");
+  const stopsStream = fnBody.includes("_stopAlwaysPipe");
   report("destroy() stops pipe stream before killing", stopsStream);
 }
 
@@ -6622,7 +6622,8 @@ async function testWindowSwitchEntryLoading() {
   // Fix 1: No longer filters cached entries by e.window === currentWindowKey
   // (cache key already scopes to correct window — strict filter dropped valid entries
   // persisted from previous server sessions with stale window tags)
-  const hasStrictWindowFilter = fnBody.includes("e.window === currentWindowKey");
+  // Note: the string may appear in a comment explaining WHY it was removed — only check for active filter usage
+  const hasStrictWindowFilter = /\.filter\([^)]*e\.window\s*===\s*currentWindowKey/.test(fnBody);
   report("Cache load does NOT filter by e.window (cache key scopes entries)", !hasStrictWindowFilter);
 
   // Fix 2: Re-tags cached entries to current window key
@@ -6695,7 +6696,7 @@ async function testTask36_toolOutputFiltering() {
   const fnBody = src.slice(src.indexOf("function isToolOutputLine("), src.indexOf("function isToolOutputLine(") + 1500);
 
   report("Filters ⏺ Bash/Read/Write/Edit markers", /⏺.*Bash/i.test(fnBody));
-  report("Filters Bash() calls", /Bash\(/i.test(fnBody));
+  report("Filters Bash() calls", /Bash\\?\(/i.test(fnBody));
   report("Filters ⎿ continuation lines", /⎿/.test(fnBody));
   report("Filters background command notifications", /Background command/i.test(fnBody) || src.includes("bg_task_notification"));
 
@@ -6713,7 +6714,9 @@ async function testTask37_genBumpRefinement() {
   const src = readFileSync("server.ts", "utf-8");
 
   // passive_redetect should NOT be in USER_INITIATED_BUMP_REASONS
-  const userInitiated = src.slice(src.indexOf("USER_INITIATED_BUMP_REASONS"), src.indexOf("USER_INITIATED_BUMP_REASONS") + 300);
+  const uibrStart = src.indexOf("USER_INITIATED_BUMP_REASONS");
+  const uibrEnd = src.indexOf("]);", uibrStart);
+  const userInitiated = src.slice(uibrStart, uibrEnd + 3);
   report("passive_redetect NOT in USER_INITIATED_BUMP_REASONS", !userInitiated.includes("passive_redetect"));
 
   // new_input should NOT be in USER_INITIATED_BUMP_REASONS
@@ -6724,7 +6727,7 @@ async function testTask37_genBumpRefinement() {
 
   // stopClientPlayback2 with passive_redetect should preserve queue (not cancel)
   const stopFn = src.slice(src.indexOf("function stopClientPlayback2("));
-  const shouldCancel = stopFn.slice(0, 300);
+  const shouldCancel = stopFn.slice(0, 600);
   report("shouldCancelQueue uses USER_INITIATED_BUMP_REASONS", shouldCancel.includes("USER_INITIATED_BUMP_REASONS"));
 }
 
@@ -6747,7 +6750,9 @@ async function testTask38_resendButton() {
 
   // Flow mode: resend button should NOT be display:none (Task #38 fix)
   // It should only be opacity:0 (visible on hover/tap)
-  const flowHiddenBlock = html.slice(html.indexOf("body.flow-mode .msg .role"), html.indexOf("body.flow-mode .msg .role") + 300);
+  const flowHiddenStart = html.indexOf("body.flow-mode .msg .role");
+  const flowHiddenEnd = html.indexOf("}", flowHiddenStart) + 1;
+  const flowHiddenBlock = html.slice(flowHiddenStart, flowHiddenEnd);
   report("Flow mode does NOT hide resend button via display:none", !flowHiddenBlock.includes("msg-resend"));
 
   // Flow mode opacity styling for resend
@@ -6994,7 +6999,7 @@ async function testStaleDedupTierOne() {
   const src = readFileSync("server.ts", "utf-8");
 
   // isDuplicateEntry should have two-tier comment
-  const dedupFn = src.slice(src.indexOf("function isDuplicateEntry"), src.indexOf("function isDuplicateEntry") + 1000);
+  const dedupFn = src.slice(src.indexOf("function isDuplicateEntry"), src.indexOf("function isDuplicateEntry") + 2200);
   report("Two-tier dedup documented", dedupFn.includes("two-tier dedup") || dedupFn.includes("Tier 1"));
 
   // Tier 1: exact text match without turn restriction

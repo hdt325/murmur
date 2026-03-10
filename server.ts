@@ -1829,6 +1829,7 @@ function queueFillerAudio(userText = ""): void {
     ts: Date.now(),
     turn: currentTurn,
     filler: true, // Tag so UI can style differently if desired
+    sourceTag: "filler", // Guard in broadcastCurrentOutput checks this to prevent clobber
     ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
   };
   pushEntry(fillerEntry);
