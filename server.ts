@@ -803,6 +803,8 @@ interface ChunkFlowLog {
 }
 const _chunkFlowLog: ChunkFlowLog[] = []; // ring buffer, last 100
 let _lastChunkFlowTs: Map<number, number> = new Map(); // entryId → last event ts
+const CHUNK_FLOW_TS_MAX_SIZE = 200; // Prune when map exceeds this size
+const CHUNK_FLOW_TS_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
 
 interface ClientPlaybackState {
   currentEntryId: number | null;
@@ -839,6 +841,13 @@ function logChunkFlow(event: ChunkFlowLog["event"], entryId: number | null, chun
   _chunkFlowLog.push(entry);
   if (_chunkFlowLog.length > 100) _chunkFlowLog.shift();
   _lastChunkFlowTs.set(key, now);
+  // Prune stale entries to prevent unbounded growth (Audit M1)
+  if (_lastChunkFlowTs.size > CHUNK_FLOW_TS_MAX_SIZE) {
+    const cutoff = now - CHUNK_FLOW_TS_MAX_AGE_MS;
+    for (const [k, ts] of _lastChunkFlowTs) {
+      if (ts < cutoff) _lastChunkFlowTs.delete(k);
+    }
+  }
 }
 
 function logTtsFetch(engine: TtsFetchLog["engine"], entryId: number | null, chunkIndex: number, text: string,
@@ -2453,26 +2462,26 @@ function isWindowActive(): boolean {
  *  Called from window_preference handler and fallback timer.
  *  @param target - "session:windowIdx" format
  *  @param ws - the requesting WebSocket client (entries sent to this client) */
-function activateWindow(target: string, ws: import("ws").WebSocket): void {
-  const lastColon = target.lastIndexOf(":");
-  if (lastColon === -1 || !terminal.switchTarget) return;
-  const session = target.slice(0, lastColon);
-  const windowIdx = parseInt(target.slice(lastColon + 1));
-  if (isNaN(windowIdx)) return;
-
-  const isFirst = !isWindowActive();
-  console.log(`[window] ${isFirst ? "First activation" : "Switching"} to: ${target}`);
+/** Shared core for activateWindow and _executeWindowSwitch (Audit I2 unification).
+ *  Handles: state reset, entry loading, broadcasts, passive watcher init. */
+function _activateWindowCore(session: string, windowIdx: number, opts: {
+  isFirst?: boolean;
+  sendToWs?: import("ws").WebSocket;  // if set, send entries to this client only (first activation)
+  stopStreaming?: boolean;             // if true, call stopTmuxStreaming before switch
+}): void {
+  if (!terminal.switchTarget) return;
+  const target = `${session}:${windowIdx}`;
+  console.log(`[window] ${opts.isFirst ? "First activation" : "Switching"} to: ${target}`);
 
   // Save current window state (skip on first activation)
-  if (!isFirst) saveCurrentWindowEntries();
+  if (!opts.isFirst) saveCurrentWindowEntries();
+  if (opts.stopStreaming) stopTmuxStreaming();
   terminal.switchTarget(session, windowIdx);
 
-  // Check if the resolved pane is the server's own pane.
-  // If so, skip scraping but still load cached entries — refusing to scrape ourselves
-  // prevents coordinator/agent output from leaking into conversation view.
+  // Check if the resolved pane is the server's own pane
   const isOwnPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
   if (isOwnPane) {
-    console.log(`[window] Own pane detected: ${target} resolves to ${_serverOwnPaneId} — refusing to scrape ourselves, serving cached entries`);
+    console.log(`[window] Own pane detected: ${target} resolves to ${_serverOwnPaneId} — refusing to scrape ourselves`);
   }
 
   saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
@@ -2496,18 +2505,17 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
 
   // Load entries for this window
   const cached = loadWindowEntries(currentWindowKey);
-  // Filter out test garbage before checking — test entries should never block scrollback parsing
   const realCached = cached?.filter(e => !isTestEntry(e)).filter(e => !e.window || e.window === currentWindowKey);
   if (realCached && realCached.length > 0) {
+    if (realCached.length < (cached?.length ?? 0)) {
+      console.log(`[window] Cleaned ${(cached?.length ?? 0) - realCached.length} test/cross-window entries from cache`);
+    }
     setConversationEntries(realCached);
   } else if (!isOwnPane) {
-    // Only scrape scrollback for non-own panes — own pane scraping blocked to prevent
-    // coordinator/agent output from leaking into conversation view
     const scrollback = loadScrollbackEntries();
     setConversationEntries(scrollback);
   } else {
-    // Own pane with no cache — keep existing conversationEntries if any (don't wipe),
-    // otherwise show an informational entry
+    // Own pane with no cache — show informational entry
     if (conversationEntries.length === 0) {
       const infoEntry: ConversationEntry = {
         id: ++entryIdCounter,
@@ -2528,15 +2536,19 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
     entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
   }
 
-  // Send entries to requesting client
+  // Send entries — either to requesting client or broadcast to all
   let recentEntries = [...conversationEntries];
   if (recentEntries.length > 80) recentEntries = recentEntries.slice(-80);
-  if (!(ws as any)._isTestMode) {
-    recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+  if (opts.sendToWs) {
+    if (!(opts.sendToWs as any)._isTestMode) {
+      recentEntries = recentEntries.filter(e => !e.sourceTag?.startsWith("text-input-test"));
+    }
+    opts.sendToWs.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: false }));
+  } else {
+    broadcast({ type: "entry", entries: recentEntries, partial: false });
   }
-  ws.send(JSON.stringify({ type: "entry", entries: recentEntries, partial: false }));
 
-  // Reset ALL status indicators — scoped to this window now
+  // Reset status indicators
   broadcast({ type: "voice_status", state: "idle" });
   broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
   broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
@@ -2556,9 +2568,19 @@ function activateWindow(target: string, ws: import("ws").WebSocket): void {
   } catch {}
 
   // On first activation, send Murmur context to voice session
-  if (isFirst) sendMurmurContext(3000);
+  if (opts.isFirst) sendMurmurContext(3000);
 
-  console.log(`[window] Activated ${target}, sent ${recentEntries.length} entries + idle status`);
+  console.log(`[window] Activated ${target}, ${recentEntries.length} entries + idle status`);
+}
+
+function activateWindow(target: string, ws: import("ws").WebSocket): void {
+  const lastColon = target.lastIndexOf(":");
+  if (lastColon === -1 || !terminal.switchTarget) return;
+  const session = target.slice(0, lastColon);
+  const windowIdx = parseInt(target.slice(lastColon + 1));
+  if (isNaN(windowIdx)) return;
+  const isFirst = !isWindowActive();
+  _activateWindowCore(session, windowIdx, { isFirst, sendToWs: ws });
 }
 
 /** Debounced persistence of windowEntries to disk. Called after map updates. */
@@ -2612,88 +2634,7 @@ let _switchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Execute the actual window switch (called after debounce from tmux:switch: handler) */
 function _executeWindowSwitch(session: string, windowIdx: number, ws: import("ws").WebSocket): void {
-  if (!terminal.switchTarget) return;
-  console.log(`[tmux] Switching target to session="${session}" window=${windowIdx}`);
-  stopTmuxStreaming();
-  saveCurrentWindowEntries();
-  terminal.switchTarget(session, windowIdx);
-  saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
-  currentWindowKey = getWindowKey();
-  stopClientPlayback2("session_switch");
-  lastPassiveSnapshot = "";
-  _lastPassiveUserInput = "";
-  _lastPassiveUserInputTs = 0;
-  _cooldownThinking = false;
-  lastStreamEndTime = 0;
-  preInputSnapshot = "";
-  _scrollbackCache = { text: "", ts: 0 };
-  lastTerminalText = ""; // Force terminal panel to re-broadcast after window switch
-  _lastWindowSwitchTs = Date.now();
-  if (streamState !== "IDLE") streamState = "IDLE";
-  entryTtsCursor.clear();
-
-  const isSelfPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
-  if (isSelfPane) {
-    console.log(`[tmux] Own pane detected (${_serverOwnPaneId}) — will skip scraping, show info entry`);
-  }
-
-  const cached = loadWindowEntries(currentWindowKey);
-  // Filter out test garbage + cross-window entries before checking — test entries should never block scrollback parsing
-  const realCached = cached?.filter(e => !isTestEntry(e)).filter(e => !e.window || e.window === currentWindowKey);
-  if (realCached && realCached.length > 0) {
-    if (realCached.length < (cached?.length ?? 0)) {
-      console.log(`[tmux] Cleaned ${(cached?.length ?? 0) - realCached.length} test/cross-window entries from cache`);
-    }
-    setConversationEntries(realCached);
-    console.log(`[tmux] Loaded ${conversationEntries.length} cached entries for ${currentWindowKey}`);
-  } else if (!isSelfPane) {
-    const scrollback = loadScrollbackEntries();
-    setConversationEntries(scrollback);
-    if (conversationEntries.length > 0) {
-      console.log(`[tmux] Loaded ${conversationEntries.length} scrollback entries for ${session}:${windowIdx}`);
-    } else {
-      console.log(`[tmux] No scrollback entries found for ${session}:${windowIdx}`);
-    }
-  } else {
-    // Own pane with no cache — keep existing conversationEntries if any (don't wipe),
-    // otherwise show an informational entry
-    if (conversationEntries.length === 0) {
-      const infoEntry: ConversationEntry = {
-        id: ++entryIdCounter,
-        role: "assistant",
-        text: `This is the Murmur server's own terminal (${session}:${windowIdx}). Switch to a Claude session window to see conversation entries.`,
-        ts: Date.now(),
-        spoken: true,
-        speakable: false,
-        turn: currentTurn,
-        window: currentWindowKey,
-      };
-      setConversationEntries([infoEntry]);
-    }
-    console.log(`[tmux] Own pane — kept ${conversationEntries.length} existing entries`);
-  }
-  for (const e of conversationEntries) e.spoken = true;
-  if (conversationEntries.length > 0) {
-    entryIdCounter = Math.max(entryIdCounter, ...conversationEntries.map(e => e.id));
-  }
-  broadcast({ type: "entry", entries: conversationEntries, partial: false });
-  broadcast({ type: "voice_status", state: "idle" });
-  broadcast({ type: "status", phase: "idle", micActive: false, ttsPlaying: false, conversationActive: false });
-  broadcast({ type: "tmux", session, window: windowIdx, alive: terminal.isSessionAlive(), current: terminal.displayTarget ?? terminal.currentTarget });
-  try {
-    lastPassiveSnapshot = captureTmuxPane();
-    preInputSnapshot = lastPassiveSnapshot;
-    console.log(`[tmux] Initialized passive snapshot for ${currentWindowKey} (${lastPassiveSnapshot.length} chars)`);
-  } catch {}
-  // Immediately broadcast terminal panel content from the new window
-  // (don't wait for the 500ms poll — user sees stale content otherwise)
-  try {
-    const text = captureTerminalPane();
-    if (text) {
-      lastTerminalText = text;
-      broadcast({ type: "terminal", text });
-    }
-  } catch {}
+  _activateWindowCore(session, windowIdx, { stopStreaming: true });
 }
 
 /** Returns true if entry looks like test injection garbage that should not be persisted or cached */

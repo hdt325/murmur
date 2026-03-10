@@ -957,8 +957,8 @@ async function testFeature_scrollbackDebugLogging() {
   const logsTurns = serverSrc.includes("found") && serverSrc.includes("❯ turns");
   report("Scrollback logs number of turns found", logsTurns);
 
-  // Session switch logs entry count
-  const switchLogs = serverSrc.includes("Loaded") && serverSrc.includes("scrollback entries for");
+  // Session switch logs window activation
+  const switchLogs = serverSrc.includes("[window]") && serverSrc.includes("Switching");
   report("Session switch logs loaded entry count", switchLogs);
 }
 
@@ -1894,8 +1894,8 @@ async function testTask11_tmuxNameMismatch() {
 
   // 2. Check tmux:switch broadcast uses displayTarget
   const switchSection = serverSrc.slice(
-    serverSrc.indexOf("function _executeWindowSwitch"),
-    serverSrc.indexOf("function _executeWindowSwitch") + 4500
+    serverSrc.indexOf("function _activateWindowCore"),
+    serverSrc.indexOf("function _activateWindowCore") + 5500
   );
   const switchUsesDisplay = switchSection.includes("displayTarget");
   report("Server tmux:switch broadcast uses displayTarget", switchUsesDisplay);
@@ -2315,6 +2315,10 @@ async function main() {
   await testAuditBug_scriptProcessorDisconnect();
   await testAuditBug_talkBtnClassList();
   await testAuditBug_flowMuteBtnSync();
+
+  // Round 12: Pane pin + audit backlog fixes
+  await testAuditBug_chunkFlowTsPruning();
+  await testAuditBug_activateWindowUnified();
 
   await teardown();
 }
@@ -4075,12 +4079,12 @@ async function testTtsPerWindowIsolation() {
   const hasWindowGuard = queueTtsFn.includes("entry.window !== getWindowKey()");
   report("queueTts skips entries from different window", hasWindowGuard);
 
-  // 4. Window switch stops TTS BEFORE loading new entries (via activateWindow)
-  const switchSection2 = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 3200);
+  // 4. Window switch stops TTS BEFORE loading new entries (via _activateWindowCore)
+  const switchSection2 = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
   const stopBeforeLoad = switchSection2.indexOf("stopClientPlayback2") < switchSection2.indexOf("loadWindowEntries");
   report("Window switch stops TTS before loading new entries", stopBeforeLoad);
 
-  // 5. Window switch marks loaded entries as spoken=true (via activateWindow)
+  // 5. Window switch marks loaded entries as spoken=true (via _activateWindowCore)
   const marksSpoken = switchSection2.includes("e.spoken = true");
   report("Window switch marks loaded entries as spoken (no auto-TTS)", marksSpoken);
 
@@ -4270,13 +4274,15 @@ async function testPerWindowConversationIsolation() {
   const switchResetsStream = src.includes('streamState = "IDLE"');
   report("Window switch resets streamState to IDLE", switchResetsStream);
 
-  // 17. Window switch initializes new pane snapshot (via activateWindow)
-  const activateSnap = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 6500);
+  // 17. Window switch initializes new pane snapshot (via _activateWindowCore)
+  const activateSnap = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
   const switchInitSnapshot = activateSnap.includes("lastPassiveSnapshot = captureTmuxPane");
   report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
 
-  // 18. Window switch resets preInputSnapshot
-  const switchResetsPreInput = /tmux:switch[\s\S]{0,2000}preInputSnapshot =/.test(src);
+  // 18. Window switch resets preInputSnapshot (now in _activateWindowCore)
+  const coreIdx = src.indexOf("function _activateWindowCore");
+  const coreSection = src.slice(coreIdx, coreIdx + 3000);
+  const switchResetsPreInput = coreSection.includes('preInputSnapshot = ""');
   report("Window switch resets preInputSnapshot", switchResetsPreInput);
 
   // 19. _pinCurrentPane targets session:window, not just session (root cause of all-entries-in-one-window)
@@ -4369,7 +4375,7 @@ async function testNonVoiceSessionTtsSuppression() {
   const preservesSpeakable = pushFn.includes("isVoiceSession()") && !pushFn.includes("entry.speakable = false");
   report("pushEntry preserves speakable for non-voice sessions (TTS-only suppression)", preservesSpeakable);
 
-  // 4. loadScrollbackEntries hardcodes speakable: true for user entries (they're historical prose)
+  // 4. loadScrollbackEntries hardcodes speakable: true for user entries (historical prose)
   const scrollbackStart = src.indexOf("function loadScrollbackEntries");
   const scrollbackEnd = src.indexOf("\n  return entries;\n}", scrollbackStart) + 20;
   const scrollbackFn = src.slice(scrollbackStart, scrollbackEnd);
@@ -4440,8 +4446,8 @@ async function testStatusScopingOnWindowSwitch() {
   const hasActivate = src.includes("function activateWindow(");
   report("activateWindow() shared function exists", hasActivate);
 
-  // 6. activateWindow resets streamState + broadcasts idle
-  const activateStart = src.indexOf("function activateWindow(");
+  // 6. _activateWindowCore (shared by activateWindow) resets streamState + broadcasts idle
+  const activateStart = src.indexOf("function _activateWindowCore");
   const activateFn = src.slice(activateStart, activateStart + 5500);
   const resetsStream = activateFn.includes('streamState');
   const broadcastsIdle = activateFn.includes('voice_status", state: "idle"');
@@ -4505,9 +4511,9 @@ async function testBug_serverOwnPaneExclusion() {
   const detectsOwnPane = src.includes("_serverOwnPaneId") && src.includes('display-message", "-p", "#{pane_id}"');
   report("Server detects own pane ID on startup", detectsOwnPane);
 
-  // 2. activateWindow() rejects activation if resolved pane is server's own
-  const activateStart = src.indexOf("function activateWindow(");
-  const activateFn = src.slice(activateStart, activateStart + 1500);
+  // 2. _activateWindowCore() rejects activation if resolved pane is server's own
+  const activateStart = src.indexOf("function _activateWindowCore");
+  const activateFn = src.slice(activateStart, activateStart + 5500);
   const blocksOwnPane = activateFn.includes("_serverOwnPaneId") && activateFn.includes("refusing to scrape ourselves");
   report("activateWindow() blocks activation of server's own pane", blocksOwnPane);
 
@@ -4544,8 +4550,8 @@ async function testBug_pasteInputDetection() {
   const usesPending = spinnerSection.includes("pendingInput.length > userInput.length") && spinnerSection.includes("paste detected");
   report("Spinner handler uses pending input for paste detection", usesPending);
 
-  // 4. Pending input cleared on window activation
-  const activateSection = src.slice(src.indexOf("function activateWindow("), src.indexOf("function activateWindow(") + 2000);
+  // 4. Pending input cleared on window activation (in _activateWindowCore)
+  const activateSection = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
   const clearedOnActivate = activateSection.includes("_pendingPromptInput = \"\"");
   report("Pending input cleared on window activation", clearedOnActivate);
 
@@ -4965,9 +4971,9 @@ async function testBubblesDisappearWindowSwitch() {
   report("getWindowKey uses displayTarget (stable key)", usesDisplayTarget);
   report("getWindowKey does NOT use currentTarget (volatile pane ID)", !usesCurrentTarget);
 
-  // 2. _executeWindowSwitch saves entries before switching
-  const switchFnIdx = src.indexOf("function _executeWindowSwitch");
-  const switchBody = src.slice(switchFnIdx, switchFnIdx + 5000);
+  // 2. _activateWindowCore saves entries before switching (called by _executeWindowSwitch)
+  const switchFnIdx = src.indexOf("function _activateWindowCore");
+  const switchBody = src.slice(switchFnIdx, switchFnIdx + 5500);
   const savesBeforeSwitch = switchBody.includes("saveCurrentWindowEntries()");
   report("_executeWindowSwitch saves entries before switch", savesBeforeSwitch);
 
@@ -5163,9 +5169,9 @@ async function testSwitchBug_ownPaneInfoEntry() {
 
   // Both activateWindow and _executeWindowSwitch have the fix
   const activateSection = src.slice(src.indexOf("function activateWindow"), src.indexOf("function activateWindow") + 3000);
-  const executeSection = src.slice(src.indexOf("function _executeWindowSwitch"), src.indexOf("function _executeWindowSwitch") + 3000);
-  report("activateWindow shows info entry on own pane", activateSection.includes("This is the Murmur server"));
-  report("_executeWindowSwitch shows info entry on own pane", executeSection.includes("This is the Murmur server"));
+  const coreSection = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
+  report("activateWindow shows info entry on own pane", activateSection.includes("_activateWindowCore") || coreSection.includes("This is the Murmur server"));
+  report("_executeWindowSwitch shows info entry on own pane", coreSection.includes("This is the Murmur server"));
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -5334,7 +5340,7 @@ async function testPassiveRedetect_preservesTts() {
 
   // passive_redetect is NOT in USER_INITIATED_BUMP_REASONS
   const setStart = src.indexOf("USER_INITIATED_BUMP_REASONS");
-  const setEnd = src.indexOf("]);", setStart) + 3;  // just the Set definition, not the GenerationEvent interface after it
+  const setEnd = src.indexOf("]);", setStart) + 3;
   const reasonSetSection = src.slice(setStart, setEnd);
   const inSet = reasonSetSection.includes("passive_redetect");
   report("passive_redetect NOT in USER_INITIATED_BUMP_REASONS", !inSet);
@@ -5535,15 +5541,15 @@ async function testEmptyArrayTruthinessFix() {
 
   const src = readFileSync("server.ts", "utf-8");
 
-  // Both activateWindow and _executeWindowSwitch should check cached.length > 0
-  const activateIdx = src.indexOf("function activateWindow(");
-  const activateSection = src.slice(activateIdx, activateIdx + 4000);
-  const hasLengthCheck1 = activateSection.includes("realCached && realCached.length > 0");
+  // _activateWindowCore (shared by activateWindow + _executeWindowSwitch) checks cached.length > 0
+  const activateCoreIdx = src.indexOf("function _activateWindowCore");
+  const activateCoreSection = src.slice(activateCoreIdx, activateCoreIdx + 5500);
+  const hasLengthCheck1 = activateCoreSection.includes("realCached && realCached.length > 0");
   report("activateWindow checks cached.length > 0", hasLengthCheck1);
 
-  const switchIdx = src.indexOf("function _executeWindowSwitch(");
-  const switchSection = src.slice(switchIdx, switchIdx + 2000);
-  const hasLengthCheck2 = switchSection.includes("realCached && realCached.length > 0");
+  const coreIdx = src.indexOf("function _activateWindowCore");
+  const coreSection = src.slice(coreIdx, coreIdx + 5500);
+  const hasLengthCheck2 = coreSection.includes("realCached && realCached.length > 0");
   report("_executeWindowSwitch checks cached.length > 0", hasLengthCheck2);
 }
 
@@ -5713,10 +5719,8 @@ async function testScrollbackSpeakableClassification() {
   const src = readFileSync("server.ts", "utf-8");
 
   const scrollbackIdx = src.indexOf("function loadScrollbackEntries");
-  // Use function boundary (ends with "\n}" at top level) instead of fixed window
-  // to avoid capturing code from subsequent functions like broadcastCurrentOutput
-  const scrollbackEnd = src.indexOf("\n  return entries;\n}", scrollbackIdx);
-  const scrollbackSection = src.slice(scrollbackIdx, scrollbackEnd > scrollbackIdx ? scrollbackEnd + 20 : scrollbackIdx + 14000);
+  const scrollbackFnEnd = src.indexOf("\n  return entries;\n}", scrollbackIdx);
+  const scrollbackSection = src.slice(scrollbackIdx, scrollbackFnEnd > scrollbackIdx ? scrollbackFnEnd + 20 : scrollbackIdx + 14000);
 
   // Should use state machine with isToolMarker/isProseMarker, NOT isToolOutputLine or isVoiceSession
   const usesToolMarker = scrollbackSection.includes("isToolMarker");
@@ -6096,6 +6100,61 @@ async function testAuditBug_flowMuteBtnSync() {
   // flowMuteBtn should get opacity/pointerEvents synced in applyMode
   const flowOpacitySync = applyModeBody.includes("opacity") && (applyModeBody.includes("flowMuteBtn") || applyModeBody.includes("_fmb"));
   report("applyMode syncs flowMuteBtn opacity for mic-off modes", flowOpacitySync);
+}
+
+// --- Audit Backlog: _lastChunkFlowTs pruning + activateWindow unification ---
+
+async function testAuditBug_chunkFlowTsPruning() {
+  console.log("\n[AUDIT-M1] _lastChunkFlowTs Map is pruned to prevent unbounded growth");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Verify pruning constants exist
+  const hasMaxSize = src.includes("CHUNK_FLOW_TS_MAX_SIZE");
+  report("CHUNK_FLOW_TS_MAX_SIZE constant defined", hasMaxSize);
+
+  const hasMaxAge = src.includes("CHUNK_FLOW_TS_MAX_AGE_MS");
+  report("CHUNK_FLOW_TS_MAX_AGE_MS constant defined", hasMaxAge);
+
+  // Verify logChunkFlow has pruning logic
+  const fnStart = src.indexOf("function logChunkFlow");
+  const fnBody = src.slice(fnStart, fnStart + 1000);
+  const hasPrune = fnBody.includes("_lastChunkFlowTs.delete(");
+  report("logChunkFlow prunes stale entries from _lastChunkFlowTs", hasPrune);
+
+  const hasSizeCheck = fnBody.includes("_lastChunkFlowTs.size");
+  report("Pruning triggered by map size exceeding threshold", hasSizeCheck);
+}
+
+async function testAuditBug_activateWindowUnified() {
+  console.log("\n[AUDIT-I2] activateWindow and _executeWindowSwitch share _activateWindowCore");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // _activateWindowCore exists and contains the shared logic
+  const hasCoreFunc = src.includes("function _activateWindowCore");
+  report("_activateWindowCore shared helper exists", hasCoreFunc);
+
+  // activateWindow delegates to _activateWindowCore
+  const activateIdx = src.indexOf("function activateWindow(");
+  const activateBody = src.slice(activateIdx, activateIdx + 500);
+  const delegatesToCore = activateBody.includes("_activateWindowCore(");
+  report("activateWindow delegates to _activateWindowCore", delegatesToCore);
+
+  // _executeWindowSwitch delegates to _activateWindowCore
+  const switchIdx = src.indexOf("function _executeWindowSwitch");
+  const switchBody = src.slice(switchIdx, switchIdx + 500);
+  const switchDelegates = switchBody.includes("_activateWindowCore(");
+  report("_executeWindowSwitch delegates to _activateWindowCore", switchDelegates);
+
+  // _activateWindowCore has the key logic
+  const coreIdx = src.indexOf("function _activateWindowCore");
+  const coreBody = src.slice(coreIdx, coreIdx + 5500);
+  report("Core has stopClientPlayback2", coreBody.includes("stopClientPlayback2"));
+  report("Core has loadWindowEntries", coreBody.includes("loadWindowEntries"));
+  report("Core has loadScrollbackEntries", coreBody.includes("loadScrollbackEntries"));
+  report("Core has voice_status idle broadcast", coreBody.includes('voice_status", state: "idle"'));
+  report("Core has own-pane detection", coreBody.includes("_serverOwnPaneId"));
 }
 
 main().catch(err => {
