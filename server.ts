@@ -489,8 +489,14 @@ function saveSettings(updates: Partial<PanelSettings>) {
   const merged = { ...current, ...updates };
   // Atomic write: write to temp file then rename to prevent corruption on crash
   const tmpFile = SETTINGS_FILE + ".tmp";
-  writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
-  renameSync(tmpFile, SETTINGS_FILE);
+  try {
+    writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
+    renameSync(tmpFile, SETTINGS_FILE);
+  } catch (err) {
+    // BUG-110 fix: Log error but re-throw so callers know save failed
+    console.error("Failed to save settings:", (err as Error).message);
+    throw err;
+  }
 }
 
 // On startup, write persisted settings to signal files so VoiceMode picks them up
@@ -1881,6 +1887,14 @@ function handleChunkDone(entryId: number | null, chunkIndex: number): void {
     // All chunks sent and played — wait for tts_done from client
     // (tts_done triggers handleTtsDone2 which cleans up)
     console.log(`[tts2] All ${job.chunks.length} chunks played for entry=${entryId}, awaiting tts_done`);
+    // BUG-123 fix: Set safety timeout for tts_done — if client never sends it,
+    // force-complete instead of waiting up to 25s for the sweep to catch it.
+    ttsPlaybackTimeout2 = setTimeout(() => {
+      if (ttsCurrentlyPlaying === job && job.currentChunkIndex === chunkIndex) {
+        console.warn(`[tts2] tts_done timeout after all chunks played — forcing done for entry=${entryId}`);
+        handleTtsDone2(entryId);
+      }
+    }, 5000); // 5s is generous — client should send tts_done within ~100ms of last chunk finishing
     return;
   }
 

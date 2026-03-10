@@ -6386,7 +6386,7 @@
       // on non-partial (final) broadcasts. See renderEntries bubble-dropped logic.
       setTalkState("idle");
     }
-    const TTS_ECHO_COOLDOWN = 150;   // 150ms cooldown after TTS ends (echoCancellation handles the rest)
+    const TTS_ECHO_COOLDOWN = 600;   // 600ms cooldown after TTS ends — prevents filler echo triggering VAD (BUG-113)
 
     async function ensureMicStream() {
       if (micStream && micStream.getTracks().every(t => t.readyState === "live")) return micStream;
@@ -7471,7 +7471,8 @@
           if (ttsPlaying) { if (shouldLog) rlog("[auto-listen] BLOCKED: ttsPlaying"); return; }
         }
         const echoCd = Date.now() - ttsEndedAt;
-        if (!inFlowMode && echoCd < TTS_ECHO_COOLDOWN) { if (shouldLog) rlog(`[auto-listen] BLOCKED: echo cooldown ${echoCd}ms`); return; }
+        // BUG-113 fix: Apply echo cooldown in ALL modes (including flow) to prevent filler audio feedback loop
+        if (echoCd < TTS_ECHO_COOLDOWN) { if (shouldLog) rlog(`[auto-listen] BLOCKED: echo cooldown ${echoCd}ms`); return; }
 
         // Resume AudioContext if iOS suspended it (common after TTS playback)
         if (ttsAudioCtx && ttsAudioCtx.state === "suspended") {

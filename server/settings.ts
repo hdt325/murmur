@@ -31,7 +31,9 @@ export function saveSettings(settingsFile: string, updates: Partial<PanelSetting
     writeFileSync(tmpFile, JSON.stringify(merged, null, 2));
     renameSync(tmpFile, settingsFile);
   } catch (err) {
+    // BUG-110 fix: Log AND re-throw so callers know save failed
     console.error("Failed to save settings:", (err as Error).message);
+    throw err;
   }
 }
 

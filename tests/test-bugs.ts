@@ -2320,6 +2320,11 @@ async function main() {
   await testAuditBug_chunkFlowTsPruning();
   await testAuditBug_activateWindowUnified();
 
+  // Round 13: TTS stall, filler echo, settings error propagation
+  await testBug123_ttsDoneSafetyTimeout();
+  await testBug113_fillerEchoCooldown();
+  await testBug110_settingsSaveErrorPropagation();
+
   await teardown();
 }
 
@@ -4279,10 +4284,10 @@ async function testPerWindowConversationIsolation() {
   const switchInitSnapshot = activateSnap.includes("lastPassiveSnapshot = captureTmuxPane");
   report("Window switch initializes passive snapshot from new pane", switchInitSnapshot);
 
-  // 18. Window switch resets preInputSnapshot (now in _activateWindowCore)
-  const coreIdx = src.indexOf("function _activateWindowCore");
-  const coreSection = src.slice(coreIdx, coreIdx + 3000);
-  const switchResetsPreInput = coreSection.includes('preInputSnapshot = ""');
+  // 18. Window switch resets preInputSnapshot
+  const coreIdx2 = src.indexOf("function _activateWindowCore");
+  const coreSection2 = src.slice(coreIdx2, coreIdx2 + 3000);
+  const switchResetsPreInput = coreSection2.includes('preInputSnapshot = ""');
   report("Window switch resets preInputSnapshot", switchResetsPreInput);
 
   // 19. _pinCurrentPane targets session:window, not just session (root cause of all-entries-in-one-window)
@@ -6155,6 +6160,72 @@ async function testAuditBug_activateWindowUnified() {
   report("Core has loadScrollbackEntries", coreBody.includes("loadScrollbackEntries"));
   report("Core has voice_status idle broadcast", coreBody.includes('voice_status", state: "idle"'));
   report("Core has own-pane detection", coreBody.includes("_serverOwnPaneId"));
+}
+
+// --- BUG-123: TTS stall — safety timeout after all chunks played ---
+
+async function testBug123_ttsDoneSafetyTimeout() {
+  console.log("\n[BUG-123] handleChunkDone sets safety timeout when all chunks are played");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // Find handleChunkDone function
+  const fnStart = src.indexOf("function handleChunkDone(");
+  const fnBody = src.slice(fnStart, fnStart + 2000);
+
+  // After "All chunks sent and played", there should be a ttsPlaybackTimeout2 safety timeout
+  const allChunksSection = fnBody.slice(fnBody.indexOf("All") || 0);
+  const hasSafetyTimeout = allChunksSection.includes("ttsPlaybackTimeout2 = setTimeout(");
+  report("handleChunkDone sets safety timeout after all chunks played", hasSafetyTimeout);
+
+  // The timeout should call handleTtsDone2 as fallback
+  const hasForceComplete = allChunksSection.includes("handleTtsDone2(entryId)");
+  report("Safety timeout forces handleTtsDone2 if client silent", hasForceComplete);
+
+  // Verify the fix: awaiting tts_done section has safety timeout protection
+  const awaitingSection = fnBody.slice(fnBody.indexOf("awaiting tts_done") || 0, fnBody.indexOf("awaiting tts_done") + 400);
+  const hasTimeoutProtection = awaitingSection.includes("setTimeout") || awaitingSection.includes("ttsPlaybackTimeout");
+  report("Awaiting tts_done has safety timeout protection", hasTimeoutProtection);
+}
+
+// --- BUG-113: Filler echo cooldown ---
+
+async function testBug113_fillerEchoCooldown() {
+  console.log("\n[BUG-113] Echo cooldown prevents filler audio mic feedback loop");
+
+  const src = readFileSync("index.html", "utf-8");
+
+  // TTS_ECHO_COOLDOWN should be >= 400ms (not the old 150ms)
+  const cooldownMatch = src.match(/TTS_ECHO_COOLDOWN\s*=\s*(\d+)/);
+  const cooldownMs = cooldownMatch ? parseInt(cooldownMatch[1]) : 0;
+  report("TTS_ECHO_COOLDOWN is >= 400ms (was 150ms)", cooldownMs >= 400);
+
+  // Echo cooldown should apply in ALL modes (including flow mode)
+  // The old code had: if (!inFlowMode && echoCd < TTS_ECHO_COOLDOWN)
+  // Fixed: if (echoCd < TTS_ECHO_COOLDOWN) — no flow mode check
+  const cooldownLine = src.slice(src.indexOf("echoCd < TTS_ECHO_COOLDOWN") - 80, src.indexOf("echoCd < TTS_ECHO_COOLDOWN") + 100);
+  const appliesToAllModes = !cooldownLine.includes("!inFlowMode");
+  report("Echo cooldown applies in flow mode too (not just normal)", appliesToAllModes);
+}
+
+// --- BUG-110: Settings save error propagation ---
+
+async function testBug110_settingsSaveErrorPropagation() {
+  console.log("\n[BUG-110] saveSettings propagates errors instead of swallowing them");
+
+  // Check server.ts main saveSettings
+  const serverSrc = readFileSync("server.ts", "utf-8");
+  const fnStart = serverSrc.indexOf("function saveSettings(");
+  const fnBody = serverSrc.slice(fnStart, fnStart + 700);
+  const hasThrow = fnBody.includes("throw err") || fnBody.includes("throw e");
+  report("server.ts saveSettings re-throws errors", hasThrow);
+
+  // Check server/settings.ts module saveSettings
+  const modSrc = readFileSync("server/settings.ts", "utf-8");
+  const modFnStart = modSrc.indexOf("export function saveSettings(");
+  const modFnBody = modSrc.slice(modFnStart, modFnStart + 500);
+  const modHasThrow = modFnBody.includes("throw err") || modFnBody.includes("throw e");
+  report("server/settings.ts saveSettings re-throws errors", modHasThrow);
 }
 
 main().catch(err => {
