@@ -384,12 +384,19 @@ interface ParseParagraphEntry {
 }
 const _parseParagraphs: ParseParagraphEntry[] = [];
 
+let _parselogLastText = "";
+let _parselogLastAction = "";
 function parselog(text: string, action: "skip" | "nonspeakable" | "speakable", reason: string) {
+  const snippet = text.slice(0, 120);
+  // Suppress consecutive identical entries to prevent parse-log flooding
+  if (snippet === _parselogLastText && action === _parselogLastAction) return;
+  _parselogLastText = snippet;
+  _parselogLastAction = action;
   if (action === "skip") {
-    _parseDiscards.push({ ts: Date.now(), text: text.slice(0, 120), reason });
+    _parseDiscards.push({ ts: Date.now(), text: snippet, reason });
     if (_parseDiscards.length > 200) _parseDiscards.shift();
   } else {
-    _parseParagraphs.push({ ts: Date.now(), text: text.slice(0, 120), speakable: action === "speakable", reason });
+    _parseParagraphs.push({ ts: Date.now(), text: snippet, speakable: action === "speakable", reason });
     if (_parseParagraphs.length > 100) _parseParagraphs.shift();
   }
 }
