@@ -6574,13 +6574,18 @@ async function testBug051_captureJoinWrapped() {
   console.log("\n[BUG-051] tmux capture-pane joins wrapped lines");
   const src = readFileSync("terminal/tmux-backend.ts", "utf-8");
 
+  // Use function boundary detection — find next method or end-of-class
   const captureFnStart = src.indexOf("capturePane(): string");
-  const captureFn = src.slice(captureFnStart, src.indexOf("}", captureFnStart + 50) + 1);
+  let captureFnEnd = src.indexOf("\n  capture", captureFnStart + 30); // next capture* method
+  if (captureFnEnd === -1) captureFnEnd = src.indexOf("\n  }", captureFnStart + 30);
+  const captureFn = src.slice(captureFnStart, captureFnEnd);
   const hasJoinFlag = captureFn.includes('"-J"');
   report("capturePane uses -J flag to join wrapped lines", hasJoinFlag);
 
   const scrollFnStart = src.indexOf("capturePaneScrollback(): string");
-  const scrollFn = src.slice(scrollFnStart, src.indexOf("}", scrollFnStart + 50) + 1);
+  let scrollFnEnd = src.indexOf("\n  start", scrollFnStart + 30); // next method (startPipeStream)
+  if (scrollFnEnd === -1) scrollFnEnd = src.indexOf("\n  }", scrollFnStart + 30);
+  const scrollFn = src.slice(scrollFnStart, scrollFnEnd);
   const scrollHasJoin = scrollFn.includes('"-J"');
   report("capturePaneScrollback uses -J flag", scrollHasJoin);
 }
