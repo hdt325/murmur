@@ -2243,9 +2243,6 @@ async function main() {
   await testStatusScopingOnWindowSwitch();
   await testTtsQueueStallRecovery();
 
-  // Server own-pane exclusion
-  await testBug_serverOwnPaneExclusion();
-
   // Paste input detection
   await testBug_pasteInputDetection();
 
@@ -2283,7 +2280,6 @@ async function main() {
   await testSaveSettings_errorHandling();
 
   // Round 9: switch bugs + table filter + agent infra filter + dropped TTS
-  await testSwitchBug_ownPaneInfoEntry();
   await testSwitchBug_cacheKeyConsistency();
   await testSwitchBug_pinPaneFallback();
   await testTableDataRowFilter();
@@ -2325,6 +2321,12 @@ async function main() {
   await testBug123_ttsDoneSafetyTimeout();
   await testBug113_fillerEchoCooldown();
   await testBug110_settingsSaveErrorPropagation();
+
+  // Round 14: Kokoro retry, WS keepalive, terminal dedup, queue trim
+  await testBug050_kokoroRetryHandling();
+  await testBug046_wsPongKeepalive();
+  await testBug045_terminalBroadcastDedup();
+  await testBug047_ttsQueueTrimming();
 
   await teardown();
 }
@@ -4442,7 +4444,7 @@ async function testStatusScopingOnWindowSwitch() {
 
   // 4. Terminal broadcaster is gated on isWindowActive
   const termBroadcast = src.indexOf("Broadcast tmux pane content with ANSI");
-  const termSection = src.slice(termBroadcast, termBroadcast + 300);
+  const termSection = src.slice(termBroadcast, termBroadcast + 600);
   const termGated = termSection.includes("isWindowActive()");
   report("Terminal content broadcaster gates on isWindowActive()", termGated);
 
@@ -4505,35 +4507,6 @@ async function testTtsQueueStallRecovery() {
   // 5. Safety drain when queue has items but nothing playing
   const safetyDrain = sweepFn.includes("ttsJobQueue.length > 0") && sweepFn.includes("drainAudioBuffer()");
   report("Sweep safety-drains when queue non-empty + nothing playing", safetyDrain);
-}
-
-// --- Server own-pane exclusion (prevents coordinator output leaking into conversation) ---
-async function testBug_serverOwnPaneExclusion() {
-  console.log("\n[PANE-EXCLUSION] Server detects and excludes its own pane from scraping");
-  const src = readFileSync("server.ts", "utf-8");
-
-  // 1. Server detects its own pane ID on startup
-  const detectsOwnPane = src.includes("_serverOwnPaneId") && src.includes('display-message", "-p", "#{pane_id}"');
-  report("Server detects own pane ID on startup", detectsOwnPane);
-
-  // 2. _activateWindowCore() rejects activation if resolved pane is server's own
-  const activateStart = src.indexOf("function _activateWindowCore");
-  const activateFn = src.slice(activateStart, activateStart + 5500);
-  const blocksOwnPane = activateFn.includes("_serverOwnPaneId") && activateFn.includes("refusing to scrape ourselves");
-  report("activateWindow() blocks activation of server's own pane", blocksOwnPane);
-
-  // 3. Passive watcher has safety-net guard against own pane
-  const watcherStart = src.indexOf("function startPassiveWatcher");
-  const watcherFn = src.slice(watcherStart, watcherStart + 500);
-  const watcherGuard = watcherFn.includes("_serverOwnPaneId") && watcherFn.includes("terminal.currentTarget");
-  report("Passive watcher has own-pane safety guard", watcherGuard);
-
-  // 4. Terminal panel broadcast also guards against own pane
-  // Use lastIndexOf to find the broadcast usage (setInterval), not the function definition
-  const termBroadcastIdx = src.lastIndexOf("captureTerminalPane()");
-  const termBroadcastSection = src.slice(Math.max(0, termBroadcastIdx - 300), termBroadcastIdx);
-  const termGuard = termBroadcastSection.includes("_serverOwnPaneId");
-  report("Terminal panel broadcast guards against own pane", termGuard);
 }
 
 // --- Paste input detection via pending prompt capture ---
@@ -5161,24 +5134,6 @@ async function testScrollbackParserAssistantEntries() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Switch bug: own-pane shows info entry, not blank
-// ──────────────────────────────────────────────────────────────
-async function testSwitchBug_ownPaneInfoEntry() {
-  console.log("\n[SWITCH-OWN-PANE] Own-pane guard shows info entry instead of blank");
-
-  const src = readFileSync("server.ts", "utf-8");
-
-  // Own pane path creates an info ConversationEntry
-  const hasInfoEntry = src.includes("server's own terminal") && src.includes("Switch to a Claude session");
-  report("Own-pane path creates informational entry", hasInfoEntry);
-
-  // Both activateWindow and _executeWindowSwitch have the fix
-  const activateSection = src.slice(src.indexOf("function activateWindow"), src.indexOf("function activateWindow") + 3000);
-  const coreSection = src.slice(src.indexOf("function _activateWindowCore"), src.indexOf("function _activateWindowCore") + 5500);
-  report("activateWindow shows info entry on own pane", activateSection.includes("_activateWindowCore") || coreSection.includes("This is the Murmur server"));
-  report("_executeWindowSwitch shows info entry on own pane", coreSection.includes("This is the Murmur server"));
-}
-
 // ──────────────────────────────────────────────────────────────
 // Switch bug: cache key consistency (save uses currentWindowKey)
 // ──────────────────────────────────────────────────────────────
@@ -6159,7 +6114,7 @@ async function testAuditBug_activateWindowUnified() {
   report("Core has loadWindowEntries", coreBody.includes("loadWindowEntries"));
   report("Core has loadScrollbackEntries", coreBody.includes("loadScrollbackEntries"));
   report("Core has voice_status idle broadcast", coreBody.includes('voice_status", state: "idle"'));
-  report("Core has own-pane detection", coreBody.includes("_serverOwnPaneId"));
+  report("Own-pane detection removed (scrapes any window)", !coreBody.includes("_serverOwnPaneId"));
 }
 
 // --- BUG-123: TTS stall — safety timeout after all chunks played ---
@@ -6249,6 +6204,116 @@ async function testBug110_settingsSaveErrorPropagation() {
   const modFnBody = modSrc.slice(modFnStart, modFnStart + 500);
   const modHasThrow = modFnBody.includes("throw err") || modFnBody.includes("throw e");
   report("server/settings.ts saveSettings re-throws errors", modHasThrow);
+}
+
+// --- BUG-050: Kokoro TTS retry handling ---
+
+async function testBug050_kokoroRetryHandling() {
+  console.log("\n[BUG-050] Kokoro TTS retry on connection error + service recovery drain");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // fetchKokoroAudio has retry parameter
+  const fnStart = src.indexOf("async function fetchKokoroAudio(");
+  const fnSig = src.slice(fnStart, fnStart + 200);
+  const hasRetryParam = fnSig.includes("_retryCount");
+  report("fetchKokoroAudio has retry count parameter", hasRetryParam);
+
+  // Connection error detection (ECONNREFUSED, fetch failed, ECONNRESET)
+  const fnEnd = src.indexOf("\nasync function ", fnStart + 1);
+  const fnBody = src.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 5000);
+  const hasConnCheck = fnBody.includes("ECONNREFUSED") && fnBody.includes("ECONNRESET");
+  report("Detects connection errors (ECONNREFUSED, ECONNRESET)", hasConnCheck);
+
+  // Retry logic: resets chunk to pending, waits, retries
+  const hasRetryLogic = fnBody.includes('chunk.state = "pending"') && fnBody.includes("fetchKokoroAudio(job, chunkIndex,");
+  report("Retry resets chunk to pending and re-calls fetchKokoroAudio", hasRetryLogic);
+
+  // TtsFetchLog status includes "retry"
+  const hasRetryStatus = src.includes('"retry"') && src.includes("status:");
+  report("TtsFetchLog supports 'retry' status", hasRetryStatus);
+
+  // Service recovery: Kokoro comes back → drain queued jobs
+  const serviceCheck = src.slice(src.indexOf("Kokoro back online"));
+  const hasDrainOnRecovery = serviceCheck.includes("drainAudioBuffer()");
+  report("Kokoro service recovery triggers drainAudioBuffer", hasDrainOnRecovery);
+}
+
+// --- BUG-046: WebSocket pong keepalive ---
+
+async function testBug046_wsPongKeepalive() {
+  console.log("\n[BUG-046] WebSocket ping/pong keepalive with stale cleanup");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // _lastPong tracked on ws connection
+  const hasLastPong = src.includes("_lastPong");
+  report("Tracks _lastPong timestamp on WebSocket connections", hasLastPong);
+
+  // Pong handler set on connection
+  const hasPongHandler = src.includes('ws.on("pong"') || src.includes("ws.on('pong'");
+  report("Pong event handler registered on connection", hasPongHandler);
+
+  // WS_PONG_TIMEOUT_MS constant exists
+  const hasTimeout = src.includes("WS_PONG_TIMEOUT_MS");
+  report("WS_PONG_TIMEOUT_MS constant defined", hasTimeout);
+
+  // Stale client termination in ping interval
+  const hasTerminate = src.includes("ws.terminate()") && src.includes("no pong");
+  report("Stale clients terminated with ws.terminate()", hasTerminate);
+}
+
+// --- BUG-045: Terminal broadcast dedup ---
+
+async function testBug045_terminalBroadcastDedup() {
+  console.log("\n[BUG-045] Terminal broadcast uses normalized comparison to skip unchanged content");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // _normalizeTerminalText function exists
+  const hasNormalize = src.includes("function _normalizeTerminalText");
+  report("_normalizeTerminalText function exists", hasNormalize);
+
+  // Normalization strips trailing whitespace
+  const normStart = src.indexOf("function _normalizeTerminalText");
+  const normBody = src.slice(normStart, normStart + 300);
+  const stripsTrailing = normBody.includes("trimEnd") || normBody.includes("replace");
+  report("Normalization strips trailing whitespace", stripsTrailing);
+
+  // Comparison uses normalized text
+  const broadcastSection = src.slice(src.indexOf("_lastTerminalHash"));
+  const usesHash = broadcastSection.includes("normalized !== _lastTerminalHash");
+  report("Broadcast comparison uses normalized hash", usesHash);
+}
+
+// --- BUG-047: TTS queue trimming ---
+
+async function testBug047_ttsQueueTrimming() {
+  console.log("\n[BUG-047] TTS queue trims stale jobs when threshold exceeded");
+
+  const src = readFileSync("server.ts", "utf-8");
+
+  // TTS_QUEUE_TRIM_THRESHOLD constant
+  const hasTrimThreshold = src.includes("TTS_QUEUE_TRIM_THRESHOLD");
+  report("TTS_QUEUE_TRIM_THRESHOLD constant defined", hasTrimThreshold);
+
+  // Trim threshold is <= 20 (reasonable for real-time conversation)
+  const trimMatch = src.match(/TTS_QUEUE_TRIM_THRESHOLD\s*=\s*(\d+)/);
+  const trimVal = trimMatch ? parseInt(trimMatch[1]) : 999;
+  report("Trim threshold is <= 20 items", trimVal <= 20);
+
+  // Queue trimming logic exists (splices old jobs)
+  const hasTrimLogic = src.includes("Queue trimmed") && src.includes("ttsJobQueue.splice(");
+  report("Queue trim removes stale jobs with splice", hasTrimLogic);
+
+  // Trimming aborts in-flight fetches before removing
+  const trimSection = src.slice(src.indexOf("Queue trimmed") - 500, src.indexOf("Queue trimmed"));
+  const abortsOnTrim = trimSection.includes("abortController") && trimSection.includes("abort()");
+  report("Trim aborts in-flight fetches before removing jobs", abortsOnTrim);
+
+  // Age-based trim (jobs older than 30s)
+  const hasAgeTrim = trimSection.includes("createdAt") && trimSection.includes("30000");
+  report("Trims jobs older than 30s", hasAgeTrim);
 }
 
 main().catch(err => {

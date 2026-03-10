@@ -792,7 +792,7 @@ interface TtsFetchLog {
   fetchEndTs: number;
   durationMs: number;
   audioSizeBytes: number;
-  status: "success" | "failed" | "aborted";
+  status: "success" | "failed" | "aborted" | "retry";
   error?: string;
 }
 const _ttsFetchLog: TtsFetchLog[] = []; // ring buffer, last 50
@@ -992,6 +992,7 @@ const TTS_CHUNK_MIN_CHARS = 50;  // Floor — don't send tiny fragments to Kokor
 const TTS_CHUNK_MAX_CHARS = 250;
 const TTS_FIRST_CHUNK_MAX = 120; // Smaller first chunk → faster initial audio from Kokoro
 const TTS_MAX_QUEUE = 50;
+const TTS_QUEUE_TRIM_THRESHOLD = 15; // BUG-047: Trim oldest non-playing jobs when queue exceeds this
 const TTS_PLAYING_TIMEOUT_MS = 8000; // Max time a job can stay in "playing" without client ack
 
 /** Split text into chunks at word boundaries, each ≤ maxChars.
@@ -1050,8 +1051,9 @@ function splitIntoChunks(text: string, maxChars: number, firstChunkMax?: number)
   return chunks;
 }
 
-/** Fetch audio from Kokoro for a single chunk. Respects TTS_MAX_PARALLEL. */
-async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> {
+/** Fetch audio from Kokoro for a single chunk. Respects TTS_MAX_PARALLEL.
+ *  BUG-050: Retries once on connection error (Kokoro restart). */
+async function fetchKokoroAudio(job: TtsJob, chunkIndex: number, _retryCount = 0): Promise<void> {
   const chunk = job.chunks[chunkIndex];
   if (!chunk || chunk.state !== "pending") return;
 
@@ -1119,6 +1121,23 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
       logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "aborted");
       return;
     }
+    // BUG-050: Retry once on connection error (Kokoro may be restarting)
+    const isConnectionError = (err as Error).message?.includes("ECONNREFUSED") ||
+      (err as Error).message?.includes("fetch failed") ||
+      (err as Error).message?.includes("ECONNRESET");
+    if (isConnectionError && _retryCount < 1 && !isJobStale(job)) {
+      console.warn(`[tts2] Kokoro connection error (job=${job.jobId} chunk=${chunkIndex}), retrying in 2s...`);
+      logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "retry", (err as Error).message);
+      // Clean up before retry — finally block still runs, so don't double-decrement
+      clearTimeout(fetchTimeout);
+      _activeFetchCount--;
+      chunk.abortController = null;
+      chunk.state = "pending"; // Reset to pending for retry
+      await new Promise(r => setTimeout(r, 2000));
+      // fetchKokoroAudio will re-increment _activeFetchCount
+      fetchKokoroAudio(job, chunkIndex, _retryCount + 1).then(() => drainAudioBuffer()).catch(() => drainAudioBuffer());
+      return; // Skip finally's decrement — we already decremented
+    }
     console.error(`[tts2] Kokoro fetch failed (job=${job.jobId} chunk=${chunkIndex}):`, (err as Error).message);
     chunk.state = "failed";
     // If any chunk fails, mark the whole job failed
@@ -1126,7 +1145,10 @@ async function fetchKokoroAudio(job: TtsJob, chunkIndex: number): Promise<void> 
     logKokoroFetch(job.entryId, chunkIndex, chunk.text, fetchStartTs, 0, "failed", (err as Error).message);
   } finally {
     clearTimeout(fetchTimeout);
-    _activeFetchCount--;
+    // Guard against double-decrement when retry path already decremented
+    if (chunk.state !== "pending") {
+      _activeFetchCount--;
+    }
     chunk.abortController = null;
   }
 }
@@ -1401,9 +1423,35 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     }
   }
 
-  // Enforce max queue size
+  // BUG-047: Trim oldest non-playing jobs when queue grows too large
+  if (ttsJobQueue.length >= TTS_QUEUE_TRIM_THRESHOLD) {
+    let trimmed = 0;
+    const now = Date.now();
+    // Remove old jobs from the back of the queue (oldest first, skip currently playing)
+    for (let i = 0; i < ttsJobQueue.length && ttsJobQueue.length >= TTS_QUEUE_TRIM_THRESHOLD; i++) {
+      const job = ttsJobQueue[i];
+      if (ttsCurrentlyPlaying === job) continue; // Don't trim currently playing
+      if (job.state === "playing") continue;
+      // Trim jobs older than 30s or if we're at hard max
+      if ((job.createdAt > 0 && now - job.createdAt > 30000) || ttsJobQueue.length >= TTS_MAX_QUEUE) {
+        // Abort any in-flight fetches
+        for (const chunk of job.chunks) {
+          if (chunk.abortController) { try { chunk.abortController.abort(); } catch {} }
+        }
+        job.state = "failed";
+        ttsJobQueue.splice(i, 1);
+        i--; // Adjust index after splice
+        trimmed++;
+      }
+    }
+    if (trimmed > 0) {
+      console.warn(`[tts2] Queue trimmed: removed ${trimmed} stale jobs (queue now ${ttsJobQueue.length})`);
+    }
+  }
+
+  // Enforce max queue size (fallback after trim)
   if (ttsJobQueue.length >= TTS_MAX_QUEUE) {
-    console.warn(`[tts2] Queue full (${TTS_MAX_QUEUE}), dropping`);
+    console.warn(`[tts2] Queue still full after trim (${TTS_MAX_QUEUE}), dropping new item`);
     return;
   }
 
@@ -2467,21 +2515,7 @@ try {
   console.error("[startup] Failed to load window entries from disk:", (err as Error).message);
 }
 
-// --- Server's own pane exclusion ---
-// The server itself runs in a tmux pane. We MUST never scrape our own pane,
-// or coordinator/agent output leaks into the conversation view as entries/TTS.
-let _serverOwnPaneId: string | null = null;
-try {
-  const id = execFileSync("tmux", ["display-message", "-p", "#{pane_id}"], {
-    encoding: "utf-8", timeout: 3000
-  }).trim();
-  if (id && id.startsWith("%")) {
-    _serverOwnPaneId = id;
-    console.log(`[startup] Server's own pane: ${id} — will never scrape this pane`);
-  }
-} catch {
-  // Not running inside tmux — no exclusion needed
-}
+// Own-pane detection removed — server scrapes any window the user switches to
 
 /** Get the window key for the currently active tmux window.
  *  Uses displayTarget (session:windowIdx) rather than currentTarget (pane ID)
@@ -2525,12 +2559,6 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
   if (opts.stopStreaming) stopTmuxStreaming();
   terminal.switchTarget(session, windowIdx);
 
-  // Check if the resolved pane is the server's own pane
-  const isOwnPane = !!(_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId);
-  if (isOwnPane) {
-    console.log(`[window] Own pane detected: ${target} resolves to ${_serverOwnPaneId} — refusing to scrape ourselves`);
-  }
-
   saveSettings({ tmuxTarget: `${session}:${windowIdx}` });
   currentWindowKey = getWindowKey();
 
@@ -2558,25 +2586,9 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
       console.log(`[window] Cleaned ${(cached?.length ?? 0) - realCached.length} test/cross-window entries from cache`);
     }
     setConversationEntries(realCached);
-  } else if (!isOwnPane) {
+  } else {
     const scrollback = loadScrollbackEntries();
     setConversationEntries(scrollback);
-  } else {
-    // Own pane with no cache — show informational entry
-    if (conversationEntries.length === 0) {
-      const infoEntry: ConversationEntry = {
-        id: ++entryIdCounter,
-        role: "assistant",
-        text: `This is the Murmur server's own terminal (${session}:${windowIdx}). Switch to a Claude session window to see conversation entries.`,
-        ts: Date.now(),
-        spoken: true,
-        speakable: false,
-        turn: currentTurn,
-        window: currentWindowKey,
-      };
-      setConversationEntries([infoEntry]);
-    }
-    console.log(`[window] Own pane — kept ${conversationEntries.length} existing entries`);
   }
   for (const e of conversationEntries) e.spoken = true;
   if (conversationEntries.length > 0) {
@@ -3417,8 +3429,6 @@ const ENTRY_TTS_DELAY_MS = 200;
 // broadcasts { type: "entry" }, and triggers TTS for completed speakable entries.
 function broadcastCurrentOutput() {
   if (_isSystemContext) return; // Suppress UI during system context
-  // Never scrape/broadcast from the server's own pane — prevents coordinator output leaking
-  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return;
   const pane = captureTmuxPane();
   if (!pane) return;
 
@@ -4161,9 +4171,6 @@ function startPassiveWatcher() {
   passiveWatcher = setInterval(() => {
     if (!isWindowActive()) return; // No window selected yet — don't scrape
     if (!terminal.isSessionAlive()) return;
-    // Safety net: never scrape our own pane (coordinator/server output)
-    if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return;
-
     const pane = captureTmuxPane();
     if (!pane) return;
 
@@ -4864,10 +4871,25 @@ function broadcast(msg: Record<string, unknown>) {
   }
 }
 
+// BUG-046: Ping/pong keepalive with stale connection cleanup
+const WS_PONG_TIMEOUT_MS = 60000; // Remove clients that haven't ponged in 60s
 setInterval(() => {
+  const now = Date.now();
   for (const ws of Array.from(clients)) {
-    if (ws.readyState === WebSocket.OPEN) ws.ping();
-    else clients.delete(ws);
+    if (ws.readyState !== WebSocket.OPEN) {
+      clients.delete(ws);
+      continue;
+    }
+    // Terminate connections that haven't responded to ping in 60s
+    const lastPong = (ws as any)._lastPong as number | undefined;
+    if (lastPong && now - lastPong > WS_PONG_TIMEOUT_MS) {
+      console.warn(`[ws] Terminating stale client (no pong for ${((now - lastPong) / 1000).toFixed(0)}s)`);
+      ws.terminate();
+      clients.delete(ws);
+      if (activeAudioClient === ws) activeAudioClient = null;
+      continue;
+    }
+    ws.ping();
   }
 }, 10000);
 
@@ -4882,6 +4904,9 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
   if (isTestMode) (ws as any)._isTestMode = true;
   const wasEmpty = clients.size === 0;
   clients.add(ws);
+  // BUG-046: Track pong timestamps for stale connection detection
+  (ws as any)._lastPong = Date.now();
+  ws.on("pong", () => { (ws as any)._lastPong = Date.now(); });
   slog("ws", "connect", { clients: clients.size });
 
   // Cancel pending exit — a client reconnected
@@ -6372,7 +6397,6 @@ app.get("/debug/state", (_req, res) => {
       cooldownRemaining: Math.max(0, PASSIVE_COOLDOWN_MS - (Date.now() - lastStreamEndTime)),
       cooldownThinking: _cooldownThinking,
     },
-    serverOwnPaneId: _serverOwnPaneId,
     clients: clients.size,
     cleanMode: _cleanMode,
   });
@@ -6445,8 +6469,7 @@ if (savedTarget && terminal.switchTarget) {
   }
 }
 // Per-window conversation tracking — DON'T load entries or scrape until a client
-// sends window_preference. This prevents the server from defaulting to its own pane
-// (coordinator) and leaking coordinator output as conversation entries / TTS.
+// sends window_preference.
 currentWindowKey = "_unset";
 setConversationEntries([]);
 console.log(`[startup] Window key: _unset (waiting for client window_preference)`);
@@ -6480,20 +6503,32 @@ setInterval(async () => {
   if (prev.whisper !== serviceStatus.whisper || prev.kokoro !== serviceStatus.kokoro || prev.piper !== serviceStatus.piper) {
     broadcast({ type: "services", ...serviceStatus });
   }
+  // BUG-050: When Kokoro comes back online, retry queued TTS jobs
+  if (!prev.kokoro && serviceStatus.kokoro && ttsJobQueue.length > 0) {
+    console.log(`[tts2] Kokoro back online — draining ${ttsJobQueue.length} queued TTS jobs`);
+    drainAudioBuffer();
+  }
 }, 30000);
 
 // Broadcast tmux pane content with ANSI colors for the terminal panel (every 500ms)
+// BUG-045: Normalize trailing whitespace before comparison to avoid false-positive diffs
 let lastTerminalText = "";
+let _lastTerminalHash = "";
 let _lastWindowSwitchTs = 0; // Track last switch for force-broadcast window
+function _normalizeTerminalText(text: string): string {
+  // Strip trailing whitespace per line and trailing newlines — cursor position / padding diffs
+  return text.replace(/[ \t]+$/gm, "").trimEnd();
+}
 setInterval(() => {
   if (clients.size === 0) return;
   if (!isWindowActive()) return; // No window selected — don't broadcast stale pane content
-  if (_serverOwnPaneId && terminal.currentTarget === _serverOwnPaneId) return; // Never broadcast own pane
   try {
     const text = captureTerminalPane();
     // After a window switch, force-broadcast for 3s even if text matches (prevents empty-string deadlock)
     const forceWindow = Date.now() - _lastWindowSwitchTs < 3000;
-    if ((text && text !== lastTerminalText) || (forceWindow && text)) {
+    const normalized = _normalizeTerminalText(text);
+    if ((text && normalized !== _lastTerminalHash) || (forceWindow && text)) {
+      _lastTerminalHash = normalized;
       lastTerminalText = text;
       broadcast({ type: "terminal", text });
     }
