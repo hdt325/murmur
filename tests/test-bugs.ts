@@ -2127,8 +2127,6 @@ async function main() {
   await testFlowButton_visibleBothModes();
   await testFlowButton_gearOverlayNotBlocked();
 
-  // Contextual filler audio
-  await testFillerAudio_contextualPhrases();
 
   // Entry dedup + cap bugs
   await testEntryBugs_dedupAndCap();
@@ -2176,7 +2174,6 @@ async function main() {
   await testDoubleTapZoomFix();
 
   // Filler phrases as conversation entries
-  await testFillerPhraseEntries();
 
   // Resend button on user bubbles
   await testResendButton();
@@ -2318,7 +2315,7 @@ async function main() {
   await testAuditBug_chunkFlowTsPruning();
   await testAuditBug_activateWindowUnified();
 
-  // Round 13: TTS stall, filler echo, settings error propagation
+  // Round 13: TTS stall, echo cooldown, settings error propagation
   await testBug123_ttsDoneSafetyTimeout();
   await testBug113_fillerEchoCooldown();
   await testBug110_settingsSaveErrorPropagation();
@@ -2371,13 +2368,18 @@ async function main() {
   await testBugU5_staleSnapshotTTL();
   await testBugU6_scrollJackingPrevention();
 
-  // Round 22: Parser double-fire, filler clobber, stale dedup
+  // Round 22: Parser double-fire, stale dedup
   await testParserDoubleFire();
-  await testFillerClobberGuard();
   await testStaleDedupTierOne();
 
   // Round 23: Push-based architecture
   await testPushArchitecture();
+
+  // Non-Claude session scrollback guard
+  await testNonClaudeSessionScrollbackGuard();
+  await testTuiHintFilteredFromUserEntries();
+  await testMicButtonNoFlashing();
+  await testQueueDrainNoAutoSwitch();
 
   // Round 24: Monitor dashboard debug endpoints
   await testMonitorDashboardEndpoints();
@@ -2819,53 +2821,6 @@ async function testFlowButton_gearOverlayNotBlocked() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Contextual filler audio: pickFillerPhrase matches input patterns
-// ──────────────────────────────────────────────────────────────
-async function testFillerAudio_contextualPhrases() {
-  console.log("\n[FILLER] Contextual filler phrase selection");
-
-  const src = readFileSync("server.ts", "utf-8");
-
-  // pickFillerPhrase function exists
-  const hasFn = /function pickFillerPhrase\(/.test(src);
-  report("pickFillerPhrase function exists", hasFn);
-
-  // Has pattern categories (at least 5)
-  const catCount = (src.match(/patterns:\s*\[/g) || []).length;
-  report(
-    "At least 5 filler pattern categories defined",
-    catCount >= 5,
-    `categories=${catCount}`
-  );
-
-  // Has recent-phrase dedup tracking
-  const hasDedup = /_recentFillers/.test(src);
-  report("Recent filler phrase dedup tracking exists", hasDedup);
-
-  // queueFillerAudio accepts userText parameter
-  const hasParam = /function queueFillerAudio\(userText/.test(src);
-  report("queueFillerAudio accepts userText parameter", hasParam);
-
-  // Call sites pass text to queueFillerAudio
-  const callSites = (src.match(/queueFillerAudio\(text\)/g) || []).length;
-  report(
-    "All filler call sites pass user text",
-    callSites >= 3,
-    `callSites=${callSites}`
-  );
-
-  // Has question pattern (? or who/what/how)
-  const hasQuestion = /patterns:.*\\\?/.test(src) || /who\|what\|where/.test(src);
-  report("Question pattern category exists", hasQuestion);
-
-  // Has greeting pattern
-  const hasGreeting = /hi\|hello\|hey/.test(src);
-  report("Greeting pattern category exists", hasGreeting);
-
-  // Default fallback phrases exist
-  const hasDefault = /FILLER_DEFAULT_PHRASES/.test(src);
-  report("Default fallback phrase pool exists", hasDefault);
-}
 
 // ──────────────────────────────────────────────────────────────
 // Entry dedup across generation bumps (Bug 1) + entry cap safety (Bug 2)
@@ -3433,41 +3388,6 @@ async function testDoubleTapZoomFix() {
   const gearSection = src.slice(src.indexOf("flow-gear-btn {"), src.indexOf("flow-gear-btn {") + 700);
   const hasGearTouch = /touch-action:\s*manipulation/.test(gearSection);
   report("Flow gear button has touch-action: manipulation", hasGearTouch);
-}
-
-// ──────────────────────────────────────────────────────────────
-// Filler phrases: created as proper conversation entries
-// ──────────────────────────────────────────────────────────────
-async function testFillerPhraseEntries() {
-  console.log("\n[FILLER] Filler phrases appear as assistant conversation entries");
-
-  const src = readFileSync("server.ts", "utf-8");
-
-  // ConversationEntry has filler? field
-  const hasFiller = /filler\?:\s*boolean/.test(src);
-  report("ConversationEntry has filler?: boolean field", hasFiller);
-
-  // queueFillerAudio creates a real assistant entry (via pushEntry)
-  const fillerSection = src.slice(src.indexOf("function queueFillerAudio"), src.indexOf("function queueFillerAudio") + 1200);
-  const createsEntry = (fillerSection.includes("conversationEntries.push") || fillerSection.includes("pushEntry(")) && fillerSection.includes("role: \"assistant\"");
-  report("queueFillerAudio creates assistant entry", createsEntry);
-
-  // Filler entry has filler: true tag
-  const hasFillerTag = fillerSection.includes("filler: true");
-  report("Filler entry tagged with filler: true", hasFillerTag);
-
-  // Filler entry is broadcast to clients
-  const hasBroadcast = fillerSection.includes("broadcast(") && fillerSection.includes("type: \"entry\"");
-  report("Filler entry broadcast to clients immediately", hasBroadcast);
-
-  // _fillerEntryId tracks the real entry ID
-  const hasTracking = /_fillerEntryId/.test(src);
-  report("_fillerEntryId tracks real filler entry ID", hasTracking);
-
-  // stopFillerIfActive uses real entry ID (not just FILLER_ENTRY_ID sentinel)
-  const stopSection = src.slice(src.indexOf("function stopFillerIfActive"), src.indexOf("function stopFillerIfActive") + 500);
-  const usesRealId = stopSection.includes("_fillerEntryId") || stopSection.includes("fid");
-  report("stopFillerIfActive uses real entry ID", usesRealId);
 }
 
 // --- Resend Button on User Bubbles ---
@@ -6195,7 +6115,7 @@ async function testBug123_ttsDoneSafetyTimeout() {
 // --- BUG-113: Filler echo cooldown ---
 
 async function testBug113_fillerEchoCooldown() {
-  console.log("\n[BUG-113] Echo cooldown prevents filler audio mic feedback loop");
+  console.log("\n[BUG-113] Echo cooldown prevents TTS audio mic feedback loop");
 
   const src = readFileSync("index.html", "utf-8");
 
@@ -6964,7 +6884,7 @@ async function testPushArchitecture() {
   }
 }
 
-// --- Round 22: Parser double-fire, filler clobber, stale dedup ---
+// --- Round 22: Parser double-fire, stale dedup ---
 
 async function testParserDoubleFire() {
   console.log("\n[Parser Double-Fire] Push architecture eliminates double-fire via single debounced path");
@@ -6978,20 +6898,6 @@ async function testParserDoubleFire() {
   report("schedulePaneCheck debounces with PARSE_DEBOUNCE_MS", src.includes("PARSE_DEBOUNCE_MS") && src.includes("schedulePaneCheck"));
   report("performPaneCheck is the single entry to broadcastCurrentOutput",
     src.includes("function performPaneCheck") && src.includes("broadcastCurrentOutput()"));
-}
-
-async function testFillerClobberGuard() {
-  console.log("\n[Filler Clobber] Filler entries protected from overwrite");
-  const src = readFileSync("server.ts", "utf-8");
-
-  // The matching section should check sourceTag !== "filler" before overwriting
-  const matchSection = src.slice(src.indexOf("matchedEntryIds.add(matched.id)"));
-  report("Checks sourceTag !== 'filler' before text overwrite",
-    matchSection.slice(0, 400).includes('sourceTag !== "filler"'));
-
-  // Filler entries should have sourceTag set
-  report("Filler entries get sourceTag='filler'",
-    src.includes('sourceTag: "filler"') || src.includes("sourceTag: 'filler'"));
 }
 
 async function testStaleDedupTierOne() {
@@ -7010,6 +6916,82 @@ async function testStaleDedupTierOne() {
   const exactMatchIdx = dedupFn.indexOf("e.text === entry.text");
   const cutoffIdx = dedupFn.indexOf("e.ts < cutoff");
   report("Exact match check precedes time cutoff", exactMatchIdx > 0 && cutoffIdx > 0 && exactMatchIdx < cutoffIdx);
+}
+
+// --- TUI hint text filtered from user entries ---
+
+async function testTuiHintFilteredFromUserEntries() {
+  console.log("\n[TUI Hints] Claude TUI hint text filtered from user bubbles");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // addUserEntry should filter TUI hints
+  const addUserFn = src.slice(src.indexOf("function addUserEntry("), src.indexOf("function addUserEntry(") + 2500);
+  report("addUserEntry filters 'press up to edit'", /press up to edit/i.test(addUserFn));
+  report("addUserEntry filters 'shift+tab to cycle'", /shift\+tab to cycle/i.test(addUserFn));
+  report("addUserEntry filters 'esc to interrupt'", /esc to interrupt/i.test(addUserFn));
+  report("addUserEntry filters 'ctrl+o to expand'", /ctrl\+o to expand/i.test(addUserFn));
+  report("addUserEntry filters 'bypass permissions'", /bypass\s+permissions/i.test(addUserFn));
+  report("addUserEntry filters 'Tokens:' / 'Session:' status lines", /Tokens\?:|Session:/i.test(addUserFn));
+
+  // Push handler should also filter TUI hints early
+  const pushHandler = src.slice(src.indexOf("// Filter TUI hint/chrome text scraped"));
+  const pushSection = pushHandler.slice(0, 300);
+  report("Push handler filters TUI hints before addUserEntry", /press up to edit/i.test(pushSection));
+}
+
+// --- Mic button flashing during RESPONDING ---
+
+async function testMicButtonNoFlashing() {
+  console.log("\n[Mic Flash] Mic button stable during thinking/responding");
+  const src = readFileSync("server.ts", "utf-8");
+  const html = readFileSync("index.html", "utf-8");
+
+  // Server: cooldown idle transition debounced (not immediate)
+  const cooldownBlock = src.slice(src.indexOf("} else if (_cooldownThinking)"), src.indexOf("} else if (_cooldownThinking)") + 500);
+  report("Cooldown→idle transition debounced (setTimeout)", cooldownBlock.includes("_cooldownIdleTimer") && cooldownBlock.includes("setTimeout"));
+
+  // Server: spinner during cooldown cancels pending idle timer
+  const spinnerBlock = src.slice(src.indexOf("SPINNER_CHARS_RE.test(_chunk)"), src.indexOf("SPINNER_CHARS_RE.test(_chunk)") + 400);
+  report("Spinner cancels pending cooldown idle timer", spinnerBlock.includes("clearTimeout(_cooldownIdleTimer)"));
+
+  // Client: setTalkState skips redundant state changes
+  const setTalkFn = html.slice(html.indexOf("function setTalkState(state)"), html.indexOf("function setTalkState(state)") + 300);
+  report("setTalkState skips redundant state (no-op if same)", setTalkFn.includes("_lastTalkState"));
+}
+
+// --- Queue drain does NOT auto-switch window target ---
+
+async function testQueueDrainNoAutoSwitch() {
+  console.log("\n[Queue Drain] Queue drain does not auto-switch window target");
+  const src = readFileSync("server.ts", "utf-8");
+
+  // The queue drain section should NOT call terminal.switchTarget
+  const drainSection = src.slice(src.indexOf("Draining queued input"), src.indexOf("Draining queued input") + 600);
+  report("Queue drain does NOT call terminal.switchTarget", !drainSection.includes("terminal.switchTarget"));
+  report("Queue drain does NOT restore stale target", !drainSection.includes("Restoring queued target"));
+}
+
+// --- Non-Claude session scrollback guard ---
+
+async function testNonClaudeSessionScrollbackGuard() {
+  console.log("\n[Scrollback Guard] Non-Claude sessions skip scrollback parsing");
+  const src = readFileSync("server.ts", "utf-8");
+
+  const fnStart = src.indexOf("function loadScrollbackEntries()");
+  const fnBody = src.slice(fnStart, fnStart + 1200);
+
+  // Must detect Claude session via TUI markers before parsing
+  report("Checks for Claude TUI markers (❯ prompt or version banner)",
+    fnBody.includes("isClaudeSession") && /❯|Claude Code v/i.test(fnBody));
+
+  // Non-Claude path returns marker entry, not parsed scrollback
+  report("Non-Claude sessions return marker entry",
+    fnBody.includes("Non-Claude session") && fnBody.includes('sourceTag: "marker"'));
+
+  // Claude sessions still get full parsing (❯ turn detection)
+  const afterGuard = fnBody.slice(fnBody.indexOf("isClaudeSession"));
+  report("Claude sessions proceed with ❯ turn parsing",
+    afterGuard.includes("turnStarts") && afterGuard.includes("❯"));
 }
 
 // --- Round 24: Monitor dashboard debug endpoints ---

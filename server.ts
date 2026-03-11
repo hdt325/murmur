@@ -571,7 +571,6 @@ interface PanelSettings {
   voice?: string;
   speed?: number;
   tmuxTarget?: string; // "session:windowIndex" — last used tmux session
-  fillerAudio?: boolean; // Enable predictive filler audio while Claude thinks (default: true)
   elevenLabsApiKey?: string; // ElevenLabs API key for cloud TTS
 }
 
@@ -1444,11 +1443,6 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
     }
   }
 
-  // Stop filler audio when real response audio is queued (not another filler)
-  if (entryId != null && entryId !== FILLER_ENTRY_ID && entryId !== _fillerEntryId) {
-    stopFillerIfActive();
-  }
-
   // Clean text for TTS
   const speakableText = cleanTtsText(text);
 
@@ -1691,199 +1685,6 @@ function queueTts(entryId: number | null, text: string, source = "queueTts"): vo
   drainAudioBuffer();
 }
 
-// --- Predictive Filler Audio ---
-// Play a contextual filler phrase while Claude thinks, so there's no dead silence.
-// Pattern-matches user transcription to pick a natural, conversational acknowledgement.
-
-const FILLER_CATEGORIES: { patterns: RegExp[]; phrases: string[] }[] = [
-  {
-    // Greetings — match first so "hey how are you" gets greeting, not question
-    patterns: [/^(hi|hello|hey|howdy|good morning|good afternoon|good evening|what'?s up)\b/],
-    phrases: [
-      "Hey there, good to hear from you.",
-      "Hi! Give me just a moment.",
-      "Hey, what's going on.",
-    ],
-  },
-  {
-    // Gratitude
-    patterns: [/\b(thank|thanks|appreciate|great job|nice work|well done)\b/],
-    phrases: [
-      "Happy to help, anytime!",
-      "Of course, glad that was useful.",
-      "You're welcome! Let me know if there's anything else.",
-    ],
-  },
-  {
-    // Jokes/humor
-    patterns: [/\b(joke|funny|laugh|humor|tell me a)\b/],
-    phrases: [
-      "Oh, I think I've got a good one for this.",
-      "Alright, let me think of something fun.",
-      "Ha, okay, give me just a second.",
-    ],
-  },
-  {
-    // Complaints/problems — match before generic requests
-    patterns: [/\b(broken|bug|wrong|error|not working|issue|problem|fix|crash|fail)\b/],
-    phrases: [
-      "Okay, let me take a closer look at that.",
-      "Got it, let me see what's going on here.",
-      "Alright, let me dig into that for you.",
-    ],
-  },
-  {
-    // Opinions
-    patterns: [/\b(what do you think|your opinion|your take|do you agree|thoughts on|what are your)\b/],
-    phrases: [
-      "That's a really interesting question, let me think about that.",
-      "Hmm, good one. Give me a moment to consider.",
-      "Oh, I actually have some thoughts on that.",
-    ],
-  },
-  {
-    // Requests — "can you", "please", "help me", etc.
-    patterns: [/\b(can you|could you|please|help me|i need|i want|make me|write me|show me|give me|create|build|set up)\b/],
-    phrases: [
-      "Sure thing, let me pull that together for you.",
-      "Absolutely, working on that right now.",
-      "On it, give me just a moment.",
-      "Sure, let me get that set up.",
-    ],
-  },
-  {
-    // Questions — broad catch after specific categories
-    patterns: [/\?/, /^(who|what|where|when|why|how|can|do|does|is|are|will|would|could|should)\b/],
-    phrases: [
-      "That's a great question, let me think about that.",
-      "Hmm, let me look into that for you.",
-      "Good question, give me a second to check.",
-      "Let me see what I can find on that.",
-    ],
-  },
-  {
-    // Continuation
-    patterns: [/^(and |also |another |one more|what about|how about|okay |ok )/],
-    phrases: [
-      "Sure, let me keep going.",
-      "Alright, coming right up.",
-      "Got it, one more moment.",
-    ],
-  },
-];
-
-const FILLER_DEFAULT_PHRASES = [
-  "Alright, give me just a moment.",
-  "Sure, let me work on that for you.",
-  "One moment, I'm on it.",
-  "Let me think about that.",
-  "Okay, working on it now.",
-];
-
-const FILLER_ENTRY_ID = -999; // Legacy sentinel (kept for stopFillerIfActive compatibility)
-let _fillerActive = false;
-let _fillerEntryId: number | null = null; // Real entry ID of current filler
-const _recentFillers: string[] = []; // Track last 3 to avoid repeats
-const FILLER_RECENT_MAX = 3;
-
-/** Pick a contextual filler phrase based on user's transcribed text. */
-function pickFillerPhrase(userText: string): string {
-  const lower = userText.toLowerCase().trim();
-
-  // Find first matching category
-  let pool = FILLER_DEFAULT_PHRASES;
-  for (const cat of FILLER_CATEGORIES) {
-    if (cat.patterns.some(p => p.test(lower))) {
-      pool = cat.phrases;
-      break;
-    }
-  }
-
-  // Filter out recently used phrases
-  const available = pool.filter(p => !_recentFillers.includes(p));
-  const choices = available.length > 0 ? available : pool;
-
-  const phrase = choices[Math.floor(Math.random() * choices.length)];
-
-  // Track recent usage
-  _recentFillers.push(phrase);
-  if (_recentFillers.length > FILLER_RECENT_MAX) _recentFillers.shift();
-
-  return phrase;
-}
-
-/** Queue a contextual filler phrase for playback while Claude processes input.
- *  Creates a proper assistant entry so the filler appears in conversation view. */
-function queueFillerAudio(userText = ""): void {
-  const settings = loadSettings();
-  // fillerAudio defaults to true if unset
-  if (settings.fillerAudio === false) return;
-
-  // Don't play filler if TTS is already playing or queued
-  if (ttsCurrentlyPlaying || ttsJobQueue.length > 0) return;
-
-  const phrase = pickFillerPhrase(userText);
-  console.log(`[tts2] Queueing filler: "${phrase}" (input: "${userText.slice(0, 40)}")`);
-
-  // Create a real assistant entry so the filler shows in conversation view
-  const fillerEntryId = ++entryIdCounter;
-  const fillerEntry: ConversationEntry = {
-    id: fillerEntryId,
-    role: "assistant",
-    text: phrase,
-    speakable: true,
-    spoken: true, // Will be spoken immediately
-    ts: Date.now(),
-    turn: currentTurn,
-    filler: true, // Tag so UI can style differently if desired
-    sourceTag: "filler", // Guard in broadcastCurrentOutput checks this to prevent clobber
-    ...(_currentInputId ? { parentInputId: _currentInputId } : {}),
-  };
-  pushEntry(fillerEntry);
-  elog(fillerEntryId, "assistant", "filler", phrase);
-  broadcast({ type: "entry", entries: conversationEntries, partial: true });
-
-  ttslog(fillerEntryId, phrase, ttsGeneration, "filler");
-  _fillerActive = true;
-  _fillerEntryId = fillerEntryId;
-  queueTts(fillerEntryId, phrase);
-}
-
-/** Stop filler playback when real response audio arrives. */
-function stopFillerIfActive(): void {
-  if (!_fillerActive) return;
-  _fillerActive = false;
-  const fid = _fillerEntryId;
-  _fillerEntryId = null;
-
-  // Check if filler job is still in queue or playing (match by real entry ID or legacy sentinel)
-  const fillerIdx = ttsJobQueue.findIndex(j =>
-    (j.entryId === fid || j.entryId === FILLER_ENTRY_ID) && j.state !== "done" && j.state !== "failed"
-  );
-  if (fillerIdx >= 0) {
-    const fillerJob = ttsJobQueue[fillerIdx];
-    for (const chunk of fillerJob.chunks) {
-      if (chunk.abortController) {
-        try { chunk.abortController.abort(); } catch {}
-        chunk.abortController = null;
-      }
-      chunk.audioBuf = null;
-    }
-    ttsJobQueue.splice(fillerIdx, 1);
-    console.log("[tts2] Filler removed from queue (real audio arriving)");
-  }
-
-  const isFillerPlaying = ttsCurrentlyPlaying &&
-    (ttsCurrentlyPlaying.entryId === fid || ttsCurrentlyPlaying.entryId === FILLER_ENTRY_ID);
-  if (isFillerPlaying) {
-    // Filler is currently playing — stop it
-    ttsCurrentlyPlaying = null;
-    if (ttsPlaybackTimeout2) { clearTimeout(ttsPlaybackTimeout2); ttsPlaybackTimeout2 = null; }
-    broadcast({ type: "tts_stop" });
-    console.log("[tts2] Filler playback stopped (real audio arriving)");
-    ttslog(fid ?? FILLER_ENTRY_ID, "", ttsGeneration, "filler_replaced");
-  }
-}
 
 /**
  * Send the next ready job's audio to the client.
@@ -2326,6 +2127,7 @@ let sawActivity = false;
 let lastStreamEndTime = 0; // Cooldown: don't re-trigger right after streaming ends
 const PASSIVE_COOLDOWN_MS = 10000; // 10 seconds after last stream ends
 let _cooldownThinking = false; // Track if we sent thinking state during cooldown
+let _cooldownIdleTimer: ReturnType<typeof setTimeout> | null = null; // Debounce cooldown→idle transition
 
 // Legacy lists kept for reference — detection now uses SPINNER_REGEX pattern
 
@@ -2608,7 +2410,6 @@ interface ConversationEntry {
   window?: string;           // tmux window key — isolates entries per window
   sourceTag?: string;        // origin: "voice", "text-input", "terminal", "text-input-test"
   queued?: boolean; // true = pending while Claude is active, not yet sent
-  filler?: boolean; // true = auto-filler phrase ("Got it, let me look into that")
   inputId?: string;          // Unique ID for this voice/text input (user entries)
   parentInputId?: string;    // Links assistant responses to the user input that triggered them
 }
@@ -2695,6 +2496,7 @@ function _activateWindowCore(session: string, windowIdx: number, opts: {
   // Stop TTS + reset all state
   stopClientPlayback2("session_switch");
   _cooldownThinking = false;
+  if (_cooldownIdleTimer) { clearTimeout(_cooldownIdleTimer); _cooldownIdleTimer = null; }
   lastStreamEndTime = 0;
   preInputSnapshot = "";
   _scrollbackCache = { text: "", ts: 0 };
@@ -2958,6 +2760,11 @@ function addUserEntry(text: string, queued = false, _source = "unknown", inputId
   // Filter status line text that passive watcher may scrape near the prompt
   if (/^[✻✶✢✽·]/.test(text.trim()) || /^(Compacting conversation|Crunched for |Background command)/i.test(text.trim()) || /^\d+\s+background\s+task/i.test(text.trim())) {
     console.log(`[addUserEntry] Filtered status line from="${_source}": "${text.slice(0, 80)}"`);
+    return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
+  }
+  // Filter TUI hint/chrome text that pipe-pane may scrape near the prompt
+  if (/press up to edit/i.test(text.trim()) || /shift\+tab to cycle/i.test(text.trim()) || /esc to interrupt/i.test(text.trim()) || /ctrl\+o to expand/i.test(text.trim()) || /bypass\s+permissions/i.test(text.trim()) || /^(Tokens?:|Session:|esc to|ctrl\+)/i.test(text.trim())) {
+    console.log(`[addUserEntry] Filtered TUI hint from="${_source}": "${text.slice(0, 80)}"`);
     return { id: -1, role: "user" as const, text, speakable: false, spoken: false, ts: Date.now(), turn: currentTurn } as ConversationEntry;
   }
   // Dedup by inputId: if an entry with same inputId already exists, return it
@@ -3383,6 +3190,25 @@ function loadScrollbackEntries(): ConversationEntry[] {
   // Debug: log first few lines to understand scrollback format
   console.log(`[scrollback] target=${terminal.currentTarget} lines=${lines.length} sample:`, lines.slice(0, 5).map(l => JSON.stringify(l)));
 
+  // Detect Claude Code session by TUI markers: ❯ prompt or version banner
+  const isClaudeSession = lines.some(l => /^❯\s/.test(l.trimEnd()) || /Claude Code v/i.test(l));
+  if (!isClaudeSession) {
+    // Non-Claude session (Aider, Copilot CLI, etc.) — don't parse unknown prompt formats.
+    // Return a single marker entry so the UI shows something instead of blank.
+    console.log(`[scrollback] Non-Claude session detected — skipping scrollback parse, inserting marker`);
+    return [{
+      id: ++entryIdCounter,
+      role: "assistant" as const,
+      text: "Conversation started — tracking new output only.",
+      speakable: false,
+      spoken: true,
+      ts: Date.now(),
+      turn: 0,
+      window: getWindowKey(),
+      sourceTag: "marker",
+    }];
+  }
+
   const turnStarts: { lineIdx: number; input: string }[] = [];
 
   // Find user input lines: ❯ followed by actual content
@@ -3632,6 +3458,8 @@ function handlePipeOutput(_chunk: string) {
     if (SPINNER_CHARS_RE.test(_chunk)) {
       // Cooldown check: don't re-trigger right after streaming ends
       if (now - lastStreamEndTime < PASSIVE_COOLDOWN_MS) {
+        // Cancel pending idle transition — spinner activity continuing
+        if (_cooldownIdleTimer) { clearTimeout(_cooldownIdleTimer); _cooldownIdleTimer = null; }
         if (!_cooldownThinking) {
           _cooldownThinking = true;
           broadcast({ type: "voice_status", state: "thinking" });
@@ -3647,10 +3475,18 @@ function handlePipeOutput(_chunk: string) {
       // Spinner while IDLE → native CLI input detected
       scheduleIdleActivityCheck();
     } else if (_cooldownThinking) {
-      // During cooldown, non-spinner output → system task finished
-      _cooldownThinking = false;
-      broadcast({ type: "voice_status", state: "idle" });
-      broadcast({ type: "tool_status", text: "" });
+      // Debounce: don't immediately go idle on non-spinner output during cooldown.
+      // Rapid spinner/text alternation causes mic button flashing without this delay.
+      if (!_cooldownIdleTimer) {
+        _cooldownIdleTimer = setTimeout(() => {
+          _cooldownIdleTimer = null;
+          if (_cooldownThinking) {
+            _cooldownThinking = false;
+            broadcast({ type: "voice_status", state: "idle" });
+            broadcast({ type: "tool_status", text: "" });
+          }
+        }, 300);
+      }
     }
     return;
   }
@@ -3793,6 +3629,11 @@ function handleNativeInputDetected() {
   // Filter tool output markers
   if (userInput && isToolOutputLine(userInput)) {
     console.log(`[push] Filtered tool output as user input: "${userInput.slice(0, 80)}"`);
+    userInput = "";
+  }
+  // Filter TUI hint/chrome text scraped from near the prompt
+  if (userInput && (/press up to edit|shift\+tab to cycle|esc to interrupt|ctrl\+o to expand|bypass\s+permissions/i.test(userInput) || /^(Tokens?:|Session:|esc to|ctrl\+)/i.test(userInput.trim()))) {
+    console.log(`[push] Filtered TUI hint as user input: "${userInput.slice(0, 80)}"`);
     userInput = "";
   }
 
@@ -3938,10 +3779,7 @@ function broadcastCurrentOutput() {
 
     if (matched) {
       matchedEntryIds.add(matched.id);
-      // Filler clobber guard: never overwrite filler entries with parsed output.
-      // Fillers have their own text ("One moment...", "Let me think...") that should
-      // be preserved until naturally replaced by the next filler or cleared on done.
-      if (matched.text !== para.text && matched.sourceTag !== "filler") {
+      if (matched.text !== para.text) {
         if (matched.text !== para.text) mlog(matched.id, "text", matched.text.slice(0, 80), para.text.slice(0, 80), "broadcastCurrentOutput");
         if (matched.speakable !== para.speakable) mlog(matched.id, "speakable", matched.speakable, para.speakable, "broadcastCurrentOutput");
         matched.text = para.text;
@@ -4396,17 +4234,9 @@ function stopTmuxStreaming() {
         queuedEntry.queued = false;
         broadcast({ type: "entry", entries: conversationEntries, partial: false });
       }
-      // Switch to the session that was active when the message was queued
-      const savedTarget = terminal.currentTarget;
-      if (next.target && next.target !== savedTarget && terminal.switchTarget) {
-        console.log(`[voice] Restoring queued target: ${next.target} (current: ${savedTarget})`);
-        const lastColon = next.target.lastIndexOf(":");
-        if (lastColon !== -1) {
-          const session = next.target.slice(0, lastColon);
-          const windowIdx = parseInt(next.target.slice(lastColon + 1));
-          terminal.switchTarget(session, windowIdx);
-        }
-      }
+      // Send to current target (user's explicit choice) — never auto-switch back to a
+      // stale queued target. If the user switched windows after queueing, the message
+      // goes to the current window. Auto-switching caused visible target flashing.
       startTmuxStreaming(next.text);
       if (!queuedEntry) addUserEntry(next.text, false, "queue-drain-fallback"); // Fallback if entry was lost
       terminal.sendText(next.text);
@@ -4803,9 +4633,9 @@ function broadcast(msg: Record<string, unknown>) {
   // knows which entries have in-flight TTS (and shouldn't be marked as dropped/red).
   if (msg.type === "entry" && !msg.ttsPendingIds) {
     const pendingIds = ttsJobQueue
-      .filter(j => j.entryId != null && j.entryId !== FILLER_ENTRY_ID && j.state !== "done" && j.state !== "failed")
+      .filter(j => j.entryId != null && j.state !== "done" && j.state !== "failed")
       .map(j => j.entryId);
-    if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.entryId != null && ttsCurrentlyPlaying.entryId !== FILLER_ENTRY_ID) {
+    if (ttsCurrentlyPlaying && ttsCurrentlyPlaying.entryId != null) {
       pendingIds.push(ttsCurrentlyPlaying.entryId);
     }
     msg.ttsPendingIds = pendingIds;
@@ -5172,7 +5002,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           addUserEntry(text, false, "voice", audioInputId);
           terminal.recordSentInput?.(text);
           terminal.sendText(text);
-          queueFillerAudio(text);
+
         } else {
           console.log(`No wake word in: "${text}"`);
           broadcast({ type: "voice_status", state: "wake_no_match" });
@@ -5185,7 +5015,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           addUserEntry(text, false, "voice", audioInputId);
           terminal.recordSentInput?.(text);
           terminal.sendText(text);
-          queueFillerAudio(text);
+
         } else {
           // Claude is active — queue the transcription, add to transcript immediately
           const queuedEntry = addUserEntry(text, true, "voice", audioInputId);
@@ -5210,7 +5040,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       const safeTestPrefixes = [
         "test:", "log:", "tts_done", "chunk_done:", "claim:audio", "speed:", "voice:",
         "mute:", "replay", "replay:", "text:",  // text: is handled separately with its own testmode check
-        "barge_in", "filler_audio:", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:", "window_preference:",
+        "barge_in", "mictest:", "resend:", "elevenlabs_key:", "clean_mode:", "window_preference:",
         "tmux:switch:", "tmux:list",  // Window management — safe for testing (don't touch Claude session)
       ];
       const isSafe = safeTestPrefixes.some(p => msg.startsWith(p));
@@ -5464,14 +5294,6 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
       return;
     }
 
-    // Filler audio toggle
-    if (msg.startsWith("filler_audio:")) {
-      const val = msg.slice(13).trim();
-      const enabled = val !== "0" && val !== "false";
-      saveSettings({ fillerAudio: enabled });
-      console.log(`[settings] Filler audio: ${enabled}`);
-      return;
-    }
 
     // Client reports available local voices for TTS fallback decisions
     if (msg.startsWith("local_voices:")) {
@@ -5622,7 +5444,6 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
         addUserEntry(text, false, "text-input-resend");
         terminal.recordSentInput?.(text);
         terminal.sendText(text);
-        queueFillerAudio(text);
       } else {
         // Claude is active — queue
         const queuedEntry = addUserEntry(text, true, "text-input-resend");
@@ -5742,7 +5563,7 @@ function handleWsConnection(ws: WebSocket, req?: import("http").IncomingMessage)
           addUserEntry(text, false, "text-input");
           terminal.recordSentInput?.(text);
           terminal.sendText(text);
-          queueFillerAudio(text);
+
         } else {
           // Claude is active — queue typed text same as voice
           const queuedEntry = addUserEntry(text, true, "text-input");

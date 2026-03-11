@@ -5684,7 +5684,11 @@
     // Uses persistent inner elements — no innerHTML rebuild — so CSS transitions work.
     // =============================================
     let _thinkingGlowTimer = null;
+    let _lastTalkState = "";
     function setTalkState(state) {
+      // Skip redundant state changes — prevents mic button flashing from rapid WS messages
+      if (state === _lastTalkState && state !== "idle") return;
+      _lastTalkState = state;
       clearBubbleHighlights();
       // Safety: auto-reset glow after 2 min if stuck in thinking/responding
       if (_thinkingGlowTimer) { clearTimeout(_thinkingGlowTimer); _thinkingGlowTimer = null; }
@@ -6428,7 +6432,7 @@
       // on non-partial (final) broadcasts. See renderEntries bubble-dropped logic.
       setTalkState("idle");
     }
-    const TTS_ECHO_COOLDOWN = 600;   // 600ms cooldown after TTS ends — prevents filler echo triggering VAD (BUG-113)
+    const TTS_ECHO_COOLDOWN = 600;   // 600ms cooldown after TTS ends — prevents TTS echo triggering VAD (BUG-113)
 
     async function ensureMicStream() {
       if (micStream && micStream.getTracks().every(t => t.readyState === "live")) return micStream;
@@ -7517,7 +7521,7 @@
           if (ttsPlaying) { if (shouldLog) rlog("[auto-listen] BLOCKED: ttsPlaying"); return; }
         }
         const echoCd = Date.now() - ttsEndedAt;
-        // BUG-113 fix: Apply echo cooldown in ALL modes (including flow) to prevent filler audio feedback loop
+        // BUG-113 fix: Apply echo cooldown in ALL modes (including flow) to prevent TTS audio feedback loop
         if (echoCd < TTS_ECHO_COOLDOWN) { if (shouldLog) rlog(`[auto-listen] BLOCKED: echo cooldown ${echoCd}ms`); return; }
 
         // Resume AudioContext if iOS suspended it (common after TTS playback)
